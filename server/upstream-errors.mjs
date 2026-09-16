@@ -28,6 +28,51 @@ export function isCapabilityError(status, body) {
   return !/\b(?:unauthorized|forbidden|invalid\s+(?:api[_ -]?key|token)|authentication)\b/i.test(message);
 }
 
+/**
+ * 上游会把供应商的错误塞进 HTTP 200 里。2026-09-14 在容器里实测到的原样响应
+ * (nemotron-3-ultra-free,经节点出站):
+ *
+ *   HTTP/1.1 200
+ *   {"error":{"type":"server_error","message":"Error from provider (Console):
+ *     Upstream request failed: [502] Upstream error from Nvidia: Service temporarily unavailable"}}
+ *
+ * 只看状态码的话这是一次成功:forward 会 JSON.parse 后 resolve,attempt 记
+ * success、清掉当前出口的冷却、把这坨 {error:...} 当成回答发给客户端,而且
+ * **不换节点不重试** —— 而它其实是个可重试的 502。所以成功路径也得验一遍 body。
+ *
+ * 判据刻意窄:必须「error 携带了信息」且「一个业务载荷字段都没有」。
+ * 上游正常回答里可能带 error:null,工具调用的响应里 choices 可能是空数组
+ * 但 usage 在 —— 误判会把真实回答吞掉,那比漏判更糟。
+ */
+const PAYLOAD_KEYS = ['choices', 'output', 'output_text', 'content', 'delta', 'response'];
+
+export function isErrorShapedOk(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  const err = payload.error;
+  if (err == null) return false;
+  const hasInfo = typeof err === 'string'
+    ? err.trim() !== ''
+    : !!(err.message || err.type || err.code);
+  if (!hasInfo) return false;
+  return !PAYLOAD_KEYS.some((k) => payload[k] != null);
+}
+
+/**
+ * 把上游真正的状态码从错误原文里抠出来 —— 它写在方括号里
+ * (`Upstream request failed: [502] Upstream error from Nvidia`),
+ * 而 HTTP 层那个 200 是假的:拿 200 去 classifyUpstreamError 会落到
+ * terminal 分支,也就是不重试。
+ *
+ * 抠不出来就退回 502:能确定的是「上游侧失败了」,而 5xx 会进 attempt 的
+ * retryable 分支去换节点,这正是这类错误该得到的处置。
+ */
+export function embeddedStatus(body, fallback = 502) {
+  const m = /\[(\d{3})\]/.exec(upstreamErrorMessage(body));
+  if (!m) return fallback;
+  const code = Number(m[1]);
+  return code >= 400 && code <= 599 ? code : fallback;
+}
+
 export function classifyUpstreamError(status, body) {
   const code = Number(status) || 0;
   if (code === 429) return 'rate_limited';

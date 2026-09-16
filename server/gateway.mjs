@@ -25,7 +25,9 @@ import { Capabilities } from './capabilities.mjs';
 import { ModelMetadataStore, MODELS_DEV_TTL_MS, metadataFree } from './model-metadata.mjs';
 import { ModelAvailability, MODEL_AVAILABILITY_TTL_MS } from './model-availability.mjs';
 import { safeEqual } from './auth.mjs';
-import { classifyUpstreamError, upstreamErrorMessage } from './upstream-errors.mjs';
+import {
+  classifyUpstreamError, upstreamErrorMessage, isErrorShapedOk, embeddedStatus,
+} from './upstream-errors.mjs';
 import {
   COOLDOWN_MS, MODEL_COOLDOWN_MS, BLOCKED_COOLDOWN_MS,
   providerGroup, NodeAffinity, NodeCooldown, ModelCooldown,
@@ -1400,11 +1402,18 @@ export class Gateway {
             const retryAfter = parseRetryAfter(resp.headers['retry-after']);
             return reject({ status: resp.statusCode, body: data, retryAfter });
           }
-          try {
-            // 不可枚举:这个对象会被 OPENAI.respond 原样 JSON.stringify 给客户端,
-            // 普通属性会当成上游字段泄出去
-            resolve(Object.defineProperty(JSON.parse(data), '_ttfb', { value: ttfb }));
-          } catch { reject({ status: 502, body: data }); }
+          let parsed;
+          try { parsed = JSON.parse(data); }
+          catch { return reject({ status: 502, body: data }); }
+          // 200 不代表成功:上游会把供应商的 5xx 包在 200 + {"error":...} 里
+          // (见 isErrorShapedOk)。按内嵌的真实状态码 reject,让 attempt 的
+          // retryable 分支去换节点,而不是把这坨东西当回答发给客户端。
+          if (isErrorShapedOk(parsed)) {
+            return reject({ status: embeddedStatus(parsed), body: data });
+          }
+          // 不可枚举:这个对象会被 OPENAI.respond 原样 JSON.stringify 给客户端,
+          // 普通属性会当成上游字段泄出去
+          resolve(Object.defineProperty(parsed, '_ttfb', { value: ttfb }));
         });
       });
       r.on('error', (e) => reject({ status: 0, body: e.message }));
@@ -1465,32 +1474,74 @@ export class Gateway {
           });
           return;
         }
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream; charset=utf-8',
-          'Cache-Control': 'no-cache',
-          Connection: 'keep-alive',
-          'X-Accel-Buffering': 'no',
-        });
-        started = true;
-        keepAlive = new StreamKeepAlive((s) => res.write(s));
-        const sink = dialect.sink(res, body.model);
-
-        // 首字节已到,把「等第一个字节」的短超时换成宽松的空闲超时:
-        // 推理模型思考几十秒很正常,拿 TTFB 那个尺度掐会毁掉已经成功的请求
-        r.setTimeout(0);
-        resp.setTimeout(STREAM_IDLE_MS, () => {
-          this.logger('error', `[stream] 空闲超过 ${STREAM_IDLE_MS / 1000}s,断开`);
-          r.destroy();
-        });
+        // 头**不在这里**发。上游会拿 200 送一个 JSON 错误壳子而不是 SSE
+        // (见 isErrorShapedOk),此刻 writeHead 就等于把这条必败的请求钉死:
+        // started=true 之后任何失败都只能就地收尾,换节点重试的机会没了,
+        // 而客户端拿到的是一条永远不吐帧的空流。所以等第一个 chunk 到手、
+        // 确认它真是 SSE 之后再发头 —— 在那之前 reject 都是安全可重试的。
+        let sink = null;
 
         // 这份缓冲只用来抓 usage,但解码同样要有状态:半个多字节字符会让
         // JSON.parse 抛在下面那个 catch 里,表现为偶发丢一次 usage 记账。
         let buf = '';
         const decoder = new TextDecoder('utf-8');
+
+        /**
+         * 首帧判定。SSE 帧一定以 `data:`/`event:`/`:` 开头,而错误壳子是一坨
+         * 裸 JSON。只看第一个非空行:够区分这两种形态,又不必攒完整个 body
+         * (真流式的第一个 chunk 之后可能几十秒才有第二个)。
+         */
+        const looksLikeSSE = (text) => {
+          const line = text.split('\n').find((l) => l.trim());
+          if (!line) return false;                 // 还没看到内容,再等下一个 chunk
+          return /^(?:data:|event:|id:|retry:|:)/.test(line.trim());
+        };
+
+        const openStream = () => {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
+          });
+          started = true;
+          keepAlive = new StreamKeepAlive((s) => res.write(s));
+          sink = dialect.sink(res, body.model);
+          // 首字节已到,把「等第一个字节」的短超时换成宽松的空闲超时:
+          // 推理模型思考几十秒很正常,拿 TTFB 那个尺度掐会毁掉已经成功的请求
+          r.setTimeout(0);
+          resp.setTimeout(STREAM_IDLE_MS, () => {
+            this.logger('error', `[stream] 空闲超过 ${STREAM_IDLE_MS / 1000}s,断开`);
+            r.destroy();
+          });
+        };
+
         resp.on('data', (chunk) => {
           // 保活计时重置:活跃的流不发 ping,静默满一个间隔才补
           keepAlive?.touch();
           firstByte ||= Date.now() - t0;
+          if (!started) {
+            // 头还没发:先攒着判形状。判不出来就继续等,别急着发头
+            buf += decoder.decode(chunk, { stream: true });
+            if (looksLikeSSE(buf)) {
+              openStream();
+              sink.write(Buffer.from(buf, 'utf8'));   // 攒下的这段也要转发出去
+            } else {
+              let parsed = null;
+              try { parsed = JSON.parse(buf); } catch { return; }  // JSON 还没收全,等下一个 chunk
+              if (isErrorShapedOk(parsed)) {
+                // 头没发,这次失败仍然可以换节点重试 —— 这正是延后发头的目的
+                return finish(() => reject({
+                  status: embeddedStatus(parsed), body: buf, notStarted: true,
+                }));
+              }
+              // 是完整 JSON 又不是错误壳子:上游把非流式响应塞给了流式请求。
+              // 交给 sink 走正常路径,它认得 chat.completion 这种整块形状。
+              openStream();
+              sink.write(Buffer.from(buf, 'utf8'));
+            }
+            return;
+          }
           sink.write(chunk);          // 先转发,统计是副产品,别让它拖慢流
           buf += decoder.decode(chunk, { stream: true });
           const lines = buf.split('\n');

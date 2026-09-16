@@ -443,8 +443,23 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
     // 这个按钮是给「上游刚上线了新模型,不想等到明天」用的。放 POST 上和
     // /api/nodes/test 一致:它会出站,不该被 GET 的缓存或预取碰上。
     if (path === '/api/models/sync' && m === 'POST') {
-      const r = await gateway.refreshModels();   // 失败会抛,交给下面统一的 500
-      return json(res, r);
+      // 清单和元数据必须一起刷。只刷清单的话,「免费但 id 不带 -free 后缀」的
+      // 新模型照样进不了 pickFreeModels 的第二道价格判据 —— union-alpha 就是
+      // 现成的例子:上游已经列了、models.dev 也记了(in=0/out=0),可我们的缓存
+      // 还停在它上线之前那一份,于是按钮按下去什么也刷不出来,得干等到下一拍
+      // (见 MODELS_DEV_TTL_MS)。元数据那层自己带 TTL,所以这里必须 force。
+      //
+      // allSettled:两者独立汇报。refreshModels 失败要抛(按钮得能报错),
+      // 但元数据只是辅助缓存 —— 它挂了不该让一次成功的清单同步变成 500。
+      const [list, meta] = await Promise.allSettled([
+        gateway.refreshModels(),
+        gateway.refreshModelMetadata({ force: true }),
+      ]);
+      if (list.status === 'rejected') throw list.reason;
+      return json(res, {
+        ...list.value,
+        metadata: meta.status === 'fulfilled' ? (meta.value?.models ?? 0) : null,
+      });
     }
 
     // 给清单里没有能力记录的模型补探一次。平时开机自动跑,这个按钮是给
