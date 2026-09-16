@@ -471,9 +471,29 @@ export class Gateway {
     this.metadataAttemptAt = 0;
     this.metadataFetch = null;
     // 免费模型可用性是独立于能力记录的短请求探针。结果只在内存里留存:
-    // 重启后重新确认,避免把旧 IP/旧上游状态当成当前事实。
+    // 重启后重新确认,避免把旧 IP/旧上游状态当成当天事实。
+    //
+    // 探针必须带上和真实请求同形的身份头。它原来只调 this.forward(body),那条路
+    // 不经过 handleChat 的 identityHeaders,出站就是裸 `User-Agent: node` 且没有
+    // x-opencode-session —— 而上游对免费层是**认这个的**:2026-09-16 正交实测,
+    // 同一个模型、同一时刻:
+    //
+    //   node UA + 无 session, max_tokens=1  → 400 "free tier can only be used in OpenCode"
+    //   仅补上 session                       → 429(认了,只是限流)
+    //   cli UA + session                     → 200 OK
+    //
+    // 于是每个模型都被这句 400 判成 terminal/unavailable,面板整片灰掉 —— 而
+    // big-pickle 走真实请求连打三次全是 200。探测反而比它要测的东西更容易失败,
+    // 这就是那种「绿着的模型被涂灰」的假警报。
+    this.identity = (model) => ({
+      ...IDENTITY_DEFAULTS,
+      'x-opencode-request': `req_${stableSessionId(`probe:${model}`)}`,
+      // 按模型定 session:探测内容固定是 'ping',不掺模型名的话所有模型会算成
+      // 同一个会话,上游的会话级限流就会让它们互相踩。
+      'x-opencode-session': stableSessionId(`probe-session:${model}`),
+    });
     this.availability = new ModelAvailability({
-      post: (body) => this.forward(body),
+      post: (body) => this.forward(body, Infinity, this.identity(body?.model)),
       logger,
     });
     this.availabilityFetch = null;
@@ -483,9 +503,13 @@ export class Gateway {
     // (见 probeCapabilities)。post 直接给 forward:探测要的就是「发一次非流式
     // 请求,成功给我 JSON、失败给我 {status, body}」,而且它不记账 —— 探测的
     // 出站不该出现在面板的调用统计里。
+    //
+    // identity 和 availability 那条同样是必须的:没有 session 时上游一律回
+    // 「free tier can only be used in OpenCode」,能力探测就永远探不到东西
+    // (实测开机日志里全是「2 个没探到 ... 档位:500」)。
     this.caps = new Capabilities({
       file: CAPS_FILE,
-      post: (body) => this.forward(body),
+      post: (body) => this.forward(body, Infinity, this.identity(body?.model)),
       logger,
     });
     setModelEfforts(this.caps.effortMap());
