@@ -410,20 +410,22 @@ function stableSessionId(signal) {
 }
 
 /**
- * 请求 ID。形状对齐真实 CLI 的 `msg_<6 位 hex 时间戳><21 位 mixed alnum>`。
+ * 请求 ID。形状对齐真实 CLI 的 `msg_<6 位 hex><19 位 mixed alnum>`。
  *
- * 实测它**不在准入门槛里**(去掉照样 200),所以这里只求形状一致,不追求和
- * CLI 逐位相同 —— 真要校验也是校验 `msg_` 前缀和整体长度。用哈希而不是
- * `Date.now()`:同一个上游请求在多次节点重试之间必须保持同一个 ID,否则上游
- * 会把每次重试看成新请求,会话路由和 prompt cache 都会碎掉。
+ * 实测它**不在准入门槛里**(去掉照样 200),这里只求形状一致,少一个和真
+ * CLI 的差异。每个请求独立生成(不像 session 那样按对话稳定)—— 真 CLI 就是
+ * 每请求一个,而且这个值不参与会话路由,不需要在重试之间保持。
+ *
+ * 时间戳那 6 位仍取当前毫秒的低 24 位,和 CLI 的写法一致。
  */
-function stableRequestId(signal) {
-  const digest = crypto.createHash('sha256').update(`msg\0${signal}`).digest();
+function newRequestId() {
+  const digest = crypto.createHash('sha256')
+    .update(`${Date.now()}\0${crypto.randomUUID()}`).digest();
   const byteAt = (i) => digest[i % digest.length];
   let hex = '';
   for (let i = 0; i < 6; i++) hex += (byteAt(i) % 16).toString(16);
   let alnum = '';
-  for (let i = 0; i < 21; i++) alnum += SESSION_ALNUM[byteAt(6 + i) % 62];
+  for (let i = 0; i < 19; i++) alnum += SESSION_ALNUM[byteAt(6 + i) % 62];
   return `msg_${hex}${alnum}`;
 }
 
@@ -471,9 +473,8 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
     || (typeof body?.metadata?.session_id === 'string' ? headerSafe(body.metadata.session_id) : '');
   const seed = conversationSeed(body);
   out['x-opencode-session'] = explicitSession || (seed ? stableSessionId(seed) : uuid());
-  // 请求 ID 同样按会话派生:同一个对话的多轮请求给同一个 ID,换节点重试也复用
-  // (上游按会话做路由和 prompt cache)。seed 还没算出来时退回 uuid。
-  out['x-opencode-request'] = pick('x-opencode-request') || stableRequestId(seed || uuid());
+  // 请求 ID 客户端给了就透传,没给就按 msg_ 形状造一个
+  out['x-opencode-request'] = pick('x-opencode-request') || newRequestId();
   // 这两个没有合理的默认值,客户端没给就别凭空造
   for (const n of ['x-session-id', 'x-title']) {
     const v = pick(n);
@@ -910,7 +911,9 @@ export class Gateway {
     // 免费层准入:上游要求 stream:true 且 tools 里集齐五个核心工具名(见 dialects
     // 的 gateChatBody)。这一步必须紧跟在 toUpstream 之后 —— 它改的是**出站的
     // chat body**,放在翻译之后才对得上形状。
-    const gate = gateChatBody(body);
+    // 只对走 chat 端点的方言过闸。Responses 是另一条路径(/zen/v1/responses),
+    // 它的 body 形状不一样,套 chat 的门禁既没意义又会把请求改坏。
+    const gate = dialect === RESPONSES ? null : gateChatBody(body);
 
     // 严格透传:客户端点哪个模型就发哪个,但只放行实时免费清单里的。
     // 以前这里无条件改写成一个固定模型 —— 客户端于是拿到的是另一个模型的回答,
@@ -1230,7 +1233,10 @@ export class Gateway {
       }
       const t0 = Date.now();
       try {
-        const useBuffered = !wantStream && gate?.forcedStream === true;
+        // 客户端要非流式就一律缓冲拼装:上游本来就只收 stream:true(见
+        // gateChatBody),RESPONSES 那条不过闸但也同理 —— 与其逐个方言判断
+        // 「上游这条路上收不收流」,不如统一成「客户端要非流式 → 我们替他收」。
+        const useBuffered = !wantStream;
         const result = useBuffered
           ? await this.forwardBuffered(res, body, dialect, left(), identity, lane?.agent, signal)
           : await this.forwardStream(res, body, dialect, left(), identity, lane?.agent, signal);

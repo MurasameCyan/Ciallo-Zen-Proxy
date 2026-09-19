@@ -48,6 +48,32 @@ const attachmentKind = (part) => {
 };
 
 /**
+ * 从 **Responses 事件流** 里取出完整响应对象。
+ *
+ * Responses 的 sink 近乎透传,所以缓冲里就是上游那一串 response.* 事件。
+ * 完整对象挂在 response.completed 事件的 response 字段上 —— 直接取它,
+ * 不要去逐段拼 output:上游怎么分片是它的事,我们照抄整块最不容易出错。
+ *
+ * 取不到 completed(比如上游提前断了)时退回 null,调用方按失败处理。
+ */
+export function assembleFromResponsesEvents(sseText, model = '') {
+  let last = null;
+  for (const rawLine of String(sseText).split('\n')) {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    let j;
+    try { j = JSON.parse(payload); } catch { continue; }
+    if (!j || typeof j !== 'object') continue;
+    if (j.type === 'response.completed' && j.response) return j.response;
+    // 有些实现把整块 response 直接发出来(没有 type 包装),留作兜底
+    if (j.object === 'response') last = j;
+  }
+  return last;
+}
+
+/**
  * 从 **Anthropic 事件流** 回拼一条 chat.completion 形状的结果。
  *
  * 为什么需要这一层:强制流式之后,非流式客户端要我们替它收完再拼(见
@@ -369,6 +395,10 @@ export const RESPONSES = {
   },
   respond: (res, oai) => json(res, oai),
   sink: (res) => responsesSink(res),
+  // Responses 的 sink 是近乎透传,所以缓冲里是上游的 response.* 事件流。
+  // 完整对象在 response.completed 的 response 字段里,直接取它 —— 比重新
+  // 拼装各段 output 更可靠(上游的 output 分片规则我们没必要猜)。
+  collect: (sseText, model) => assembleFromResponsesEvents(sseText, model),
 };
 
 /** OpenAI 流:上游字节原样透传,不解析不重排 */

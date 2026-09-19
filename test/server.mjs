@@ -701,21 +701,40 @@ await t('calls 坏成对象/字符串时退回空数组,不让面板拿着它去
 
 // ── OpenCode 身份头 ─────────────────────────────────────
 
-await t('身份头:缺的补默认值,客户端给了的优先', () => {
+await t('身份头:User-Agent 用我们的,其余缺的补默认、客户端给了的优先', () => {
   const h = identityHeaders({ headers: { 'x-opencode-project': 'my-proj' } }, () => 'uuid-1');
-  assert.equal(h['User-Agent'], 'opencode-cli/1.0.0');
+  // UA 刻意不接受客户端透传:上游免费层要求首 token 是 opencode/<version>
+  // (低于 1.18.0 回 426),而真实客户端永远会带自己的 UA。这条断言的意义就是
+  // 挡住「把它改回透传」—— 那会让所有请求吃 403,而且很难查。
+  assert.match(h['User-Agent'], /^opencode\/\d+\.\d+\.\d+/);
   assert.equal(h['x-opencode-client'], 'cli');
   assert.equal(h['x-opencode-project'], 'my-proj', '客户端值优先');
-  assert.equal(h['x-opencode-request'], 'uuid-1');
+  // 请求 ID 按会话派生(不是直接拿 uuid),形状对齐真实 CLI 的
+  // msg_<6位hex><21位 alnum>。上游不校验它,但形状一致少一个变量。
+  assert.match(h['x-opencode-request'], /^msg_[0-9a-f]{6}[0-9A-Za-z]{19}$/);
   assert.equal(h['x-opencode-session'], 'uuid-1');
   assert.equal(h['x-title'], undefined, '没合理默认值的就别凭空造');
+});
+
+await t('身份头:UA 版本不低于上游下限(低于 1.18.0 会被 426 挡回)', () => {
+  const h = identityHeaders({ headers: {} }, () => 'u');
+  const m = /^opencode\/(\d+)\.(\d+)\.(\d+)/.exec(h['User-Agent']);
+  assert.ok(m, `UA 首 token 必须是 opencode/<version>,实际 ${h['User-Agent']}`);
+  const [, major, minor] = m.map(Number);
+  assert.ok(major > 1 || (major === 1 && minor >= 18), `版本 ${major}.${minor} 低于上游要求 1.18`);
+});
+
+await t('身份头:客户端自带的 UA 不会被透传(带了自己的 UA 也一样)', () => {
+  const h = identityHeaders({ headers: { 'user-agent': 'claude-cli/2.0.0' } }, () => 'u');
+  assert.match(h['User-Agent'], /^opencode\//, '客户端 UA 必须被替换掉');
+  assert.ok(!h['User-Agent'].includes('claude-cli'), '不能把客户端 UA 混进来');
 });
 
 await t('身份头:读入站头大小写不敏感', () => {
   // Node 收到的 req.headers 本来就是小写,但客户端和测试夹具不一定 ——
   // 大小写敏感的话「客户端值优先」这条会在真实请求上悄悄失效
-  const h = identityHeaders({ headers: { 'USER-AGENT': 'my-cli/9', 'X-Opencode-Session': ' sess-7 ' } }, () => 'uuid-2');
-  assert.equal(h['User-Agent'], 'my-cli/9');
+  const h = identityHeaders({ headers: { 'X-Opencode-Project': ' proj-9 ', 'X-Opencode-Session': ' sess-7 ' } }, () => 'uuid-2');
+  assert.equal(h['x-opencode-project'], 'proj-9', '顺手去掉首尾空白');
   assert.equal(h['x-opencode-session'], 'sess-7', '顺手去掉首尾空白');
 });
 
@@ -779,12 +798,15 @@ await t('身份头:没有显式 session 时按第一条 user 内容生成稳定 
     messages: [{ role: 'user', content: 'different opening' }],
   } }, () => 'req-c');
 
-  assert.match(first['x-opencode-session'], /^ses_[0-9a-f]{24}$/);
+  // 形状是上游准入的一部分:必须 ses_<12 位小写 hex><14 位 alnum>
+  // (2026-09-19 实测,形状不对/缺失一律 403 FreeTierError)
+  assert.match(first['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
   assert.equal(first['x-opencode-session'], grown['x-opencode-session'],
     '对话增长后第一条 user 不变,session 就必须不变');
   assert.notEqual(first['x-opencode-session'], other['x-opencode-session']);
-  assert.equal(first['x-opencode-request'], 'req-a', 'request ID 仍是每个请求单独生成');
-  assert.equal(grown['x-opencode-request'], 'req-b');
+  assert.match(first['x-opencode-request'], /^msg_[0-9a-f]{6}[0-9A-Za-z]{19}$/);
+  assert.notEqual(first['x-opencode-request'], grown['x-opencode-request'],
+    '同一对话的两轮请求 ID 不同(它按请求生成,不像 session 按对话稳定)');
 });
 
 await t('身份头的值必须洗掉 Node 不认的字符 —— 否则一个畸形 body 字段能烧掉整轮重试', () => {
@@ -866,7 +888,7 @@ await t('Chat、Responses、Anthropic 三个入口用同一套稳定 session', a
   assert.equal(new Set(affinityKeys).size, 1, '三种协议必须共用同一套 session+model 调度键');
 });
 
-await t('完整身份头开关关闭时仍发送稳定 session 标识', async () => {
+await t('完整身份头开关关闭时,UA 与稳定 session 仍必须发(它们是准入门槛)', async () => {
   const cfg = { ...load(), opencodeIdentityHeaders: false };
   const g = new Gateway(cfg, () => {});
   g.getAllNodes = async () => ['A'];
@@ -878,8 +900,12 @@ await t('完整身份头开关关闭时仍发送稳定 session 标识', async ()
   const req = Readable.from([JSON.stringify(body)]);
   req.headers = {};
   await g.handleChat(req, fakeRes(), OPENAI);
-  assert.match(sent?.['x-opencode-session'] || '', /^ses_[0-9a-f]{24}$/);
-  assert.equal(sent?.['x-opencode-client'], undefined, '完整身份头仍受开关控制');
+  // 这两条 2026-09-19 起是上游免费层的准入条件,不再受实验开关控制:
+  // 关了开关就不发的话,每个请求都会吃 403 FreeTierError。
+  assert.match(sent?.['x-opencode-session'] || '', /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  assert.match(sent?.['User-Agent'] || '', /^opencode\/\d+\.\d+\.\d+/);
+  assert.equal(sent?.['x-opencode-client'], undefined, '可选的那几个仍受开关控制');
+  assert.equal(sent?.['x-opencode-project'], undefined, '可选的那几个仍受开关控制');
 });
 
 await t('文本模型附件降级接入真实 Messages 请求流,未知模态仍透传图片', async () => {
@@ -917,7 +943,8 @@ await t('身份头:不同请求的 request ID 不一样', () => {
   const a = identityHeaders({ headers: {} });
   const b = identityHeaders({ headers: {} });
   assert.notEqual(a['x-opencode-request'], b['x-opencode-request']);
-  assert.match(a['x-opencode-request'], /^[0-9a-f-]{36}$/);
+  // 形状对齐真实 CLI:msg_<6 位 hex><19 位 alnum>
+  assert.match(a['x-opencode-request'], /^msg_[0-9a-f]{6}[0-9A-Za-z]{19}$/);
 });
 
 await t('会话调度:所有会话粘同一个节点,用完额度才整体迁移', () => {
@@ -1277,7 +1304,7 @@ await t('lane:子 lane 请求成功后 release,主 lane 不受影响', async () 
   assert.equal(g.lanes.children().length, 1, '子 lane 仍存活,等待空闲回收');
 });
 
-await t('reqOpts:开关关着时出站还是裸 User-Agent: node', () => {
+await t('reqOpts:不带身份头时 UA 是 node(models.dev 等公开端点);带身份头时被覆盖成可信 UA', () => {
   const g = new Gateway(load(), () => {});
   const off = g.reqOpts('{}', { accept: '*/*', timeout: 1000 });
   assert.equal(off.headers['User-Agent'], 'node');
@@ -1285,7 +1312,8 @@ await t('reqOpts:开关关着时出站还是裸 User-Agent: node', () => {
   assert.equal(off.headers.Authorization, undefined, '免费端点认的就是「不带 Bearer」这个形态');
 
   const on = g.reqOpts('{}', { accept: '*/*', timeout: 1000, identity: identityHeaders({ headers: {} }) });
-  assert.equal(on.headers['User-Agent'], 'opencode-cli/1.0.0', '身份头得盖掉默认的 node');
+  // 免费层要求 UA 首 token 是 opencode/<version>,身份头必须盖掉默认的 node
+  assert.match(on.headers['User-Agent'], /^opencode\/\d+\.\d+\.\d+/);
   assert.equal(on.headers['x-opencode-client'], 'cli');
   assert.equal(on.headers['Content-Length'], 2, 'Content-Length 排在身份头后面,不能被盖掉');
 });
@@ -1354,6 +1382,11 @@ function retryGateway(file, script) {
   };
   g.forward = run;
   g.forwardStream = run;
+  // 非流式客户端现在也走流式出站(上游只收 stream:true,见 gateChatBody),
+  // 由 forwardBuffered 缓冲后拼回 JSON。它的契约和 forward 一样「成功给对象、
+  // 失败抛 {status}」,所以同一份脚本能直接喂它,免得重试循环的测试只覆盖
+  // 流式那条路。
+  g.forwardBuffered = run;
   return g;
 }
 
@@ -1367,7 +1400,7 @@ await t('客户端断开:在飞的上游请求被 abort,而且不再换节点重
   const res = fakeRes();
   let signalAtCall = null;
   const g = retryGateway('sm-abort.json', (i, node, args) => {
-    signalAtCall = args[5];                 // forward 的第 6 个形参就是 signal
+    signalAtCall = args[6];                 // forwardStream(res,body,dialect,budget,identity,agent,signal)
     assert.ok(signalAtCall, 'attempt 必须把取消信号传进出站');
     res.hangup();                           // 客户端此刻挂断
     assert.equal(signalAtCall.aborted, true, '断开应当场 abort 在飞请求');
@@ -1625,7 +1658,10 @@ await t('同一节点上的网络重试:每次真发出去都记一笔,不是整
   assert.equal(d.byNode.A.timeout, 3);
   assert.equal(d.byNode.B.success, 1);
   assert.deepEqual(g.tries, ['A', 'A', 'A', 'B']);
-  assert.ok(g.forwardArgs.every((args) => args[2] === identity),
+  // forward() 的签名是 (body, budget, identity, path, agent, signal),identity 在第 3 个;
+  // 但非流式客户端现在也走 forwardStream(上游只收 stream:true),
+  // 它的签名是 (res, body, dialect, budget, identity, agent, signal),identity 在第 5 个。
+  assert.ok(g.forwardArgs.every((args) => args[4] === identity),
     '同一次请求的网络重试和换节点必须复用同一组 identity headers');
   assert.equal(g.affinity.get(affinityKey), 'B', '网络错误重试耗尽后也要把绑定迁到新节点');
 });

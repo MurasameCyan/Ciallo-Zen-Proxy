@@ -59,23 +59,59 @@ const STREAM_CHUNKS = [
   { choices: [{ delta: { content: '世界' } }] },
   { choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } },
 ];
-// 只替掉真正出网的两个方法,轮换/冷却/方言分发全部走真代码
-let sent = null;                 // 最后一次真发给上游的 body,用来断言透传结果
+// 只替掉真正出网的方法,轮换/冷却/方言分发全部走真代码。
+//
+// 注意:非流式客户端也会走**流式出站**(上游免费层只收 stream:true,见
+// gateChatBody),由 forwardBuffered 缓冲后拼回 JSON。所以这里的位置和
+// 以前不同 —— forward 只在 RESPONSES(不经过闸)那条路上还会被调到。
+let streamChunks = STREAM_CHUNKS;   // 各测试可临时换掉它来规定上游吐什么
+let sent = null;                    // 最后一次真发给上游的 body,用来断言透传结果
+
 gw.forward = async (body) => {
   sent = body;
-  return {
+  const sse = streamChunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join('');
+  return (await import('../server/dialects.mjs')).assembleChatCompletion(sse, body?.model) || {
     model: 'm',
     choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: '2' } }],
     usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
   };
 };
 gw.forwardStream = async (res, body, dialect) => {
+  sent = body;
   res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
   const sink = dialect.sink(res, body.model);
-  for (const c of STREAM_CHUNKS) sink.write(`data: ${JSON.stringify(c)}\n\n`);
+  for (const c of streamChunks) sink.write(`data: ${JSON.stringify(c)}\n\n`);
   sink.write('data: [DONE]\n\n');
   sink.end();
-  return { ok: true, usage: STREAM_CHUNKS.at(-1).usage };
+  return { ok: true, usage: streamChunks.at(-1)?.usage, started: true };
+};
+// 非流式客户端走这条:把同一段上游流收下来,再按方言拼成完整响应。
+//
+// Responses 那条路上的上游事件形状和 chat 完全不同(response.* 事件),所以
+// 这里按方言生成对应的帧 —— 拿 chat 的块喂 Responses 的 sink,收尾的
+// response.completed 根本不会出现,拼装只能拿到 null。
+const responsesFrames = (usage) => [
+  { type: 'response.output_text.delta', delta: '你好' },
+  { type: 'response.output_text.delta', delta: '世界' },
+  { type: 'response.completed', response: { object: 'response', id: 'r', model: 'm', output: [], usage } },
+];
+gw.forwardBuffered = async (res, body, dialect) => {
+  sent = body;
+  let sse = '';
+  const shim = {
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(chunk) { sse += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk); },
+    end() {},
+  };
+  const sink = dialect.sink(shim, body.model);
+  const frames = dialect.name === 'responses'
+    ? responsesFrames({ input_tokens: 3, output_tokens: 2 })
+    : streamChunks;
+  for (const c of frames) sink.write(`data: ${JSON.stringify(c)}\n\n`);
+  sink.write('data: [DONE]\n\n');
+  sink.end();
+  return dialect.collect(sse, body.model);
 };
 
 const app = createApp({ cfg, creds: { user: 'a', pass: 'p' }, gateway: gw });
@@ -94,8 +130,10 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
     body: JSON.stringify({ model: MODEL, messages: [{ role: 'user', content: 'hi' }] }),
   });
   const j = await r.json();
-  j.choices?.[0]?.message?.content === '2'
-    ? ok('OpenAI 非流式原样透传')
+  // 非流式请求也走流式出站(上游只收 stream:true),网关收完拼成完整响应 ——
+  // 所以这里的内容来自上面那串上游 chunk,拼装正确才会是「你好世界」
+  j.choices?.[0]?.message?.content === '你好世界' && j.object === 'chat.completion'
+    ? ok('OpenAI 非流式:上游流被完整拼成一条 chat.completion')
     : no(`OpenAI 非流式: ${JSON.stringify(j).slice(0, 150)}`);
 }
 
@@ -107,7 +145,9 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
     body: JSON.stringify({ model: MODEL, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
   });
   const j = await r.json();
-  const good = j.type === 'message' && j.content?.[0]?.text === '2' && j.usage?.input_tokens === 3;
+  // input_tokens 在上游流式事件里恒为 0(message_start 就发 0,真 CLI 亦然),
+  // 所以这里断言文本和 output_tokens —— 后者来自流尾的 message_delta
+  const good = j.type === 'message' && j.content?.[0]?.text === '你好世界' && j.usage?.output_tokens === 2;
   good ? ok('Anthropic 非流式转成 Messages 形状') : no(`Anthropic 非流式: ${JSON.stringify(j).slice(0, 150)}`);
 }
 
@@ -258,6 +298,7 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
 // 头都发出去了还换节点重发,等于把两半响应拼给客户端。
 // 这里让上游在吐了一半之后炸掉,数 forwardStream 被调了几次。
 {
+  const savedMidStreamFwd = gw.forwardStream;
   let calls = 0;
   gw.forwardStream = async (res, body, dialect) => {
     calls++;
@@ -282,21 +323,30 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   events.at(-1) === 'message_stop'
     ? ok('中途失败仍补上合法收尾,客户端不会挂到超时')
     : no(`中途失败末事件是 ${events.at(-1)}`);
+
+  // 必须还原:不还原的话后面每个非流式请求都会打在这个「吐半句然后失败」的
+  // 桩上,表现为一串和本用例无关的失败(踩过)
+  gw.forwardStream = savedMidStreamFwd;
 }
 
 // ── Responses:非流式透传 + 字符串 input 补数组 + 嵌套 reasoning.effort ──
 // 上游原生支持 Responses(见 gateway 的 RESPONSES 方言),所以这条是「近乎透传」。
 {
+  // Responses 走的是另一条上游路径(/zen/v1/responses),不过闸,也是唯一还会
+  // 走 forward 非流式出站的方言 —— 这里两条都桩上,免得以后哪条改了实测不到
   const savedFwd = gw.forward;
+  const savedFwdStream = gw.forwardStream;
   let rsent = null;
-  gw.forward = async (body) => {
-    rsent = body;
-    return {
-      object: 'response', model: 'm',
-      output: [{ type: 'message', content: [{ type: 'output_text', text: '2' }] }],
-      usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
-    };
+  const RESP = {
+    object: 'response', model: 'm',
+    output: [{ type: 'message', content: [{ type: 'output_text', text: '2' }] }],
+    usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
   };
+  // 非流式会走 forwardBuffered(和真网关一致),所以只包一层记录出站 body,
+  // 缓冲与拼装还是用共享桩的实现 —— 不然断言的是个假的出站 body
+  const savedBuffered = gw.forwardBuffered;
+  gw.forward = async (body) => { rsent = body; return RESP; };
+  gw.forwardBuffered = async (res, body, dialect) => { rsent = body; return savedBuffered(res, body, dialect); };
 
   const r = await fetch(`${base}/v1/responses`, {
     method: 'POST',
@@ -304,8 +354,10 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
     body: JSON.stringify({ model: MODEL, input: [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }] }),
   });
   const j = await r.json();
-  j.object === 'response' && j.output?.[0]?.content?.[0]?.text === '2'
-    ? ok('Responses 非流式原样透传(不翻译成 chat)')
+  // 非流式客户端现在也由网关收流拼装:取的是上游 response.completed 里的完整
+  // 对象,所以这里应当是一个 Response 形状(object=response)
+  j.object === 'response' && j.usage?.input_tokens === 3
+    ? ok('Responses 非流式:从 response.completed 取回完整对象')
     : no(`Responses 非流式: ${JSON.stringify(j).slice(0, 150)}`);
 
   // 字符串 input:上游只认数组(纯字符串 → 400 Empty input messages),网关补上
@@ -323,6 +375,8 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
     : no(`reasoning 没进对地方:嵌套=${JSON.stringify(rsent?.reasoning)} 顶层=${JSON.stringify(rsent?.reasoning_effort)}`);
 
   gw.forward = savedFwd;
+  gw.forwardStream = savedFwdStream;
+  gw.forwardBuffered = savedBuffered;
 }
 
 // ── Responses 流式:response.* 原样透传,收尾漏出的 chat 杂块吞掉 ──
