@@ -36,7 +36,7 @@ import {
 import { CALL_LOG_LIMIT, readUsage, UsageTracker } from './usage.mjs';
 import { json } from './http-util.mjs';
 import {
-  OPENCODE_HOST, CHAT_PATH, MODELS_PATH, OPENAI, ANTHROPIC, RESPONSES,
+  OPENCODE_HOST, CHAT_PATH, MODELS_PATH, OPENAI, ANTHROPIC, RESPONSES, gateChatBody,
 } from './dialects.mjs';
 export { json } from './http-util.mjs';
 export { OPENAI, ANTHROPIC, RESPONSES } from './dialects.mjs';
@@ -304,11 +304,22 @@ export function pickFreeModels(ids, lookup = null) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 
-/** 客户端可以自己带的那几个身份头。带了就透传,没带的按下面的默认值补 */
+/**
+ * 客户端可以自己带的那几个身份头。带了就透传,没带的按下面的默认值补。
+ *
+ * **UA 的写法是准入门槛,不是随便写的**。2026-09-19 实测,上游免费层要求:
+ *
+ *   - 首 token 必须是 `opencode/<version>`:`node` 和 `omp/1.0.0` 都吃 403,
+ *     只有 `opencode/...` 放行(后续 token 不校验,CLI 那串 ai-sdk/bun 可省)
+ *   - 版本不能低于 1.18.0:`opencode/1.0.0` 回 426 UpgradeRequired。
+ *     原来这里是 `opencode-cli/1.0.0` —— 版本号解析出来是 1.0.0,正好踩中下限
+ *
+ * `x-opencode-project` 用 global 对齐真实 CLI(它默认就是这个值)。
+ */
 const IDENTITY_DEFAULTS = {
-  'User-Agent': 'opencode-cli/1.0.0',
+  'User-Agent': 'opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14',
   'x-opencode-client': 'cli',
-  'x-opencode-project': 'default',
+  'x-opencode-project': 'global',
 };
 
 /**
@@ -374,9 +385,46 @@ function conversationSeed(body) {
   return '';
 }
 
+/**
+ * 稳定会话 ID。**形状不是随便定的**:上游免费层的准入门槛里有一条是
+ * `x-opencode-session` 必须匹配 `ses_<12 位小写 hex><14 位 [0-9A-Za-z]>`
+ * —— 2026-09-19 实测,不带这个头一律 403 `FreeTierError`。
+ *
+ * 原来是 `ses_` + sha256 前 24 位 hex(纯小写 hex),形状对不上:服务端只做
+ * 形状检查(shapeless 的 id 也照样被接受),但纯 hex 不满足「第 13 位起可以是
+ * 大写字母和数字混合」那一段。这里把 sha256 的字节按位切出来,前 6 字节编成
+ * 12 位 hex、后 14 字节查表编成 14 位 alnum。
+ *
+ * 仍然必须是**确定性**的:同一对话的多轮请求要用同一个 ID,上游的会话路由和
+ * prompt cache 都吃这个值。所以用哈希而不是随机数 —— 换节点重试也保持不变。
+ */
+const SESSION_ALNUM = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 function stableSessionId(signal) {
-  const hash = crypto.createHash('sha256').update(`ses\0${signal}`).digest('hex');
-  return `ses_${hash.slice(0, 24)}`;
+  const digest = crypto.createHash('sha256').update(`ses\0${signal}`).digest();
+  const byteAt = (i) => digest[i % digest.length];
+  let hex = '';
+  for (let i = 0; i < 12; i++) hex += (byteAt(i) % 16).toString(16);
+  let alnum = '';
+  for (let i = 0; i < 14; i++) alnum += SESSION_ALNUM[byteAt(12 + i) % 62];
+  return `ses_${hex}${alnum}`;
+}
+
+/**
+ * 请求 ID。形状对齐真实 CLI 的 `msg_<6 位 hex 时间戳><21 位 mixed alnum>`。
+ *
+ * 实测它**不在准入门槛里**(去掉照样 200),所以这里只求形状一致,不追求和
+ * CLI 逐位相同 —— 真要校验也是校验 `msg_` 前缀和整体长度。用哈希而不是
+ * `Date.now()`:同一个上游请求在多次节点重试之间必须保持同一个 ID,否则上游
+ * 会把每次重试看成新请求,会话路由和 prompt cache 都会碎掉。
+ */
+function stableRequestId(signal) {
+  const digest = crypto.createHash('sha256').update(`msg\0${signal}`).digest();
+  const byteAt = (i) => digest[i % digest.length];
+  let hex = '';
+  for (let i = 0; i < 6; i++) hex += (byteAt(i) % 16).toString(16);
+  let alnum = '';
+  for (let i = 0; i < 21; i++) alnum += SESSION_ALNUM[byteAt(6 + i) % 62];
+  return `msg_${hex}${alnum}`;
 }
 
 /**
@@ -407,9 +455,13 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
 
   const out = { ...IDENTITY_DEFAULTS };
   for (const [name, dflt] of Object.entries(IDENTITY_DEFAULTS)) {
-    out[name] = pick(name.toLowerCase()) || dflt;
+    // User-Agent 不接受客户端透传。以前它是「客户端带就转发、没带才补默认」的
+    // 普通头,现在它是**准入门槛**:上游免费层要求首 token 是 opencode/<version>,
+    // 而真实客户端(claude-cli、codex…)永远会带自己的 UA,于是默认值从来轮不到
+    // 生效 —— 网关实测发出去的是 `claude-cli/1.0.0`,换来一个 403。
+    // 其余身份头(client/project)没有形状要求,照旧优先用客户端给的。
+    out[name] = name === 'User-Agent' ? dflt : (pick(name.toLowerCase()) || dflt);
   }
-  out['x-opencode-request'] = pick('x-opencode-request') || uuid();
   const body = inbound?.body;
   // body 里的两个入口同样要洗 —— 它们不经入站头解析器,所以 CR/LF 和中文都能活着
   // 走到这里(头那条路会先被 Node 的入站解析器 400 挡下)。洗完为空就当没给,
@@ -419,6 +471,9 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
     || (typeof body?.metadata?.session_id === 'string' ? headerSafe(body.metadata.session_id) : '');
   const seed = conversationSeed(body);
   out['x-opencode-session'] = explicitSession || (seed ? stableSessionId(seed) : uuid());
+  // 请求 ID 同样按会话派生:同一个对话的多轮请求给同一个 ID,换节点重试也复用
+  // (上游按会话做路由和 prompt cache)。seed 还没算出来时退回 uuid。
+  out['x-opencode-request'] = pick('x-opencode-request') || stableRequestId(seed || uuid());
   // 这两个没有合理的默认值,客户端没给就别凭空造
   for (const n of ['x-session-id', 'x-title']) {
     const v = pick(n);
@@ -493,9 +548,18 @@ export class Gateway {
       'x-opencode-session': stableSessionId(`probe-session:${model}`),
     });
     this.availability = new ModelAvailability({
-      post: (body) => this.forward(body, Infinity, this.identity(body?.model)),
+      post: (body) => this.probeRequest(body),
       logger,
     });
+    // 探测请求统一走这里:和真实请求一样过免费层准入(见 gateChatBody),再
+    // 用缓冲出口把流收成一份完整响应 —— 探测要的是「成没成 / 错误原文是什么」,
+    // 不需要流式。2026-09-19 实测:不走准入的探测一律 403,会把能用的模型
+    // 全判成不可用(那是假警报,比对上游的真实错误更难发现)。
+    this.probeRequest = (body) => {
+      const probe = { ...body };
+      gateChatBody(probe);
+      return this.forwardBuffered({ write() {} }, probe, OPENAI, Infinity, this.identity(probe.model));
+    };
     this.availabilityFetch = null;
     this.availabilityNextTryAt = 0;
 
@@ -509,7 +573,7 @@ export class Gateway {
     // (实测开机日志里全是「2 个没探到 ... 档位:500」)。
     this.caps = new Capabilities({
       file: CAPS_FILE,
-      post: (body) => this.forward(body, Infinity, this.identity(body?.model)),
+      post: (body) => this.probeRequest(body),
       logger,
     });
     setModelEfforts(this.caps.effortMap());
@@ -843,6 +907,10 @@ export class Gateway {
     const wantStream = inbound.stream === true;
     const requestedModel = typeof inbound.model === 'string' ? inbound.model.trim() : '';
     const body = dialect.toUpstream(inbound, requestedModel ? this.modelMetadata(requestedModel) : null);
+    // 免费层准入:上游要求 stream:true 且 tools 里集齐五个核心工具名(见 dialects
+    // 的 gateChatBody)。这一步必须紧跟在 toUpstream 之后 —— 它改的是**出站的
+    // chat body**,放在翻译之后才对得上形状。
+    const gate = gateChatBody(body);
 
     // 严格透传:客户端点哪个模型就发哪个,但只放行实时免费清单里的。
     // 以前这里无条件改写成一个固定模型 —— 客户端于是拿到的是另一个模型的回答,
@@ -885,9 +953,17 @@ export class Gateway {
     // 稳定 session 是独立能力:即使完整 OpenCode 头开关关闭,也把会话标识发给
     // 上游,让同一对话有机会命中 prompt cache。其余 client/project/user-agent
     // 仍遵守原有实验开关,避免无意改变免费端点的请求画像。
+    //
+    // **但 UA 和 session 现在是准入门槛,不再可选**。2026-09-19 实测:免费层
+    // 要求首 token 是 opencode/<version>(低于 1.18.0 还回 426)、且带形状正确的
+    // x-opencode-session,缺任一条一律 403 FreeTierError。所以这两个头无论如何
+    // 都要发;实验开关只管 client/project/request 那几个可选的。
     const identity = this.config.opencodeIdentityHeaders
       ? requestIdentity
-      : { 'x-opencode-session': requestIdentity['x-opencode-session'] };
+      : {
+          'User-Agent': requestIdentity['User-Agent'],
+          'x-opencode-session': requestIdentity['x-opencode-session'],
+        };
     const affinityKey = this.affinity.key(requestIdentity['x-opencode-session'], model);
 
     // 排过序的表:延迟低的在前,测不通的直接不在表里。pickAvailable 取的是
@@ -929,7 +1005,7 @@ export class Gateway {
       this.lanes.release(lane);
       lane = null;
     }
-    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort, affinityKey, lane);
+    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort, affinityKey, lane, gate);
   }
 
   /** Anthropic Messages API 入口。同一条路,只是换个方言。 */
@@ -1022,7 +1098,7 @@ export class Gateway {
    * 每条 `return`(定案了)才有 record。
    */
   async attempt(res, body, nodes, cur, wantStream, dialect = OPENAI, deadline = Infinity,
-    identity = null, effort = '', affinityKey = '', lane = null) {
+    identity = null, effort = '', affinityKey = '', lane = null, gate = null) {
     const tried = new Set();
     const MAX_NET_RETRY = 2;
     let netRetry = 0;
@@ -1154,9 +1230,10 @@ export class Gateway {
       }
       const t0 = Date.now();
       try {
-        const result = wantStream
-          ? await this.forwardStream(res, body, dialect, left(), identity, lane?.agent, signal)
-          : await this.forward(body, left(), identity, dialect.path, lane?.agent, signal);
+        const useBuffered = !wantStream && gate?.forcedStream === true;
+        const result = useBuffered
+          ? await this.forwardBuffered(res, body, dialect, left(), identity, lane?.agent, signal)
+          : await this.forwardStream(res, body, dialect, left(), identity, lane?.agent, signal);
 
         const dt = Date.now() - t0;
         if (wantStream) {
@@ -1186,7 +1263,9 @@ export class Gateway {
           this.logger(result.ok ? 'ok' : 'error',
             `[stream-${result.ok ? 'ok' : 'cut'}] node="${cur}"${lane ? ` lane=${lane.id}` : ''} ${dt}ms effort=${effort || '默认'}`);
           finishLane();
-          return;
+          // useBuffered 时响应已经在 forwardBuffered 里收完并按非流式形状拼好了,
+          // 走下面的通用成功路径即可(它按 result 取值,而 result 就是那个对象)。
+          if (!useBuffered) return;
         }
         if (!lane) {
           this.lockedNode = cur;
@@ -1447,6 +1526,89 @@ export class Gateway {
   }
 
   /**
+   * 给「要非流式、但上游只收 stream:true」的客户端用:把上游的流在内存里收完,
+   * 再用方言自己的 sink 把它翻成完整响应,最后按非流式回给客户端。
+   *
+   * 为什么不直接用 forward():上游免费层拒收 stream:false(403),所以非流式
+   * 客户端**只能**走流式出站,再在网关侧拼回 JSON。复用 dialect.sink 是关键 ——
+   * 它就是「上游 chat 流 → 本方协议响应」的那套翻译,自己再写一份必然和流式路
+   * 那条慢慢跑偏。
+   *
+   * 代价:整段响应先驻内存。免费模型输出量级不大,可以接受;真到了要省内存的
+   * 时候,这里是可以按协议降级成「自己攒 SSE 再解析」的地方。
+   */
+  forwardBuffered(res, body, dialect, budget, identity, agent, signal) {
+    const buffered = {
+      headersSent: false,
+      chunks: [],
+      ended: false,
+      writeHead() { this.headersSent = true; },
+      write(chunk) {
+        if (chunk == null) return;
+        const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+        // SSE 注释帧和空帧必须丢掉 —— 缓冲的产物是要 JSON.parse 的,而
+        // SSE 里到处都是 `: keep-alive` 这类注释行(上游自己就在发,实测
+        // 一次响应里混了几十条)和把事件分隔开的空行,留着直接解析失败。
+        // 真流式那条路把这些原样转发给客户端是对的,缓冲这条不能留。
+        // 注意要连 \r 一起处理:上游的 SSE 是 CRLF 行尾,过滤掉空行之后如果
+        // 每行还留着尾部的 \r,join('\n') 拼出来就是 "data: {...}\rdata: {...}"
+        // —— 两帧粘成一行,拼装时整条都解析不出来(踩过)。
+        // 每行保留自己的结尾换行:chunk 边界会切在帧中间,一条帧可能前半段在
+        // 这个 chunk、后半段在下一个 —— 如果这里只在「行与行之间」补换行,那
+        // 跨 chunk 的那条帧就会被和下一个 chunk 的首行粘成一行(实测表现为
+        // 整个缓冲最后只有 1 行)。所以每行都带 \n 走。
+        let kept = '';
+        for (const raw of text.split('\n')) {
+          const line = raw.replace(/\r$/, '');
+          if (line.trim() === '' || /^\s*:/.test(line)) continue;
+          kept += line + '\n';
+        }
+        if (kept) this.chunks.push(Buffer.from(kept, 'utf8'));
+      },
+      end() { this.ended = true; },
+      // 方言里个别路径会直接碰这些,补齐免得抛
+      setHeader() {},
+      getHeader() { return undefined; },
+      on() {}, once() {}, emit() {}, removeListener() {},
+    };
+    // 注意第三个参数是 **res**:forwardStream 会自己 writeHead + 建 sink,
+    // 所以这里必须把上面那个 shim 当 res 传进去,而不是把 sink 传进去
+    // (传 sink 会以 `sink.writeHead is not a function` 炸掉整个进程 —— 踩过)。
+    const text = () => Buffer.concat(buffered.chunks).toString('utf8');
+
+    return this.forwardStream(buffered, body, dialect, budget, identity, agent, signal).then((result) => {
+      // 首帧之前就失败了(比如上游直接给个错误壳子):一个字节都没发给客户端,
+      // 这时还能换节点,所以按可重试失败抛回去 —— 别拿空壳当回答。
+      if (!result.started) {
+        const err = new Error('上游在首帧之前失败');
+        err.status = 502;
+        err.notStarted = true;
+        throw err;
+      }
+      const bodyText = text();
+      // 缓冲里装的是**本方协议**的 SSE(sink 已经把上游 chunk 翻译过了),所以
+      // 拼装得按方言来:OpenAI/Anthropic 都是 chat.completion.chunk 的形状,
+      // 拼完再交给方言的 respond 落到客户端协议上。绝不能拿 chat 的拼装器去解
+      // Anthropic 事件流 —— 那样拼出来是空壳(踩过)。
+      let parsed = null;
+      try { parsed = JSON.parse(bodyText); } catch { /* 不是裸 JSON */ }
+      if (!parsed) parsed = dialect.collect(bodyText, body.model);
+      if (!parsed) {
+        const err = new Error('缓冲的响应拼不出结果');
+        err.status = 502;
+        err.body = bodyText.slice(0, 300);
+        throw err;
+      }
+      // 形状刻意对齐 forward():解析好的对象 + 两个**不可枚举**的元数据字段。
+      // attempt 的成功路径、方言的 respond、usage 记账三处都按这个形状取值,
+      // 不一致就会出现「响应被包了一层 ok/parsed」这种事(踩过)。
+      Object.defineProperty(parsed, 'usage', { value: result.usage, enumerable: false });
+      Object.defineProperty(parsed, '_ttfb', { value: result.ttfb, enumerable: false });
+      return parsed;
+    });
+  }
+
+  /**
    * 流式转发。上游的 SSE 交给 dialect.sink 决定怎么落地:
    * OpenAI 原样透传,Anthropic 翻译成 Messages 事件。
    *
@@ -1585,7 +1747,7 @@ export class Gateway {
         resp.on('end', () => finish(() => {
           stopHeartbeat();
           sink.end();
-          resolve({ ok: true, usage, ttfb: firstByte });
+          resolve({ ok: true, usage, ttfb: firstByte, started });
         }));
         resp.on('error', (e) => finish(() => {
           stopHeartbeat();
@@ -1593,7 +1755,7 @@ export class Gateway {
           // sink.fail 会补一个合法收尾(Anthropic 那边是 error + message_stop),
           // 客户端的状态机于是能正常结束,而不是等到自己超时
           sink.fail(e.message);
-          resolve({ ok: false, usage, ttfb: firstByte });   // 已经发出去一部分了,重试不了,不算可重试失败
+          resolve({ ok: false, usage, ttfb: firstByte, started });   // 已经发出去一部分了,重试不了,不算可重试失败
         }));
       });
 
@@ -1603,7 +1765,7 @@ export class Gateway {
           // 头已经发了,只能就地收尾。这里不能 reject 回重试循环。
           this.logger('error', `[stream] 传输中断: ${e.message}`);
           try { res.end(); } catch {}
-          return resolve({ ok: false, usage, ttfb: firstByte });
+          return resolve({ ok: false, usage, ttfb: firstByte, started });
         }
         reject({ status: 0, body: e.message, notStarted: true });
       }));

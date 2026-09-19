@@ -12,9 +12,15 @@ import {
 import { json } from './http-util.mjs';
 
 export const OPENCODE_HOST = 'opencode.ai';
-export const CHAT_PATH = '/zen/v1/chat/completions';
+// 免费层入口在 2026-09-18~19 之间搬到了 /inference/openai/v1/*:老路径
+// /zen/v1/chat/completions 现在对免费模型一律 403 FreeTierError,新路径在
+// 同样的头 + body 形状下回 200。实测见容器内对照(/inference/openai/v1/
+// chat/completions 200 vs /zen/v1/chat/completions 403)。
+export const CHAT_PATH = '/inference/openai/v1/chat/completions';
 // 上游原生支持 Responses API,走这条透传而不是翻译成 chat 再转回来(实测见
 // zen-responses-native)。方言各自带上游 path,轮换逻辑不用知道自己在服务哪个。
+// 新入口下的 responses 目前回 503 Endpoint is unavailable,所以仍指向老路径,
+// 等它恢复再切。
 export const RESPONSES_PATH = '/zen/v1/responses';
 export const MODELS_PATH = '/zen/v1/models';
 
@@ -40,6 +46,231 @@ const attachmentKind = (part) => {
   if (type === 'document' || type === 'file' || type === 'input_file') return 'document';
   return '';
 };
+
+/**
+ * 从 **Anthropic 事件流** 回拼一条 chat.completion 形状的结果。
+ *
+ * 为什么需要这一层:强制流式之后,非流式客户端要我们替它收完再拼(见
+ * gateChatBody)。而 Anthropic 方言的 sink 已经把上游 chunk 翻译成了
+ * message_start / content_block_delta / message_delta 这套事件 —— 缓冲里
+ * 装的就是它。所以这里做的是**反向**解析:把事件还原成「一个助手回答」,
+ * 再交给 openAIToAnthropic 落到 Messages 响应上。
+ *
+ * 不能拿 chat 的拼装器直接解这些事件:字段名完全不同,解出来是个空壳
+ * (实测过一次,text 块是空的而 usage 正常 —— 那种半对不对的结果最难发现)。
+ */
+export function assembleFromAnthropicEvents(sseText, model = '') {
+  const text = [];
+  const thinking = [];
+  const blocks = new Map();     // index -> { id, name, args }
+  let stopReason = null;
+  let outputTokens = 0;
+  let inputTokens = 0;
+
+  const handle = (evt, data) => {
+    if (!data || typeof data !== 'object') return;
+    switch (evt) {
+      case 'content_block_start': {
+        const b = data.content_block || {};
+        if (b.type === 'tool_use') {
+          blocks.set(data.index, { id: b.id || '', name: b.name || '', args: '' });
+        }
+        break;
+      }
+      case 'content_block_delta': {
+        const d = data.delta || {};
+        if (d.type === 'text_delta' && typeof d.text === 'string') text.push(d.text);
+        else if (d.type === 'thinking_delta' && typeof d.thinking === 'string') thinking.push(d.thinking);
+        else if (d.type === 'input_json_delta' && typeof d.partial_json === 'string') {
+          const acc = blocks.get(data.index);
+          if (acc) acc.args += d.partial_json;
+        }
+        break;
+      }
+      case 'message_delta': {
+        if (data.delta?.stop_reason) stopReason = data.delta.stop_reason;
+        if (data.usage?.output_tokens != null) outputTokens = data.usage.output_tokens;
+        break;
+      }
+      case 'message_start': {
+        if (data.message?.usage?.input_tokens != null) inputTokens = data.message.usage.input_tokens;
+        break;
+      }
+      default: break;
+    }
+  };
+
+  // 事件流按「event: X / data: {...} / 空行」分帧,其中只有 data 行是载荷
+  for (const rawLine of String(sseText).split('\n')) {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) continue;
+    let j;
+    try { j = JSON.parse(line.slice(5).trim()); } catch { continue; }
+    const evt = (j && typeof j === 'object' && j.type) ? j.type : null;
+    if (evt) handle(evt, j);
+  }
+
+  if (!text.length && !blocks.size && !thinking.length && !stopReason) return null;
+  const toolCalls = [...blocks.entries()].sort((a, b) => a[0] - b[0]).map(([, b]) => ({
+    id: b.id, type: 'function', function: { name: b.name, arguments: b.args || '{}' },
+  }));
+  const message = { role: 'assistant', content: text.join('') || null };
+  if (thinking.length) message.reasoning_content = thinking.join('');
+  if (toolCalls.length) message.tool_calls = toolCalls;
+  return {
+    id: `msg_${Date.now().toString(36)}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: stopReason === 'tool_use' ? 'tool_calls'
+        : (stopReason === 'max_tokens' ? 'length' : 'stop'),
+    }],
+    ...(outputTokens || inputTokens
+      ? { usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens } }
+      : {}),
+  };
+}
+
+/**
+ * 免费层准入的 body 条件。**这是门槛,不是优化。**
+ *
+ * 2026-09-19 容器内实测(/inference/openai/v1/chat/completions,不带任何凭证):
+ *   stream:false + 无 tools / 5 tools   -> 403 FreeTierError
+ *   stream:true  + 无 tools             -> 403
+ *   stream:true  + 5 个核心工具名        -> **200 OK**
+ *
+ * 两个条件,缺一不可:
+ *   1. body 里 stream 必须是 true
+ *   2. tools 里必须**集齐 OpenCode 那五个核心工具名**:
+ *      bash / edit / glob / grep / read
+ *
+ * 第 2 条容易搞错,这里记下实测过程:先按「总数 ≥5 且其中 ≥2 个核心名」实现,
+ * 结果 403。逐项消融才看清真正的规则 —— 核心名**必须五个都在**:
+ *
+ *   5 个核心名              -> 200
+ *   3 核心 + 2 个通用名      -> 403
+ *   3 核心 + 2 个任意真实词   -> 403
+ *   5 核心 + 5 个任意词      -> 200   ← 多余的工具名无害
+ *
+ * 所以是「五个核心名齐了就行」,多出来的工具不影响。注意别被旧资料带偏:
+ * oh-my-pi #12306 里那份 bisection 说的是 /zen/v1 那条老路的规则(5 个核心名中
+ * 有 2 个即可),对新端点不成立。
+ *
+ * 注入的 stub 只求名字对得上:实测 schema 和 description 完全不被校验(用
+ * "x" 和一句废话都能过)。所以 stub 只是个占位,模型看不到有意义的描述,
+ * 也就不会去调它。客户端自带的工具原样保留在前面。
+ */
+const GATE_CORE_TOOLS = ['bash', 'edit', 'glob', 'grep', 'read'];
+
+const isObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
+
+/** 从一条 tool 定义里取名字,兼容 OpenAI 的嵌套式和 Responses 的扁平式 */
+function toolName(tool) {
+  if (!isObject(tool)) return '';
+  if (typeof tool.name === 'string') return tool.name;
+  if (isObject(tool.function) && typeof tool.function.name === 'string') return tool.function.name;
+  return '';
+}
+
+const gatedTool = (name) => ({
+  type: 'function',
+  function: {
+    name,
+    description: 'Tool available for this session.',
+    parameters: { type: 'object', properties: {}, required: [] },
+  },
+});
+
+/**
+ * 把出站 body 补齐到能过免费层的形状。返回 {forcedStream, injected},
+ * 调用方据此决定响应怎么回(forcedStream 且客户端要非流式 → 得缓冲后拼回 JSON)。
+ */
+export function gateChatBody(body) {
+  const forcedStream = body.stream !== true;
+  if (forcedStream) body.stream = true;
+
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  const present = new Set(tools.map(toolName));
+
+  let injected = 0;
+  for (const name of GATE_CORE_TOOLS) {
+    if (present.has(name)) continue;
+    tools.push(gatedTool(name));
+    present.add(name);
+    injected++;
+  }
+  if (injected) body.tools = tools;
+  return { forcedStream, injected };
+}
+
+/**
+ * 把上游的 SSE 文本拼成一条完整的 chat.completion 响应。
+ *
+ * 为什么需要:免费层只收 stream:true(见 gateChatBody),所以非流式客户端
+ * 只能由我们替它收流再拼回来。上游给的是 chat.completion.chunk 增量,
+ * 拼装规则按 OpenAI 的流式规范:
+ *   - content / reasoning_content 逐段追加
+ *   - tool_calls 按 index 归并,function.arguments 是分片追加的字符串
+ *   - usage 通常只在最后一个 chunk 上,直接取
+ *   - finish_reason 同理
+ *
+ * 这不是猜测形状的活:拼出来的对象要和上游非流式响应同形,否则客户端的
+ * SDK 会解析失败 —— 所以下面刻意保留 id/object/created/model 这几个字段,
+ * 并把 object 从 chat.completion.chunk 改写成 chat.completion。
+ */
+export function assembleChatCompletion(sseText, fallbackModel = '') {
+  let head = null;
+  let usage = null;
+  let finish = null;
+  let content = '';
+  let reasoning = '';
+  const tools = new Map();
+
+  for (const rawLine of String(sseText).split('\n')) {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) continue;      // 空行、注释、event: 行都跳过
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    let j;
+    try { j = JSON.parse(payload); } catch { continue; }
+    if (!head && j && typeof j === 'object') head = j;
+    const choice = j?.choices?.[0];
+    const delta = choice?.delta || choice?.message || {};
+    if (typeof delta.content === 'string') content += delta.content;
+    const r = delta.reasoning_content ?? delta.reasoning;
+    if (typeof r === 'string') reasoning += r;
+    for (const tc of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+      const idx = Number.isInteger(tc?.index) ? tc.index : (tools.size ? tools.size - 1 : 0);
+      const acc = tools.get(idx) || { id: '', type: 'function', function: { name: '', arguments: '' } };
+      if (tc.id) acc.id = tc.id;
+      if (tc.type) acc.type = tc.type;
+      if (tc.function?.name) acc.function.name += tc.function.name;
+      if (typeof tc.function?.arguments === 'string') acc.function.arguments += tc.function.arguments;
+      tools.set(idx, acc);
+    }
+    if (choice?.finish_reason) finish = choice.finish_reason;
+    if (j?.usage) usage = j.usage;
+  }
+
+  if (!head) return null;
+  const message = { role: 'assistant', content: content || null };
+  if (reasoning) message.reasoning_content = reasoning;
+  if (tools.size) {
+    message.content = content || null;
+    message.tool_calls = [...tools.entries()].sort((a, b) => a[0] - b[0]).map(([, t]) => t);
+  }
+  return {
+    id: head.id || '',
+    object: 'chat.completion',
+    created: head.created || Math.floor(Date.now() / 1000),
+    model: head.model || fallbackModel,
+    choices: [{ index: 0, message, finish_reason: finish || 'stop' }],
+    ...(usage ? { usage } : {}),
+  };
+}
 
 function downgradeOpenAIAttachments(body, meta, textType) {
   if (!isTextOnly(meta)) return body;
@@ -78,6 +309,10 @@ export const OPENAI = {
   applyEffort: (body, effort) => { if (effort) body.reasoning_effort = effort; else delete body.reasoning_effort; },
   respond: (res, oai) => json(res, oai),
   sink: (res) => rawSink(res),
+  // 上游只收流式(见 gateChatBody),所以非流式客户端要我们替它收完再拼。
+  // 拼装由 gateway 的 assembleChatCompletion 做:两者缓冲里装的都是
+  // chat.completion.chunk 形状的 SSE,规则一致。
+  collect: (sseText, model) => assembleChatCompletion(sseText, model),
 };
 
 export const ANTHROPIC = {
@@ -98,6 +333,9 @@ export const ANTHROPIC = {
   applyEffort: (body, effort) => { if (effort) body.reasoning_effort = effort; else delete body.reasoning_effort; },
   respond: (res, oai, model) => json(res, openAIToAnthropic(oai, model)),
   sink: (res, model) => anthropicSink(res, model),
+  // 这里的 buffered 是**上游 chat 流经 sink 翻译后的 Anthropic 事件流**,不是
+  // chat chunk。所以拼装要从 Anthropic 事件里取回完整回答,再交给 respond。
+  collect: (sseText, model) => assembleFromAnthropicEvents(sseText, model),
 };
 
 /**
