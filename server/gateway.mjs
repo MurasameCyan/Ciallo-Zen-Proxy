@@ -39,7 +39,7 @@ import {
   OPENCODE_HOST, CHAT_PATH, MODELS_PATH, RESPONSES_PATH, OPENAI, ANTHROPIC, RESPONSES,
   gateChatBody, gateResponsesBody, responsesUpstreamDialect, chatToResponsesBody,
 } from './dialects.mjs';
-import { json } from './http-util.mjs';
+import { json, readUtf8Body } from './http-util.mjs';
 export { json } from './http-util.mjs';
 export { OPENAI, ANTHROPIC, RESPONSES } from './dialects.mjs';
 
@@ -926,11 +926,8 @@ export class Gateway {
    * 估偏一点没有后果;拿不到数导致客户端起不来才是真问题。
    */
   async handleCountTokens(req, res) {
-    let raw = '';
-    for await (const chunk of req) {
-      raw += chunk;
-      if (raw.length > 8e6) return ANTHROPIC.fail(res, 413, 'Request too large', 'request_too_large');
-    }
+    const raw = await readUtf8Body(req, 8e6);
+    if (raw === null) return ANTHROPIC.fail(res, 413, 'Request too large', 'request_too_large');
     let body;
     try { body = JSON.parse(raw); } catch { return ANTHROPIC.fail(res, 400, 'Invalid JSON', 'invalid_request_error'); }
 
@@ -950,14 +947,11 @@ export class Gateway {
 
   async handleChat(req, res, dialect = OPENAI) {
     const reqStart = Date.now();
-    let raw = '';
-    for await (const chunk of req) {
-      raw += chunk;
-      if (raw.length > 8e6) return dialect.fail(res, 413, 'Request too large', 'request_too_large');
-    }
+    const raw = await readUtf8Body(req, 8e6);
+    if (raw === null) return dialect.fail(res, 413, 'Request too large', 'request_too_large');
     // 预算按体积算,但从请求进来的那一刻起算 —— 几 MB 的上传本身就要几秒到几十秒,
     // 等收完才起算等于白送一段,而客户端是从发出请求就开始等的
-    const deadline = reqStart + budgetFor(raw.length);
+    const deadline = reqStart + budgetFor(Buffer.byteLength(raw, 'utf8'));
     let inbound;
     try { inbound = JSON.parse(raw); } catch { return dialect.fail(res, 400, 'Invalid JSON', 'invalid_request_error'); }
 

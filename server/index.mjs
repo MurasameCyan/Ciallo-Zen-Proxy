@@ -21,6 +21,7 @@ import {
   matches, parseBasic, readCookie, resolveCredentials,
   Sessions, FailWindow, SESSION_COOKIE, sessionCookie, CLEAR_COOKIE,
 } from './auth.mjs';
+import { readUtf8Body } from './http-util.mjs';
 
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const MAX_LOG = 500;
@@ -63,12 +64,11 @@ export function log(level, msg) {
   }
 }
 
-function readBody(req) {
-  return new Promise((resolve) => {
-    let raw = '';
-    req.on('data', (c) => { raw += c; if (raw.length > 1e6) req.destroy(); });
-    req.on('end', () => { try { resolve(JSON.parse(raw || '{}')); } catch { resolve({}); } });
-  });
+async function readBody(req) {
+  const raw = await readUtf8Body(req, 1e6);
+  if (raw === null) { req.destroy(); return {}; }
+  try { return JSON.parse(raw || '{}'); } catch { return {}; }
+
 }
 
 async function serveStatic(res, path) {

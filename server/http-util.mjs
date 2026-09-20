@@ -10,3 +10,20 @@ export function json(res, obj, code = 200) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(obj));
 }
+
+/**
+ * 收完整个请求体后再一次性按 UTF-8 解码。不能对每个网络 chunk 直接做
+ * `raw += chunk`:chunk 可能切在中文或 emoji 的多字节序列中,逐块解码会产出 U+FFFD。
+ * 超过 maxBytes 返回 null,调用方负责按自己的协议回 413。
+ */
+export async function readUtf8Body(req, maxBytes = Infinity) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    bytes += buf.byteLength;
+    if (bytes > maxBytes) return null;
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}

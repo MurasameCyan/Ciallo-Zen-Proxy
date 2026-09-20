@@ -968,6 +968,29 @@ await t('文本模型附件降级接入真实 Messages 请求流,未知模态仍
   ]);
 });
 
+await t('请求体跨 UTF-8 分片时保留中文,不把多字节字符替换成 �', async () => {
+  const g = new Gateway({ ...load(), opencodeIdentityHeaders: false }, () => {});
+  g.getAllNodes = async () => ['A'];
+  g.rankNodes = (nodes) => nodes;
+  g.ensureNode = async () => 'A';
+  let sent = null;
+  g.attempt = async (_res, body) => { sent = body; };
+
+  const payload = JSON.stringify({
+    model: FREE_MODELS[0],
+    messages: [{ role: 'user', content: '它有检查清单' }],
+  });
+  const bytes = Buffer.from(payload, 'utf8');
+  const marker = Buffer.from('它', 'utf8');
+  const split = bytes.indexOf(marker) + 1; // 刻意切在三字节字符中间
+  const req = Readable.from([bytes.subarray(0, split), bytes.subarray(split)]);
+  req.headers = {};
+  await g.handleChat(req, fakeRes(), OPENAI);
+
+  assert.equal(sent.messages[0].content, '它有检查清单',
+    '跨 chunk 的 UTF-8 字符必须原样进入上游 body');
+});
+
 await t('身份头:不同请求的 request ID 不一样', () => {
   const a = identityHeaders({ headers: {} });
   const b = identityHeaders({ headers: {} });

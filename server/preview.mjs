@@ -16,6 +16,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readUtf8Body } from './http-util.mjs';
 
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const PORT = Number(process.env.PORT) || 5173;
@@ -314,12 +315,11 @@ function json(res, obj, code = 200) {
   res.end(body);
 }
 
-function readBody(req) {
-  return new Promise((resolve) => {
-    let raw = '';
-    req.on('data', (c) => { raw += c; if (raw.length > 1e6) req.destroy(); });
-    req.on('end', () => { try { resolve(JSON.parse(raw || '{}')); } catch { resolve({}); } });
-  });
+async function readBody(req) {
+  const raw = await readUtf8Body(req, 1e6);
+  if (raw === null) { req.destroy(); return {}; }
+  try { return JSON.parse(raw || '{}'); } catch { return {}; }
+
 }
 
 async function handleApi(req, res, path) {
