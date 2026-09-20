@@ -295,6 +295,7 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
         // 于是下线的模型不会再挂在面板上,新上的也不用等人去补一行常量
         ctx: gateway.modelCtx(),
         modelsDev: gateway.modelMetadataStatus(),
+        catalog: gateway.catalogStatus?.() || null,
         metadata: gateway.modelMetadataMap(),
         // build / buildUrl / repoUrl / trackRef:面板右上角那个 hash 徽标。
         // 搭轮询的车带过去,不另开一个路由 —— 它是个常量,不值得再来一次请求
@@ -451,14 +452,16 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
       //
       // allSettled:两者独立汇报。refreshModels 失败要抛(按钮得能报错),
       // 但元数据只是辅助缓存 —— 它挂了不该让一次成功的清单同步变成 500。
-      const [list, meta] = await Promise.allSettled([
+      const [list, meta, cat] = await Promise.allSettled([
         gateway.refreshModels(),
         gateway.refreshModelMetadata({ force: true }),
+        gateway.refreshCatalog({ force: true }),
       ]);
       if (list.status === 'rejected') throw list.reason;
       return json(res, {
         ...list.value,
         metadata: meta.status === 'fulfilled' ? (meta.value?.models ?? 0) : null,
+        catalog: cat.status === 'fulfilled' ? (cat.value?.models ?? 0) : null,
       });
     }
 
@@ -623,14 +626,16 @@ export function createModelsSync({
   // 还活着 —— refreshModels 只在清单**有变化**时记一行,元数据成功时一个字都不记。
   const run = async () => {
     logger('info', '[models-auto] 开始同步免费清单');
-    const [list, meta] = await Promise.allSettled([
+    const [list, meta, cat] = await Promise.allSettled([
       gateway.refreshModels(),
       gateway.refreshModelMetadata({ force: true }),
+      gateway.refreshCatalog({ force: true }),
     ]);
     const listPart = list.status === 'fulfilled' ? `清单 ${list.value.models.length} 个` : '清单未更新';
     const metaPart = meta.status === 'fulfilled' ? `元数据 ${meta.value?.models ?? 0} 条` : '元数据未更新';
-    logger(list.status === 'fulfilled' ? 'ok' : 'warn', `[models-auto] ${listPart},${metaPart}`);
-    return [list, meta];
+    const catPart = cat.status === 'fulfilled' ? `目录 ${cat.value?.models ?? 0} 条` : '目录未更新';
+    logger(list.status === 'fulfilled' ? 'ok' : 'warn', `[models-auto] ${listPart},${metaPart},${catPart}`);
+    return [list, meta, cat];
   };
 
   const stop = () => {
@@ -679,6 +684,12 @@ async function main() {
     .catch(() => {});
   gateway.refreshModelMetadata()
     .then((r) => log('info', `[gateway] models.dev 元数据 ${r.models ?? 0} 条`))
+    .catch(() => {});
+  // opencode 能力目录:给原生协议路由(muse-spark 那类走 /responses)和上下文
+  // 上限的展示兜底。同样不 await —— 拉到之前 modelProtocol 一律回 'chat'(老行为),
+  // 只是 muse-spark 暂时还按 chat 打(500),拉到后自动切对端点。
+  gateway.refreshCatalog()
+    .then((r) => log('info', `[gateway] opencode 目录 ${r.models ?? 0} 条`))
     .catch(() => {});
 
   if (creds.generated) {

@@ -24,6 +24,7 @@ export const LAST_NODE_FILE = path.join(DATA_DIR, 'last-node.txt');
 export const USAGE_FILE = path.join(DATA_DIR, 'usage.json');
 export const CAPS_FILE = path.join(DATA_DIR, 'capabilities.json');
 export const MODELS_DEV_FILE = path.join(DATA_DIR, 'models.dev.json');
+export const OPENCODE_CATALOG_FILE = path.join(DATA_DIR, 'opencode-catalog.json');
 
 // buildMihomoYaml 里写的是 `path: ./providers/airport.yaml`,相对内核的 -d 数据目录。
 // 子 lane 各有自己的数据目录,但订阅是同一份,节点名到落地 IP 的映射也就同一份,

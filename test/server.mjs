@@ -2286,6 +2286,7 @@ await t('免费清单每 24 小时自动同步一次,清单拉失败不会带走
     // 所以这里照着抛,验证定时器那条路自己接住了
     refreshModels: async () => { calls.push('models'); throw new Error('两条路都不通'); },
     refreshModelMetadata: async (opt) => { calls.push(`meta:force=${opt?.force === true}`); return { models: 3 }; },
+    refreshCatalog: async (opt) => { calls.push(`cat:force=${opt?.force === true}`); return { models: 7 }; },
   };
   const sync = createModelsSync({
     gateway,
@@ -2302,11 +2303,11 @@ await t('免费清单每 24 小时自动同步一次,清单拉失败不会带走
   // 定时器那一拍走的就是 run。allSettled 是关键:少了它,清单拉失败就是一条
   // 没人接的 rejection,Node 20 起默认直接把进程带走 —— 每天一次的定时崩溃
   const settled = await scheduled[0].fn();
-  assert.deepEqual(calls, ['models', 'meta:force=true'],
-    '一拍同步两样:免费清单 + models.dev 元数据,后者带 force 才不会被它自身的 TTL 节流跳过');
-  assert.deepEqual(settled.map((r) => r.status), ['rejected', 'fulfilled'],
-    '两件事互不影响:清单没拉到,元数据照样更新');
-  assert.equal(lines.at(-1), 'warn:[models-auto] 清单未更新,元数据 3 条',
+  assert.deepEqual(calls, ['models', 'meta:force=true', 'cat:force=true'],
+    '一拍同步三样:免费清单 + models.dev 元数据 + opencode 目录,后两者带 force 才不会被各自 TTL 节流跳过');
+  assert.deepEqual(settled.map((r) => r.status), ['rejected', 'fulfilled', 'fulfilled'],
+    '三件事互不影响:清单没拉到,元数据和目录照样更新');
+  assert.equal(lines.at(-1), 'warn:[models-auto] 清单未更新,元数据 3 条,目录 7 条',
     '一天才响一次,必须留下结果 —— 不然没法确认它还活着');
 
   sync.schedule();
@@ -2320,13 +2321,14 @@ await t('免费清单每 24 小时自动同步一次,清单拉失败不会带走
     gateway: {
       refreshModels: async () => ({ models: ['a-free', 'b-free'], added: ['b-free'], gone: [] }),
       refreshModelMetadata: async () => ({ models: 12 }),
+      refreshCatalog: async () => ({ models: 7 }),
     },
     logger: (lv, msg) => lines.push(`${lv}:${msg}`),
     setTimer: () => ({ unref() {} }),
     clearTimer: () => {},
   });
   await good.run();
-  assert.equal(lines.at(-1), 'ok:[models-auto] 清单 2 个,元数据 12 条');
+  assert.equal(lines.at(-1), 'ok:[models-auto] 清单 2 个,元数据 12 条,目录 7 条');
 });
 
 // ── 鉴权 ────────────────────────────────────────────────

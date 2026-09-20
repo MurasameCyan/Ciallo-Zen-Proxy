@@ -437,12 +437,24 @@ t('nodeStats 带出最近一次的模型和思考强度,旧桶缺字段归一成
   assert.equal(b.lastEffort, '');
 });
 
-t('nodeStats 合计只加四类结果和尝试数,token 不进合计', () => {
+t('nodeStats 合计只加五类结果和尝试数,token 不进合计', () => {
   const { totals } = nodeStats({
     A: { requests: 3, success: 1, rateLimited: 1, timeout: 1, promptTokens: 900 },
     B: { requests: 2, success: 1, upstreamError: 1, promptTokens: 100 },
   });
-  assert.deepEqual(totals, { requests: 5, success: 2, rateLimited: 1, timeout: 1, upstreamError: 1 });
+  assert.deepEqual(totals,
+    { requests: 5, success: 2, rateLimited: 1, timeout: 1, upstreamError: 1, clientCanceled: 0 });
+});
+
+t('nodeStats 把 clientCanceled 计入合计,且从成功率分母里剔掉', () => {
+  // 一个节点:2 次成功 + 3 次客户端取消。取消不是节点的错,成功率应是 2/2=100%,
+  // 而不是 2/5=40% —— 分母只算「真正跑完」的尝试
+  const { rows, totals } = nodeStats({ A: { requests: 5, success: 2, clientCanceled: 3 } });
+  assert.equal(totals.clientCanceled, 3);
+  assert.equal(rows[0].clientCanceled, 3);
+  assert.equal(rows[0].rate, 1, '取消从分母剔除后,2/2 = 100%');
+  // 全是取消时没有可判定的样本,成功率是 null(不是 0%,避免误报「全挂了」)
+  assert.equal(successRate({ requests: 3, success: 0, clientCanceled: 3 }), null);
 });
 
 t('nodeStats 缺字段当 0,坏值不传染成 NaN', () => {
@@ -456,7 +468,7 @@ t('nodeStats 缺字段当 0,坏值不传染成 NaN', () => {
   assert.equal(r.rate, 0.75);
   assert.equal(r.cache, 0.25);
   assert.deepEqual(nodeStats(null), {
-    rows: [], totals: { requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0 },
+    rows: [], totals: { requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0, clientCanceled: 0 },
     ttfb: null, duration: null,
   });
 });

@@ -22,7 +22,10 @@ const blankTotals = () => ({
  * 成功 —— 顶部总览要显示「1 次成功」,而这里要显示三次尝试各自的归属。
  * 混在一个数里的话「换了几个节点」和「客户端失败了几次」永远分不出来。
  */
-const NODE_OUTCOMES = ['success', 'rateLimited', 'timeout', 'upstreamError'];
+// clientCanceled 和 upstreamError 分开:前者是客户端中途断开(我们主动 abort 了
+// 在飞的上游请求),不是节点的错;混在 upstreamError 里会把「用户按了取消」误算
+// 成「这个节点上游出错」,面板成功率的分母跟着虚高。
+const NODE_OUTCOMES = ['success', 'rateLimited', 'timeout', 'upstreamError', 'clientCanceled'];
 
 const blankNode = () => ({
   requests: 0, ...Object.fromEntries(NODE_OUTCOMES.map((k) => [k, 0])),

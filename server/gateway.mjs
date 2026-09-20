@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { MihomoAgent } from './proxy.mjs';
 import {
-  LAST_NODE_FILE, USAGE_FILE, CAPS_FILE, MODELS_DEV_FILE,
+  LAST_NODE_FILE, USAGE_FILE, CAPS_FILE, MODELS_DEV_FILE, OPENCODE_CATALOG_FILE,
   MIXED_PORT, CTRL_PORT, POOL_NAME, lanePorts, laneDataDir, writeMihomoConfig,
   loadProviderEgress,
 } from './config.mjs';
@@ -23,6 +23,7 @@ import { LaneManager } from './lane.mjs';
 import { errTypeFor, flattenText, reasoningEffort, setModelEfforts } from './anthropic.mjs';
 import { Capabilities } from './capabilities.mjs';
 import { ModelMetadataStore, MODELS_DEV_TTL_MS, metadataFree } from './model-metadata.mjs';
+import { OpencodeCatalog, CATALOG_TTL_MS } from './model-catalog.mjs';
 import { ModelAvailability, MODEL_AVAILABILITY_TTL_MS } from './model-availability.mjs';
 import { safeEqual } from './auth.mjs';
 import {
@@ -34,10 +35,11 @@ import {
 } from './rotation.mjs';
 
 import { CALL_LOG_LIMIT, readUsage, UsageTracker } from './usage.mjs';
-import { json } from './http-util.mjs';
 import {
-  OPENCODE_HOST, CHAT_PATH, MODELS_PATH, OPENAI, ANTHROPIC, RESPONSES, gateChatBody,
+  OPENCODE_HOST, CHAT_PATH, MODELS_PATH, RESPONSES_PATH, OPENAI, ANTHROPIC, RESPONSES,
+  gateChatBody, gateResponsesBody, responsesUpstreamDialect, chatToResponsesBody,
 } from './dialects.mjs';
+import { json } from './http-util.mjs';
 export { json } from './http-util.mjs';
 export { OPENAI, ANTHROPIC, RESPONSES } from './dialects.mjs';
 
@@ -525,6 +527,11 @@ export class Gateway {
     this.modelsFetch = null;    // 进行中的拉取,防并发(面板 2 秒轮一次)
     this.metadata = new ModelMetadataStore({ file: MODELS_DEV_FILE, logger });
     this.metadataAttemptAt = 0;
+    // opencode 官方能力目录(models.opencode.ai)。给原生协议(路由要它决定
+    // 打 /chat/completions 还是 /zen/v1/responses)和上下文上限的展示兜底。
+    this.catalog = new OpencodeCatalog({ file: OPENCODE_CATALOG_FILE, logger });
+    this.catalogAttemptAt = 0;
+    this.catalogFetch = null;
     this.metadataFetch = null;
     // 免费模型可用性是独立于能力记录的短请求探针。结果只在内存里留存:
     // 重启后重新确认,避免把旧 IP/旧上游状态当成当天事实。
@@ -557,9 +564,20 @@ export class Gateway {
     // 不需要流式。2026-09-19 实测:不走准入的探测一律 403,会把能用的模型
     // 全判成不可用(那是假警报,比对上游的真实错误更难发现)。
     this.probeRequest = (body) => {
+      const model = typeof body.model === 'string' ? body.model.trim() : '';
+      // 原生 Responses 模型(muse-spark 那类):探测也得走对端点,否则打 chat 一律
+      // 500/503,会把能用的模型判成不可用/探不到能力 —— 面板灰点与真实请求相反。
+      // body 先翻成 Responses 形状,再过 Responses 门禁(扁平式 tools),经 bridge
+      // 方言收流:bridge 把 response.* 翻回 chat chunk,collect 仍用 OPENAI 的拼装器,
+      // 于是探测拿到的和 chat 模型同形的结果 / 错误原文,parseCtx/parseEfforts 照读。
+      if (this.modelProtocol(model) === 'responses') {
+        const probe = chatToResponsesBody(body);
+        gateResponsesBody(probe);
+        return this.forwardBuffered({ write() {} }, probe, responsesUpstreamDialect(OPENAI), Infinity, this.identity(model));
+      }
       const probe = { ...body };
       gateChatBody(probe);
-      return this.forwardBuffered({ write() {} }, probe, OPENAI, Infinity, this.identity(probe.model));
+      return this.forwardBuffered({ write() {} }, probe, OPENAI, Infinity, this.identity(model));
     };
     this.availabilityFetch = null;
     this.availabilityNextTryAt = 0;
@@ -661,9 +679,26 @@ export class Gateway {
     return this.availability.schedulerStatus();
   }
 
-  /** 面板要的那张「id → 上下文上限」,只给当前清单里的 —— 下线的模型不该显示 */
+  /**
+   * 面板要的那张「id → 上下文上限」,只给当前清单里的 —— 下线的模型不该显示。
+   *
+   * 两层来源,实测优先:自己发真实请求探出来的值(caps)盖在上面,opencode
+   * 目录(catalog)只填我们**还没探到**的模型。为什么不反过来让目录当权威 ——
+   * 实测过我们放行的 256K~1M 请求确实能过,而目录对同一批模型报的 context 明显
+   * 偏小(big-pickle 目录 200000 vs 实测 1048576),目录填的是「广告值」不是
+   * 上游校验器的实际放行线。展示上以实测为准,目录只补空。
+   */
   modelCtx() {
-    return this.caps.ctxMap(this.models);
+    return { ...this.catalog.ctxMap(this.models), ...this.caps.ctxMap(this.models) };
+  }
+
+  /**
+   * 模型的上游原生协议:'chat' | 'responses' | 'anthropic'。
+   * 目录说了算(它的 npm 字段唯一决定端点),目录里没有就按 chat 兜底 ——
+   * 免费清单绝大多数是 chat,而且老行为就是全走 chat。
+   */
+  modelProtocol(model) {
+    return this.catalog.protocol(model) || 'chat';
   }
 
   modelMetadata(model) {
@@ -692,6 +727,25 @@ export class Gateway {
     this.metadataFetch = this.metadata.refresh({ force })
       .finally(() => { this.metadataFetch = null; });
     return this.metadataFetch;
+  }
+
+  refreshCatalog({ force = false } = {}) {
+    if (this.catalogFetch) return this.catalogFetch;
+    if (!force && Date.now() - this.catalogAttemptAt < CATALOG_TTL_MS) {
+      return Promise.resolve({ updated: false, reason: 'attempted', models: this.catalog.status().models });
+    }
+    this.catalogAttemptAt = Date.now();
+    this.catalogFetch = this.catalog.refresh({ force })
+      .finally(() => { this.catalogFetch = null; });
+    return this.catalogFetch;
+  }
+
+  catalogStatus() {
+    const status = this.catalog.status();
+    if (status.stale && Date.now() - this.catalogAttemptAt >= CATALOG_TTL_MS) {
+      this.refreshCatalog().catch(() => {});
+    }
+    return status;
   }
 
   pause() { this.paused = true; }
@@ -907,13 +961,22 @@ export class Gateway {
     // 明确报告纯文本时才让方言降级附件;元数据缺失时 fail-open,保持原请求。
     const wantStream = inbound.stream === true;
     const requestedModel = typeof inbound.model === 'string' ? inbound.model.trim() : '';
+    // 原生协议路由:muse-spark 1.2/1.3 这类模型的上游端点是 /zen/v1/responses,
+    // 打 chat 一律 500(实测)。客户端说 chat/anthropic 时,把上游那条腿换成
+    // Responses:body 翻成 Responses 形状发上去,回来的 response.* 事件由 sink 里的
+    // bridge 翻回 chat chunk —— validate/respond/collect 仍用客户端方言,对它透明。
+    // 客户端本来就说 Responses(codex 那类)的不动,它走原路。
+    if (dialect !== RESPONSES && requestedModel && this.modelProtocol(requestedModel) === 'responses') {
+      dialect = responsesUpstreamDialect(dialect);
+    }
     const body = dialect.toUpstream(inbound, requestedModel ? this.modelMetadata(requestedModel) : null);
     // 免费层准入:上游要求 stream:true 且 tools 里集齐五个核心工具名(见 dialects
-    // 的 gateChatBody)。这一步必须紧跟在 toUpstream 之后 —— 它改的是**出站的
-    // chat body**,放在翻译之后才对得上形状。
-    // 只对走 chat 端点的方言过闸。Responses 是另一条路径(/zen/v1/responses),
-    // 它的 body 形状不一样,套 chat 的门禁既没意义又会把请求改坏。
-    const gate = dialect === RESPONSES ? null : gateChatBody(body);
+    // 的 gateChatBody / gateResponsesBody)。这一步必须紧跟在 toUpstream 之后 ——
+    // 它改的是**出站 body**,放在翻译之后才对得上形状。走 Responses 那条腿用扁平式
+    // tools(嵌套式回 400),chat 那条腿用嵌套式。客户端原生 Responses 仍不过闸
+    // (它的 body 由客户端负责,历史行为不变)。
+    if (dialect.path === RESPONSES_PATH && dialect !== RESPONSES) gateResponsesBody(body);
+    else if (dialect !== RESPONSES) gateChatBody(body);
 
     // 严格透传:客户端点哪个模型就发哪个,但只放行实时免费清单里的。
     // 以前这里无条件改写成一个固定模型 —— 客户端于是拿到的是另一个模型的回答,
@@ -1008,7 +1071,7 @@ export class Gateway {
       this.lanes.release(lane);
       lane = null;
     }
-    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort, affinityKey, lane, gate);
+    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort, affinityKey, lane);
   }
 
   /** Anthropic Messages API 入口。同一条路,只是换个方言。 */
@@ -1101,7 +1164,7 @@ export class Gateway {
    * 每条 `return`(定案了)才有 record。
    */
   async attempt(res, body, nodes, cur, wantStream, dialect = OPENAI, deadline = Infinity,
-    identity = null, effort = '', affinityKey = '', lane = null, gate = null) {
+    identity = null, effort = '', affinityKey = '', lane = null) {
     const tried = new Set();
     const MAX_NET_RETRY = 2;
     let netRetry = 0;
@@ -1261,13 +1324,20 @@ export class Gateway {
           } else {
             unbind(cur);
           }
+          // ok:false 有两种:客户端中途断开(clientGone,我们 abort 了上游),
+          // 或上游自己断的流。前者不是节点的错,记 clientCanceled;后者记
+          // upstreamError。混在一起会让面板把「用户取消」算进节点失败率。
+          const canceled = !result.ok && clientGone;
+          const outcome = result.ok ? 'success' : (canceled ? 'clientCanceled' : 'upstreamError');
           // 只给成功那次记耗时:中断的那次总耗时量的是「断在第几秒」,
           // 不是这个节点跑完一次要多久,混进平均值里读不出任何东西
-          this.usage.recordAttempt(cur, result.ok ? 'success' : 'upstreamError', result.usage,
+          this.usage.recordAttempt(cur, outcome, result.usage,
             result.ok ? { ttfb: result.ttfb, total: dt } : null, call);
-          this.usage.record(body.model, result.usage, result.ok);
-          this.logger(result.ok ? 'ok' : 'error',
-            `[stream-${result.ok ? 'ok' : 'cut'}] node="${cur}"${lane ? ` lane=${lane.id}` : ''} ${dt}ms effort=${effort || '默认'}`);
+          // 客户端取消不算模型失败:它没跑完不代表模型/上游有问题,
+          // 记成 false 会把取消也算进「这个模型失败了几次」
+          if (!canceled) this.usage.record(body.model, result.usage, result.ok);
+          this.logger(result.ok ? 'ok' : (canceled ? 'warn' : 'error'),
+            `[stream-${result.ok ? 'ok' : (canceled ? 'cancel' : 'cut')}] node="${cur}"${lane ? ` lane=${lane.id}` : ''} ${dt}ms effort=${effort || '默认'}`);
           finishLane();
           // useBuffered 时响应已经在 forwardBuffered 里收完并按非流式形状拼好了,
           // 走下面的通用成功路径即可(它按 result 取值,而 result 就是那个对象)。

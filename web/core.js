@@ -95,10 +95,15 @@ export function fmtClock(ts) {
 /**
  * 成功率。没有任何请求时返回 null —— 显示 0% 会让人以为全挂了,
  * 而实际是「还没跑过」。调用方据此显示占位符。
+ *
+ * clientCanceled 从分母里剔掉:那是客户端中途按了取消(我们主动 abort 了在飞的
+ * 上游),不是节点/模型的错,算进分母会把成功率无端拉低。剔完分母归零(全都是
+ * 取消)时同样返回 null —— 没有一次「真正跑完」的样本,谈不上成功率。
  */
 export function successRate(total) {
-  const req = Number(total?.requests) || 0;
-  if (!req) return null;
+  const canceled = Number(total?.clientCanceled) || 0;
+  const req = (Number(total?.requests) || 0) - canceled;
+  if (req <= 0) return null;
   return (Number(total?.success) || 0) / req;
 }
 
@@ -319,7 +324,7 @@ export function cacheRate(b) {
  * 平均值得拿自己那个 count 当分母(见 gateway.mjs 的 blankNode)。
  */
 export function nodeStats(byNode) {
-  const totals = { requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0 };
+  const totals = { requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0, clientCanceled: 0 };
   // 平均值不能对各节点的平均再平均 —— 那是把跑了 800 次的节点和跑了 3 次的
   // 等权看待。先把总和与样本数攒起来,最后除一次
   const acc = { ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0 };
@@ -329,7 +334,7 @@ export function nodeStats(byNode) {
     const requests = n('requests');
     if (!requests) continue;        // 一次都没试过的节点不占位置
     const row = { name, requests };
-    for (const k of ['success', 'rateLimited', 'timeout', 'upstreamError',
+    for (const k of ['success', 'rateLimited', 'timeout', 'upstreamError', 'clientCanceled',
       'promptTokens', 'completionTokens', 'reasoningTokens', 'totalTokens',
       'cacheReadTokens', 'cacheWriteTokens']) row[k] = n(k);
     // undefined 要保留给 cacheRate 做旧桶兼容；强制成 false 会把历史非零缓存误判成无数据。

@@ -232,6 +232,142 @@ export function gateChatBody(body) {
   return { forcedStream, injected };
 }
 
+/** 门禁工具的 Responses 扁平式。/zen/v1/responses 只认这种(嵌套式回 400,实测)*/
+const gatedResponsesTool = (name) => ({
+  type: 'function',
+  name,
+  description: 'Tool available for this session.',
+  parameters: { type: 'object', properties: {}, required: [] },
+  strict: false,
+});
+
+/**
+ * Responses body 的免费层准入。和 gateChatBody 同一道门槛(stream:true + 集齐
+ * 五个核心工具名),差别只有 tools 的形状:Responses 用扁平式 {type,name,...},
+ * 嵌套式 {type,function:{name}} 会被上游判成 400 invalid_request_error(实测)。
+ */
+export function gateResponsesBody(body) {
+  const forcedStream = body.stream !== true;
+  if (forcedStream) body.stream = true;
+
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  const present = new Set(tools.map(toolName));
+
+  let injected = 0;
+  for (const name of GATE_CORE_TOOLS) {
+    if (present.has(name)) continue;
+    tools.push(gatedResponsesTool(name));
+    present.add(name);
+    injected++;
+  }
+  if (injected || tools.length) body.tools = tools;
+  return { forcedStream, injected };
+}
+
+/** chat 的 tool 定义(嵌套式)→ Responses 的扁平式 */
+function chatToolToResponses(tool) {
+  if (!isObject(tool)) return null;
+  const fn = isObject(tool.function) ? tool.function : tool;
+  const name = typeof fn.name === 'string' ? fn.name : '';
+  if (!name) return null;
+  return {
+    type: 'function',
+    name,
+    description: typeof fn.description === 'string' ? fn.description : '',
+    parameters: isObject(fn.parameters) ? fn.parameters : { type: 'object', properties: {}, required: [] },
+    strict: false,
+  };
+}
+
+/** 一条 chat 消息的 content(字符串或分片数组)→ Responses input 的分片数组 */
+function chatContentToResponses(content, textType) {
+  if (typeof content === 'string') return content ? [{ type: textType, text: content }] : [];
+  if (!Array.isArray(content)) return [];
+  const out = [];
+  for (const part of content) {
+    if (typeof part === 'string') { if (part) out.push({ type: textType, text: part }); continue; }
+    if (!isObject(part)) continue;
+    if (typeof part.text === 'string') { out.push({ type: textType, text: part.text }); continue; }
+    // 附件在 downgradeOpenAIAttachments 里已按纯文本模型换成占位文本;走不到这
+    // 分支的(多模态模型)保持原样透传,让上游自己解释
+    out.push(part);
+  }
+  return out;
+}
+
+/**
+ * chat body → Responses body。
+ *
+ * 为什么需要:muse-spark 1.2/1.3 这类模型的原生端点是 /zen/v1/responses,打
+ * /chat/completions 一律 500(实测)。但客户端(Claude Code / OpenAI SDK)发来的
+ * 是 chat/messages 形状,经 dialect.toUpstream 归一成 chat body 之后,这里再翻成
+ * Responses 形状发上去。回来的 response.* 事件由 ResponsesToChatStream 翻回 chat
+ * chunk,于是对客户端和对下游 sink 都还是 chat —— 整条 Responses 腿是透明的。
+ *
+ * 翻译规则(只覆盖免费层真实用到的字段):
+ *   messages → input:role 保留,content 拆成 input_text/output_text 分片;
+ *     assistant 的 tool_calls → function_call 项;tool 结果 → function_call_output 项
+ *   tools(嵌套式)→ 扁平式
+ *   max_tokens → max_output_tokens
+ *   reasoning_effort 不在这翻:applyEffort 由方言按 Responses 的嵌套 reasoning.effort 落
+ */
+export function chatToResponsesBody(chatBody) {
+  const src = chatBody && typeof chatBody === 'object' ? chatBody : {};
+  const out = { model: src.model, stream: true };
+
+  const input = [];
+  for (const msg of Array.isArray(src.messages) ? src.messages : []) {
+    if (!isObject(msg)) continue;
+    const role = msg.role;
+    if (role === 'tool') {
+      // chat 的 tool 结果消息 → Responses 的 function_call_output
+      input.push({
+        type: 'function_call_output',
+        call_id: msg.tool_call_id || msg.id || '',
+        output: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? ''),
+      });
+      continue;
+    }
+    const textType = role === 'assistant' ? 'output_text' : 'input_text';
+    const parts = chatContentToResponses(msg.content, textType);
+    if (parts.length) input.push({ role, content: parts });
+    // assistant 带的 tool_calls 单独成 function_call 项(顺序排在文本之后)
+    if (role === 'assistant' && Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        if (!isObject(tc)) continue;
+        const fn = isObject(tc.function) ? tc.function : {};
+        input.push({
+          type: 'function_call',
+          call_id: tc.id || '',
+          name: fn.name || '',
+          arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {}),
+        });
+      }
+    }
+  }
+  out.input = input;
+
+  if (Array.isArray(src.tools) && src.tools.length) {
+    const tools = src.tools.map(chatToolToResponses).filter(Boolean);
+    if (tools.length) out.tools = tools;
+  }
+  // 上限字段改名;Responses 用 max_output_tokens。有个硬下限:实测 Responses 端点
+  // 要求 `max_output_tokens >= 16`(muse-spark 报「The number must be >= 16」),
+  // 低于此一律 400。chat 客户端(含可用性探针的 max_tokens:1)常带更小的值,所以
+  // 夹到 16 —— 推理模型本来就得留够预算,夹上去不改变客户端语义(它要的是「尽量短」)。
+  const RESP_MIN_OUT = 16;
+  const maxOut = src.max_completion_tokens ?? src.max_tokens ?? src.max_output_tokens;
+  if (Number.isFinite(Number(maxOut))) out.max_output_tokens = Math.max(RESP_MIN_OUT, Number(maxOut));
+  // 已带的 reasoning(effort 等)透传;顶层 reasoning_effort(chat 写法)折进
+  // 嵌套 reasoning.effort —— 真实请求里 applyEffort 会在其上覆盖成解析后的档位,
+  // 但探测那条路不过 applyEffort(见 gateway 的 probeRequest),靠这里把档位带上,
+  // 否则「发个非法档位看上游认不认」的探测永远读成宽松。
+  const reasoning = isObject(src.reasoning) ? { ...src.reasoning } : {};
+  if (typeof src.reasoning_effort === 'string' && src.reasoning_effort) reasoning.effort = src.reasoning_effort;
+  if (Object.keys(reasoning).length) out.reasoning = reasoning;
+  return out;
+}
+
 /**
  * 把上游的 SSE 文本拼成一条完整的 chat.completion 响应。
  *
@@ -472,6 +608,224 @@ function anthropicSink(res, model) {
     // 和 rawSink 不同:这里能补一个合法收尾(error + message_stop),
     // 客户端的状态机于是能正常结束,而不是等到超时
     fail: (msg) => { st.fail(msg); safe(() => res.end()); },
+  };
+}
+
+/**
+ * Responses 事件流 → chat.completion.chunk 事件流的**在线**翻译器。
+ *
+ * 用途:muse-spark 这类原生 Responses 模型,被 chat/anthropic 客户端点到时,
+ * 上游那条腿走 /zen/v1/responses(见 chatToResponsesBody),吐回来的是 response.*
+ * 事件。这个类边收边翻成 chat chunk,喂给客户端方言原本的 sink —— 于是 OPENAI
+ * 客户端拿到标准 chat 流,ANTHROPIC 客户端由它的 sink 再翻成 Messages 事件,
+ * 两条路都不用知道上游其实是 Responses。收尾拼装也照旧:缓冲里落的是翻译后的
+ * chat chunk / Anthropic 事件,collect 用现成的那两个拼装器就对得上。
+ *
+ * 事件映射(实测帧型见 zen-responses-native 的抓包):
+ *   response.created                       → 记 id/created,发首个 {role:assistant} chunk
+ *   response.output_text.delta             → {delta:{content}}
+ *   response.reasoning_summary_text.delta  → {delta:{reasoning_content}}(有摘要的模型才有)
+ *   response.function_call_arguments.delta → tool_call 参数分片
+ *   response.output_item.done(function_call)→ 兜底:没收到 delta 时用整块 arguments
+ *   response.completed                     → finish_reason + usage,再 [DONE]
+ *   reasoning 项 / ping / 其它             → 忽略(muse-spark 的推理是 encrypted,无可转发文本)
+ */
+export class ResponsesToChatStream {
+  constructor({ model = '', emit, emitDone }) {
+    this.emit = emit;              // (chunkObj) => void
+    this.emitDone = emitDone;      // () => void,发 [DONE]
+    this.model = model;
+    this.id = '';
+    this.created = 0;
+    this.buf = '';
+    this.decoder = new TextDecoder('utf-8');
+    this.done = false;
+    this.roleSent = false;
+    // output_index → {slot, id, name, argsSent} :把上游的 output_index 映射成
+    // chat tool_calls 的连续下标,同时记住这一路参数是否已经开始发
+    this.calls = new Map();
+    this.toolSlot = 0;
+    this.finish = null;
+    this.usage = null;
+  }
+
+  head() {
+    return {
+      id: this.id || `chatcmpl_${Date.now().toString(36)}`,
+      object: 'chat.completion.chunk',
+      created: this.created || Math.floor(Date.now() / 1000),
+      model: this.model,
+    };
+  }
+
+  sendDelta(delta, finish = null) {
+    this.emit({ ...this.head(), choices: [{ index: 0, delta, finish_reason: finish }] });
+  }
+
+  ensureRole() {
+    if (this.roleSent) return;
+    this.roleSent = true;
+    this.sendDelta({ role: 'assistant' });
+  }
+
+  callFor(outputIndex, item = {}) {
+    let c = this.calls.get(outputIndex);
+    if (!c) {
+      c = { slot: this.toolSlot++, id: item.call_id || item.id || '', name: item.name || '', started: false };
+      this.calls.set(outputIndex, c);
+    } else {
+      if (item.call_id && !c.id) c.id = item.call_id;
+      if (item.name && !c.name) c.name = item.name;
+    }
+    return c;
+  }
+
+  // 发一段 tool_call:第一段带 id/name/type,后续只带 arguments 增量
+  sendToolDelta(c, argsChunk) {
+    const tc = { index: c.slot };
+    if (!c.started) {
+      c.started = true;
+      tc.id = c.id;
+      tc.type = 'function';
+      tc.function = { name: c.name, arguments: argsChunk || '' };
+    } else {
+      tc.function = { arguments: argsChunk || '' };
+    }
+    this.ensureRole();
+    this.sendDelta({ tool_calls: [tc] });
+  }
+
+  handle(obj) {
+    const type = obj?.type;
+    if (!type) return;
+    switch (type) {
+      case 'response.created':
+      case 'response.in_progress': {
+        const r = obj.response || {};
+        if (r.id && !this.id) this.id = r.id;
+        if (r.created_at && !this.created) this.created = r.created_at;
+        break;
+      }
+      case 'response.output_text.delta': {
+        if (typeof obj.delta === 'string' && obj.delta) {
+          this.ensureRole();
+          this.sendDelta({ content: obj.delta });
+        }
+        break;
+      }
+      case 'response.reasoning_summary_text.delta': {
+        if (typeof obj.delta === 'string' && obj.delta) {
+          this.ensureRole();
+          this.sendDelta({ reasoning_content: obj.delta });
+        }
+        break;
+      }
+      case 'response.output_item.added': {
+        if (obj.item?.type === 'function_call') this.callFor(obj.output_index, obj.item);
+        break;
+      }
+      case 'response.function_call_arguments.delta': {
+        const c = this.callFor(obj.output_index);
+        if (typeof obj.delta === 'string') this.sendToolDelta(c, obj.delta);
+        break;
+      }
+      case 'response.output_item.done': {
+        if (obj.item?.type === 'function_call') {
+          const c = this.callFor(obj.output_index, obj.item);
+          // 没收到过增量(上游把参数一次性放在 done 里)才补发整块,
+          // 否则会把参数发两遍
+          if (!c.started) this.sendToolDelta(c, typeof obj.item.arguments === 'string' ? obj.item.arguments : '');
+        }
+        break;
+      }
+      case 'response.completed': {
+        const r = obj.response || {};
+        if (r.usage) this.usage = r.usage;
+        // 有 tool_call 就是 tool_calls,否则按 stop
+        this.finish = this.calls.size ? 'tool_calls' : 'stop';
+        break;
+      }
+      default: break;   // ping / content_part.* / reasoning 项等
+    }
+  }
+
+  feed(chunk) {
+    if (this.done) return;
+    this.buf += this.decoder.decode(
+      Buffer.isBuffer(chunk) || chunk instanceof Uint8Array ? chunk : Buffer.from(String(chunk)),
+      { stream: true },
+    );
+    const lines = this.buf.split('\n');
+    this.buf = lines.pop();
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+      let obj;
+      try { obj = JSON.parse(payload); } catch { continue; }
+      this.handle(obj);
+    }
+  }
+
+  end() {
+    if (this.done) return;
+    this.done = true;
+    this.ensureRole();          // 一个字都没吐也得有个合法的空回复壳
+    const tail = { ...this.head(), choices: [{ index: 0, delta: {}, finish_reason: this.finish || 'stop' }] };
+    if (this.usage) tail.usage = this.usage;
+    this.emit(tail);
+    this.emitDone?.();
+  }
+
+  // 中途断了:chat 流没有专门的 error 事件,补一个 finish_reason 收尾即可,
+  // 别让下游 sink(尤其 anthropic)悬着
+  fail() {
+    if (this.done) return;
+    this.done = true;
+    this.ensureRole();
+    this.emit({ ...this.head(), choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+    this.emitDone?.();
+  }
+}
+
+/**
+ * 把一个「吃 chat chunk 的 sink」包成一个「吃 Responses 事件的 sink」。
+ * inner 是客户端方言原本的 sink(OPENAI 的 rawSink / ANTHROPIC 的 anthropicSink)——
+ * 翻译后的 chat chunk 喂给它,它该透传透传、该翻 Messages 翻 Messages。
+ */
+export function bridgeResponsesToChat(inner, model) {
+  const st = new ResponsesToChatStream({
+    model,
+    emit: (obj) => inner.write(`data: ${JSON.stringify(obj)}\n\n`),
+    emitDone: () => inner.write('data: [DONE]\n\n'),
+  });
+  return {
+    write: (chunk) => st.feed(chunk),
+    end: () => { st.end(); inner.end(); },
+    fail: (msg) => { st.fail(msg); inner.fail(msg); },
+  };
+}
+
+/**
+ * 给「客户端说 chat/anthropic、但模型原生是 Responses」这种请求造一个有效方言。
+ *
+ * 只覆盖上游那条腿相关的三件事,其余(validate/respond/collect/fail)全用客户端
+ * 方言的 —— 因为 sink 这一层已经把 Responses 翻回了 chat chunk,缓冲里落的东西
+ * 和客户端方言原本期待的完全一致,collect/respond 不用改。
+ *   path       → /zen/v1/responses
+ *   toUpstream → 先按客户端方言归一成 chat body,再翻成 Responses body
+ *   applyEffort→ 嵌套 reasoning.effort(Responses 的写法)
+ *   sink       → bridge 包住客户端方言原本的 sink
+ */
+export function responsesUpstreamDialect(clientDialect) {
+  return {
+    ...clientDialect,
+    name: `${clientDialect.name}->responses`,
+    path: RESPONSES_PATH,
+    toUpstream: (body, meta) => chatToResponsesBody(clientDialect.toUpstream(body, meta)),
+    applyEffort: RESPONSES.applyEffort,
+    sink: (res, model) => bridgeResponsesToChat(clientDialect.sink(res, model), model),
   };
 }
 

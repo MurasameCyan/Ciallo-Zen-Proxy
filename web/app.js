@@ -226,11 +226,11 @@ function renderCallLog() {
   $('nstat-empty').hidden = rows.length > 0;
   $('nstat-sum').textContent = rows.length
     ? `最近 ${fmtCount(rows.length)} 条 · Token ${fmtTokens(tokens)}`
-      // 折叠状态下只看得见这一行,所以两个平均值放这儿:哪一次慢要展开才知道,
-      // 但「整体现在快不快」不该逼人先点开
       + ` · 平均首字 ${fmtDelay(ttfb)} · 平均耗时 ${fmtDelay(duration)}`
       + ` · 累计限流 ${fmtCount(totals.rateLimited)} · 超时 ${fmtCount(totals.timeout)}`
       + ` · 错误 ${fmtCount(totals.upstreamError)}`
+      // 取消只在真发生过时才显示,免得给常见情况添噪音
+      + (totals.clientCanceled ? ` · 取消 ${fmtCount(totals.clientCanceled)}` : '')
     : '每条成功的上游调用记一行,失败的尝试只进运行日志。';
 
   // 列表现在是自己的滚动容器(限高 + 藏起来的滚动条),而 replaceChildren 会把
