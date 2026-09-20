@@ -88,6 +88,17 @@ await t('明确业务 4xx 都标为 unavailable,包括鉴权和额度错误', as
   }
 });
 
+await t('免费层抽检 403(FreeTierError)保持 unknown,不灰掉能用的模型', async () => {
+  // 我们出站强制补齐 cli UA + session + 核心工具名,所以这个 403 不是身份真不对,
+  // 而是上游间歇性抽检(实测同节点前拒后成)。真实请求走换节点重试能过,探针
+  // 就不该据此把模型判成 unavailable 灰六小时。
+  const a = new ModelAvailability({
+    post: async () => { throw { status: 403, body: '{"error":{"type":"FreeTierError","message":"OpenCode\'s free tier can only be used from within OpenCode"}}' }; },
+  });
+  await a.probe(['muse-free']);
+  assert.equal(a.status(['muse-free'])['muse-free'].status, 'unknown');
+});
+
 await t('临时错误保持 unknown,也只随六小时周期重探', async () => {
   let now = 1000;
   let calls = 0;

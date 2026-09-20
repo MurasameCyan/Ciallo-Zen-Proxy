@@ -20,6 +20,23 @@ export function isModelUnavailableError(status, body) {
     .test(upstreamErrorMessage(body));
 }
 
+/**
+ * 免费层准入门(403 FreeTierError:「can only be used from within OpenCode」)。
+ *
+ * 我们出站已经强制补上 cli UA + 形状正确的 session + 集齐五个核心工具名(见
+ * identityHeaders / gateChatBody / gateResponsesBody),所以这个 403 从来不是
+ * 「身份真的不对」—— 实测它是**间歇性**的:同一个节点前一分钟被这句话拒、
+ * 后一分钟同样的请求 200。多半是上游按出口/时间窗做的概率性抽检。
+ *
+ * 所以它该被当成**可重试**(换出口重发),而不是 terminal 直接甩给客户端 ——
+ * 后者会让用户在一次抽检上原地失败,而隔壁节点明明能过。
+ */
+export function isFreeTierError(status, body) {
+  if (Number(status) !== 403) return false;
+  const message = upstreamErrorMessage(body);
+  return /free\s*tier|FreeTierError|from\s+within\s+OpenCode/i.test(message);
+}
+
 export function isCapabilityError(status, body) {
   const code = Number(status);
   if (code !== 400 && code !== 422) return false;
@@ -78,6 +95,9 @@ export function classifyUpstreamError(status, body) {
   if (code === 429) return 'rate_limited';
   if (code === 0) return 'transport';
   if (isModelUnavailableError(code, body)) return 'model_unavailable';
+  // 免费层抽检 403 是间歇的(见 isFreeTierError):换个出口重发多半就过,
+  // 当 terminal 会让用户在一次抽检上原地失败。归到 retryable 走换节点重试。
+  if (isFreeTierError(code, body)) return 'retryable';
   if (code === 408 || code >= 500) return 'retryable';
   return 'terminal';
 }

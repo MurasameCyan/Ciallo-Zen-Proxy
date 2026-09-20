@@ -225,6 +225,12 @@ await t('上游错误分类:模型不可用不当成节点限流,5xx 才是可�
   assert.equal(classifyUpstreamError(408, 'upstream timeout'), 'retryable');
   assert.equal(classifyUpstreamError(503, 'upstream overloaded'), 'retryable');
   assert.equal(classifyUpstreamError(400, 'invalid reasoning_effort'), 'terminal');
+  // 免费层抽检 403 是间歇的,归 retryable 走换节点重试(实测同节点前拒后成)。
+  // 但**通用** 403(鉴权/配额)没有这句话,仍是 terminal —— 换节点也是白换。
+  assert.equal(classifyUpstreamError(403,
+    '{"error":{"type":"FreeTierError","message":"OpenCode\'s free tier can only be used from within OpenCode"}}'),
+  'retryable');
+  assert.equal(classifyUpstreamError(403, '{"error":{"message":"Forbidden"}}'), 'terminal');
 });
 
 await t('模型冷却会过期,且默认窗口足够短不永久隐藏恢复的模型', () => {
