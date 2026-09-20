@@ -718,7 +718,7 @@ await t('身份头:User-Agent 用我们的,其余缺的补默认、客户端给�
   // 请求 ID 按会话派生(不是直接拿 uuid),形状对齐真实 CLI 的
   // msg_<6位hex><21位 alnum>。上游不校验它,但形状一致少一个变量。
   assert.match(h['x-opencode-request'], /^msg_[0-9a-f]{6}[0-9A-Za-z]{19}$/);
-  assert.equal(h['x-opencode-session'], 'uuid-1');
+  assert.match(h['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
   assert.equal(h['x-title'], undefined, '没合理默认值的就别凭空造');
 });
 
@@ -739,50 +739,73 @@ await t('身份头:客户端自带的 UA 不会被透传(带了自己的 UA 也�
 await t('身份头:读入站头大小写不敏感', () => {
   // Node 收到的 req.headers 本来就是小写,但客户端和测试夹具不一定 ——
   // 大小写敏感的话「客户端值优先」这条会在真实请求上悄悄失效
-  const h = identityHeaders({ headers: { 'X-Opencode-Project': ' proj-9 ', 'X-Opencode-Session': ' sess-7 ' } }, () => 'uuid-2');
+  const h = identityHeaders({ headers: { 'X-Opencode-Project': ' proj-9 ', 'X-Opencode-Session': ' ses_0123456789abcdef0123456789 ' } }, () => 'uuid-2');
   assert.equal(h['x-opencode-project'], 'proj-9', '顺手去掉首尾空白');
-  assert.equal(h['x-opencode-session'], 'sess-7', '顺手去掉首尾空白');
+  assert.equal(h['x-opencode-session'], 'ses_0123456789abcdef0123456789', '合法 session 保留并去掉首尾空白');
 });
 
 await t('身份头:兼容旧的 session-affinity 和通用 session-id', () => {
-  const a = identityHeaders({ headers: { 'x-session-affinity': 'aff-1' } }, () => 'u');
-  assert.equal(a['x-opencode-session'], 'aff-1');
-  const b = identityHeaders({ headers: { 'x-session-id': 'sid-1' } }, () => 'u');
-  assert.equal(b['x-opencode-session'], 'sid-1');
-  assert.equal(b['x-session-id'], 'sid-1', 'x-session-id 本身也照原样透传');
+  const a = identityHeaders({ headers: { 'x-session-affinity': 'ses_0123456789abcdef0123456789' } }, () => 'u');
+  assert.equal(a['x-opencode-session'], 'ses_0123456789abcdef0123456789');
+  const b = identityHeaders({ headers: { 'x-session-id': 'ses_abcdef01234567890123456789' } }, () => 'u');
+  assert.equal(b['x-opencode-session'], 'ses_abcdef01234567890123456789');
+  assert.equal(b['x-session-id'], 'ses_abcdef01234567890123456789', 'x-session-id 本身也照原样透传');
 });
 
 await t('身份头:Claude Code 原生会话 ID 优先于通用会话头', () => {
   const h = identityHeaders({ headers: {
-    'x-claude-code-session-id': 'claude-conversation-1',
-    'x-session-id': 'generic-session',
-    'conversation-id': 'generic-conversation',
+    'x-claude-code-session-id': 'ses_0123456789abcdef0123456789',
+    'x-session-id': 'ses_abcdef01234567890123456789',
+    'conversation-id': 'ses_111111111111AAAAAAAAAAAAAA',
   } }, () => 'fallback');
-  assert.equal(h['x-opencode-session'], 'claude-conversation-1');
+  assert.equal(h['x-opencode-session'], 'ses_0123456789abcdef0123456789');
 });
 
 await t('身份头:显式 session 按头和 body 的优先级选,不被内容 hash 覆盖', () => {
   const body = {
-    conversation_id: 'body-conv',
-    metadata: { session_id: 'meta-session' },
+    conversation_id: 'ses_222222222222BBBBBBBBBBBBBB',
+    metadata: { session_id: 'ses_333333333333CCCCCCCCCCCCCC' },
     messages: [{ role: 'user', content: 'hello' }],
   };
   assert.equal(identityHeaders({ headers: {
-    'x-opencode-session': 'open-session',
-    'x-session-id': 'generic-session',
-    'conversation-id': 'header-conv',
-  }, body }, () => 'req-1')['x-opencode-session'], 'open-session');
+    'x-opencode-session': 'ses_0123456789abcdef0123456789',
+    'x-session-id': 'ses_abcdef01234567890123456789',
+    'conversation-id': 'ses_111111111111AAAAAAAAAAAAAA',
+  }, body }, () => 'req-1')['x-opencode-session'], 'ses_0123456789abcdef0123456789');
   assert.equal(identityHeaders({ headers: {
-    'x-session-id': 'generic-session',
-    'conversation-id': 'header-conv',
-  }, body }, () => 'req-2')['x-opencode-session'], 'generic-session');
-  assert.equal(identityHeaders({ headers: { 'conversation-id': 'header-conv' }, body }, () => 'req-3')
-    ['x-opencode-session'], 'header-conv');
-  assert.equal(identityHeaders({ headers: {}, body }, () => 'req-4')['x-opencode-session'], 'body-conv');
+    'x-session-id': 'ses_abcdef01234567890123456789',
+    'conversation-id': 'ses_111111111111AAAAAAAAAAAAAA',
+  }, body }, () => 'req-2')['x-opencode-session'], 'ses_abcdef01234567890123456789');
+  assert.equal(identityHeaders({ headers: { 'conversation-id': 'ses_111111111111AAAAAAAAAAAAAA' }, body }, () => 'req-3')
+    ['x-opencode-session'], 'ses_111111111111AAAAAAAAAAAAAA');
+  assert.equal(identityHeaders({ headers: {}, body }, () => 'req-4')['x-opencode-session'], 'ses_222222222222BBBBBBBBBBBBBB');
   assert.equal(identityHeaders({ headers: {}, body: {
-    metadata: { session_id: 'meta-session' },
+    metadata: { session_id: 'ses_333333333333CCCCCCCCCCCCCC' },
     messages: body.messages,
-  } }, () => 'req-5')['x-opencode-session'], 'meta-session');
+  } }, () => 'req-5')['x-opencode-session'], 'ses_333333333333CCCCCCCCCCCCCC');
+});
+
+await t('身份头:所有显式 session 来源都归一成稳定的上游格式', () => {
+  const cases = [
+    ['x-opencode-session', { headers: { 'x-opencode-session': 'open-session' } }],
+    ['x-claude-code-session-id', { headers: { 'x-claude-code-session-id': 'claude-conversation-1' } }],
+    ['x-session-id', { headers: { 'x-session-id': 'generic-session' } }],
+    ['conversation-id', { headers: { 'conversation-id': 'header-conversation' } }],
+    ['conversation_id', { headers: {}, body: { conversation_id: 'body-conversation' } }],
+    ['metadata.session_id', { headers: {}, body: { metadata: { session_id: 'meta-session' } } }],
+  ];
+  for (const [source, inbound] of cases) {
+    const first = identityHeaders(inbound, () => 'fallback-a');
+    const grown = identityHeaders({ ...inbound, body: {
+      ...inbound.body,
+      messages: [...(inbound.body?.messages || []), { role: 'user', content: 'follow-up' }],
+    } }, () => 'fallback-b');
+    assert.match(first['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/, source);
+    assert.equal(first['x-opencode-session'], grown['x-opencode-session'], `${source} 归一结果必须稳定`);
+  }
+
+  const valid = 'ses_0123456789abcdef0123456789';
+  assert.equal(identityHeaders({ headers: { 'x-opencode-session': valid } }, () => 'fallback-c')['x-opencode-session'], valid);
 });
 
 await t('身份头:没有显式 session 时按第一条 user 内容生成稳定 SHA-256 ID', () => {
@@ -858,8 +881,8 @@ await t('身份头的值必须洗掉 Node 不认的字符 —— 否则一个畸
   for (const [k, v] of Object.entries(all)) http.validateHeaderValue(k, String(v));
 
   // 正常值一个字都不能动 —— 洗值不该改变已经好用的 session
-  const clean = identityHeaders({ headers: {}, body: { conversation_id: 'sess-normal-1' } }, () => 'u');
-  assert.equal(clean['x-opencode-session'], 'sess-normal-1');
+  const clean = identityHeaders({ headers: {}, body: { conversation_id: 'ses_444444444444DDDDDDDDDDDDDD' } }, () => 'u');
+  assert.equal(clean['x-opencode-session'], 'ses_444444444444DDDDDDDDDDDDDD');
 });
 
 await t('Chat、Responses、Anthropic 三个入口用同一套稳定 session', async () => {

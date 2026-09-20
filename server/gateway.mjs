@@ -401,6 +401,7 @@ function conversationSeed(body) {
  * prompt cache 都吃这个值。所以用哈希而不是随机数 —— 换节点重试也保持不变。
  */
 const SESSION_ALNUM = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+const SESSION_ID_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 function stableSessionId(signal) {
   const digest = crypto.createHash('sha256').update(`ses\0${signal}`).digest();
   const byteAt = (i) => digest[i % digest.length];
@@ -474,7 +475,13 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
     || (typeof body?.conversation_id === 'string' ? headerSafe(body.conversation_id) : '')
     || (typeof body?.metadata?.session_id === 'string' ? headerSafe(body.metadata.session_id) : '');
   const seed = conversationSeed(body);
-  out['x-opencode-session'] = explicitSession || (seed ? stableSessionId(seed) : uuid());
+  const rawSession = explicitSession || (seed ? stableSessionId(seed) : uuid());
+  // 上游只接受固定形状的 session。客户端的 Claude/通用 session 通常是 UUID 或
+  // 自定义字符串,不能原样塞进 x-opencode-session;合法的 OpenCode ID 才透传,
+  // 其余按原值稳定哈希,既过门槛又保持同一对话跨请求/换节点不变。
+  out['x-opencode-session'] = SESSION_ID_RE.test(rawSession)
+    ? rawSession
+    : stableSessionId(rawSession);
   // 请求 ID 客户端给了就透传,没给就按 msg_ 形状造一个
   out['x-opencode-request'] = pick('x-opencode-request') || newRequestId();
   // 这两个没有合理的默认值,客户端没给就别凭空造
