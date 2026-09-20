@@ -45,6 +45,13 @@ await t('parseEfforts 从错误原文里读出档位,按词边界而不是子串
   assert.equal(parseEfforts(null), null);
 });
 
+await t('parseEfforts 优先读取 valid values,不把被拒的 max 算成支持', () => {
+  assert.deepEqual(
+    parseEfforts('invalid reasoning_effort: max; valid values: low, medium, high'),
+    ['low', 'medium', 'high'],
+  );
+});
+
 await t('parseMaxOut 认中英文两种上限写法', () => {
   assert.equal(parseMaxOut('[1210] The max_tokens parameter is illegal.:限制数值范围[1,131072]'), 131072);
   assert.equal(parseMaxOut('max_tokens must be between 1 and 8192'), 8192);
@@ -120,7 +127,7 @@ await t('effortMapOf 缺字段时兜底成 high + 宽松(也就是有记录之�
 await t('load:盘上那份盖过 SEED,读坏了退回只用 SEED', () => {
   const file = tmpFile('caps-load.json');
   fs.writeFileSync(file, JSON.stringify({
-    version: 1,
+    version: 2,
     models: { 'hy3-free': { ctx: 999, top: 'max', efforts: null }, 'new-free': { ctx: 4096, top: 'low' } },
   }));
   const caps = new Capabilities({ file, post: async () => ({}) });
@@ -158,7 +165,27 @@ function fakePost(handler) {
   return { post, calls };
 }
 
-await t('探档位:严格模型从 400 原文里读出它认的那几档,不再多问一次顶档', async () => {
+await t('探档位:顶档探测读取 valid values,不把被拒的 max 算成支持', async () => {
+  const { post, calls } = fakePost((b) => {
+    if (b.reasoning_effort === '__probe__') {
+      return { throw: { status: 400, body: 'invalid reasoning_effort parameter' } };
+    }
+    if (b.reasoning_effort === 'max') {
+      return { throw: { status: 400, body: 'invalid reasoning_effort: max; valid values: low, medium, high' } };
+    }
+    if (b.max_tokens === 900_000_000) {
+      return { throw: { status: 400, body: '限制数值范围[1,131072]' } };
+    }
+    return {};
+  });
+  const caps = new Capabilities({ file: tmpFile('caps-e-max-rejected.json'), post });
+  const r = await caps.probeEfforts('strict-max-rejected');
+  assert.deepEqual(r.efforts, ['low', 'medium', 'high']);
+  assert.equal(r.top, 'high');
+  assert.ok(calls.some((c) => c.reasoning_effort === 'max'), '宽松探测也必须发一次真实 max 验证');
+});
+
+await t('探档位:严格模型从 400 原文里读出它认的那几档', async () => {
   const { post, calls } = fakePost((b) => {
     if (b.reasoning_effort === '__probe__') {
       return { throw: { status: 400, body: '[1210] please use low, high, or max' } };
@@ -173,7 +200,7 @@ await t('探档位:严格模型从 400 原文里读出它认的那几档,不再�
   assert.deepEqual(r.efforts, ['low', 'high', 'max']);
   assert.equal(r.top, 'max', '顶档就是它认的最强那档');
   assert.equal(r.maxOut, 131072);
-  assert.equal(calls.length, 2, '原文已经点名了档位,不用再拿 max 试一次');
+  assert.equal(calls.length, 3, '列出顶档后还要验证一次,再探 max_tokens');
 });
 
 await t('探档位:宽松模型(非法档位也 200)要单独问一次顶档', async () => {
@@ -314,14 +341,17 @@ await t('run:max_tokens 那一探失败不该连坐 —— efforts/top 已经探
   assert.equal(caps.get('weird-free').efforts, null, '原文里没有档位词 = 按宽松处理');
   assert.equal(caps.get('weird-free').maxOut, null, '这个值只是留档,探不到就空着');
 });
-await t('run:顶档探测不把上游 400 误当成固定 high', async () => {
+await t('run:顶档探测从 max 拒绝错误中保存允许档位', async () => {
   const file = tmpFile('caps-r9.json');
-  const { post } = fakePost((b) => {
-    if (b.reasoning_effort === '__probe__') {
-      return { throw: { status: 400, body: 'invalid reasoning_effort; use low, medium, high' } };
+  const { post, calls } = fakePost((b) => {
+    if (b.reasoning_effort === '__probe__') return {};
+    if (b.reasoning_effort === 'max') {
+      return { throw: { status: 400, body: 'invalid reasoning_effort: max; valid values: low, medium, high' } };
     }
-    if (b.max_tokens === 900_000_000) return { throw: { status: 400, body: 'max_tokens must be between 1 and 131072' } };
-    return { throw: { status: 400, body: 'max effort is unsupported' } };
+    if (b.max_tokens === 900_000_000) {
+      return { throw: { status: 400, body: 'max_tokens must be between 1 and 131072' } };
+    }
+    return {};
   });
   const caps = new Capabilities({ file, post });
   caps.stamp = () => 1;
@@ -330,6 +360,52 @@ await t('run:顶档探测不把上游 400 误当成固定 high', async () => {
   assert.equal(caps.get('strict-free').top, 'high');
   assert.deepEqual(caps.get('strict-free').efforts, ['low', 'medium', 'high']);
   assert.equal(caps.get('strict-free').maxOut, 131072);
+  assert.ok(calls.some((c) => c.reasoning_effort === 'max'), '必须真的验证 max');
+  const again = new Capabilities({ file, post: async () => { throw new Error('不该再次出站'); } });
+  const reloaded = again.effortMap();
+  assert.deepEqual(reloaded['strict-free'], { top: 'high', efforts: ['low', 'medium', 'high'] });
+  const { reasoningEffort, setModelEfforts } = await import('../server/anthropic.mjs');
+  setModelEfforts(reloaded);
+  try {
+    assert.equal(reasoningEffort({ output_config: { effort: 'max' } }, 'strict-free'), 'high');
+  } finally {
+    setModelEfforts(null);
+  }
+});
+
+await t('run:旧能力缓存升级时清掉过期档位,保留上下文并重探', async () => {
+  const file = tmpFile('caps-r10-migrate.json');
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    models: {
+      'stale-free': {
+        ctx: 262144, method: 'validator', ctxAt: 1,
+        top: 'max', efforts: ['low', 'medium', 'high', 'max'], effortAt: 1,
+      },
+    },
+  }));
+  const { post, calls } = fakePost((b) => {
+    if (b.reasoning_effort === '__probe__') return {};
+    if (b.reasoning_effort === 'max') {
+      return { throw: { status: 400, body: 'invalid reasoning_effort: max; valid values: low, medium, high' } };
+    }
+    if (b.max_tokens === 900_000_000) {
+      return { throw: { status: 400, body: 'max_tokens must be between 1 and 131072' } };
+    }
+    return {};
+  });
+  const caps = new Capabilities({ file, post });
+  const r = await caps.probeMissing(['stale-free'], { context: false });
+  assert.equal(r.note, 'ok');
+  assert.equal(caps.get('stale-free').ctx, 262144, '迁移只清档位,上下文实测值要留着');
+  assert.equal(caps.get('stale-free').top, 'high');
+  assert.deepEqual(caps.get('stale-free').efforts, ['low', 'medium', 'high']);
+  assert.ok(calls.some((c) => c.reasoning_effort === 'max'), '旧 top=max 不能阻止新规则重探');
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(saved.version, 2, '重探后写新缓存版本');
+
+  const again = new Capabilities({ file, post: async () => { throw new Error('不该再次出站'); } });
+  assert.equal((await again.probeMissing(['stale-free'], { context: false })).note, 'nothing-missing');
 });
 
 

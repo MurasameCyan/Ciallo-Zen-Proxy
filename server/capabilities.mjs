@@ -29,7 +29,8 @@ import { classifyUpstreamError, isCapabilityError } from './upstream-errors.mjs'
 
 /** 思考强度六档,从弱到强。和 anthropic.mjs 的 LADDER 是同一份顺序 */
 export const LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
-
+/** 上游能力探测契约变更时递增,触发一次旧档位缓存迁移。 */
+const CAPABILITIES_VERSION = 2;
 /**
  * 搬家过来的手工实测值。字段含义见 record 的注释。
  *
@@ -109,22 +110,32 @@ export function effortMapOf(records) {
 /**
  * 从错误原文里读出这个模型认的档位。
  *
- * 判据是「原文里点名了哪几个档位词」。x-preview-f-free 的原文:
- *   [1210] This model always engages in thinking and cannot be disabled;
- *          please use low, high, or max
- * → ['low','high','max']
- *
- * 必须按词边界匹配,不能用 includes:`xhigh` 里含着 `high`,子串匹配会把
- * 「只认 xhigh」的模型读成「认 high」。
- *
- * ponytail: 这是个启发式 —— 上游哪天把档位写在散文里(「high is not supported」)
- * 就会读反。所以只在**确实报错**时才采信它,报错本身已经说明这个模型是严格的;
- * 读出来是空的就当没探到(返回 null = 按宽松处理,退回原来的行为)。
+ * 优先读取「valid values」「please use」这类正向列表。错误原文经常同时包含
+ * 被拒的那个值(例如 `invalid ...: max; valid values: low, medium, high`),
+ * 不能把前者也算进能力；没有正向列表时才退回整段启发式扫描。
  */
 export function parseEfforts(msg) {
   const text = String(msg ?? '');
-  const found = LADDER.filter((lv) => new RegExp(`\\b${lv}\\b`, 'i').test(text));
-  return found.length ? found : null;
+  const read = (part) => {
+    const found = LADDER.filter((lv) => new RegExp(`\\b${lv}\\b`, 'i').test(part));
+    return found.length ? found : null;
+  };
+  const patterns = [
+    /\bvalid\b(?:\s+(?:values?|options?|levels?|efforts?))?\s*(?::|=|\bare\b)?\s*([^.;\n]+)/i,
+    /\b(?:allowed|supported|available|acceptable|permitted)\b(?:\s+(?:values?|options?|levels?|efforts?))?\s*(?::|=|\bare\b)?\s*([^.;\n]+)/i,
+    /\b(?:use|choose|select)\b\s+([^.;\n]+)/i,
+    /\bone\s+of\b\s*:?\s*([^.;\n]+)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    const found = match && read(match[1]);
+    if (found) return found;
+  }
+  // 没有正向列表时,「max is not supported」这类错误不能把 max 当成支持项。
+  if (/\\b(?:invalid|unsupported|rejected)\\b|\\bnot\\s+supported\\b|\\bdoes\\s+not\\s+support\\b/i.test(text)) {
+    return null;
+  }
+  return read(text);
 }
 
 /**
@@ -283,17 +294,35 @@ export class Capabilities {
    */
   load() {
     let saved = {};
+    let version = 0;
     try {
-      if (fs.existsSync(this.file)) saved = JSON.parse(fs.readFileSync(this.file, 'utf8'))?.models || {};
+      if (fs.existsSync(this.file)) {
+        const disk = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+        saved = disk?.models || {};
+        version = Number(disk?.version) || 0;
+      }
     } catch (e) {
       this.logger('warn', `[caps] 记录读取失败,只用内置那份: ${e.message}`);
     }
-    return { ...SEED, ...saved };
+
+    const records = { ...SEED, ...saved };
+    if (version !== CAPABILITIES_VERSION) {
+      // 旧探测可能在互相矛盾的错误原文下把 max 落盘。昂贵的上下文结果保留,
+      // 但所有盘上模型都要经过一次新档位探测;不在盘上的仍由 SEED 兜底。
+      for (const id of Object.keys(saved)) {
+        const record = records[id];
+        if (!record || typeof record !== 'object') continue;
+        delete record.top;
+        delete record.efforts;
+        delete record.effortAt;
+      }
+    }
+    return records;
   }
 
   save() {
     try {
-      fs.writeFileSync(this.file, JSON.stringify({ version: 1, models: this.records }, null, 2), 'utf8');
+      fs.writeFileSync(this.file, JSON.stringify({ version: CAPABILITIES_VERSION, models: this.records }, null, 2), 'utf8');
     } catch (e) {
       this.logger('warn', `[caps] 记录写盘失败(下次开机会重探): ${e.message}`);
     }
@@ -320,7 +349,7 @@ export class Capabilities {
   }
 
   /**
-   * 探思考强度 + max_tokens 上限。**便宜**:两次几十字节的请求。
+   * 探思考强度 + max_tokens 上限。**便宜**:通常两次、列出 max 时三次几十字节的请求。
    *
    * 手法都是「故意发个非法值,让上游的校验器把合法范围报在错误原文里」——
    * 比逐档试快得多(逐档要 6 次,而且每次都真的算一遍),也更准:原文是上游
@@ -330,45 +359,51 @@ export class Capabilities {
     const ask = { model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 };
     const out = {};
 
-    // 非法档位。宽松的模型会把这个字段丢掉照常回答(200),严格的会 400 并点名合法档位
+    // 非法档位。宽松的模型会把这个字段丢掉照常回答(200),严格的会 400 并点名合法档位。
     try {
       await this.post({ ...ask, reasoning_effort: '__probe__' });
-      out.efforts = null;                       // 200 = 不认也不报错,不用夹
+      out.efforts = null;
     } catch (e) {
-      if (!informative(e)) throw e;              // 连不上/限流/上游炸了都不是「探到了」
+      if (!informative(e)) throw e;
       out.efforts = parseEfforts(e?.body);
     }
-    // 顶档:认 max 就用 max,不认就 high。宽松模型也得问 —— 发个它不认的 max
-    // 会被丢成默认档,比 high 还弱
-    out.top = out.efforts ? out.efforts[out.efforts.length - 1]
-      : await this.topOf(model, ask);
 
-    // max_tokens 上限。**best-effort**:这个值只是留档,没有任何地方拿它做判断
+    // 只有错误原文明确列出 max 时才验证它。某些上游会把非法探针报成
+    // 「valid values: ... max」,但实际 max 仍被拒;不能只凭这份清单落盘。
+    if (out.efforts?.includes('max')) {
+      const checked = await this.topOf(model, ask, out.efforts);
+      out.top = checked.top;
+      out.efforts = checked.efforts;
+    } else if (out.efforts) {
+      out.top = out.efforts.at(-1);
+    } else {
+      const checked = await this.topOf(model, ask);
+      out.top = checked.top;
+      out.efforts = checked.efforts;
+    }
+
+    // max_tokens 上限。**best-effort**:这个值只是留档,没有任何地方拿它做判断。
     // (夹档位靠 efforts/top,上下文靠 ctx),所以探不到就不记 —— 更不该因为它
     // 把上面已经探明白的 efforts/top 一起扔掉。
-    //
-    // 这不是理论上的顾虑:muse-spark-1.2-contributor-free(2026-08-21 上线)对
-    // 什么请求都回怪状态码 —— 基线 400、非法档位 400、而 max_tokens=9e8 偏偏回
-    // **429**,正文全是一个没有 error 字段的「成功壳子」。当时这一下把整轮探测
-    // 掐了(429 被当成「出口被限流,停手」),于是它每次开机都探、每次都白探。
-    // 真的出口限流会在上面那两次(更便宜、更正常的请求)就露出来,那两条还是照停。
     try {
       await this.post({ ...ask, max_tokens: 900_000_000 });
-      out.maxOut = null;                        // 居然不校验,那就不记
+      out.maxOut = null;
     } catch (e) {
       out.maxOut = informative(e) ? parseMaxOut(e?.body) : null;
     }
     return out;
   }
 
-  /** 宽松模型的顶档:max 打得通就是 max;失败时若原文点名档位,取其中最强 */
-  async topOf(model, ask) {
+  /** 验证 max;被拒时保留可靠的允许档位,并排除刚刚被拒的 max。 */
+  async topOf(model, ask, hintedEfforts = null) {
     try {
       await this.post({ ...ask, reasoning_effort: 'max' });
-      return 'max';
+      return { top: 'max', efforts: hintedEfforts };
     } catch (e) {
       if (!informative(e)) throw e;
-      return parseEfforts(e?.body)?.at(-1) || 'high';
+      const parsed = parseEfforts(e?.body);
+      const efforts = (parsed || hintedEfforts)?.filter((lv) => lv !== 'max') || null;
+      return { top: efforts?.at(-1) || 'high', efforts };
     }
   }
 
