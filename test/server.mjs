@@ -2680,6 +2680,23 @@ await t('Chat 和 Responses 仅为明确文本模型降级图片与文件', () =
   assert.deepEqual(RESPONSES.toUpstream(structuredClone(responses), unknown).input[0].content,
     responses.input[0].content);
 });
+await t('Responses 上游路由把模型不支持的 max 强度夹到实测顶档', async () => {
+  const { reasoningEffort, setModelEfforts } = await import('../server/anthropic.mjs');
+  const original = { 'strict-responses': { top: 'high', efforts: ['low', 'medium', 'high'] } };
+  setModelEfforts(original);
+  try {
+    const req = {
+      model: 'strict-responses',
+      output_config: { effort: 'max' },
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+    assert.equal(reasoningEffort(req, req.model), 'high',
+      '严格模型不支持 max 时应发送真实顶档 high,不能把 max 发给上游');
+  } finally {
+    setModelEfforts(null);
+  }
+});
+
 
 await t('RESPONSES.applyEffort:走嵌套 reasoning.effort,不碰顶层 reasoning_effort', () => {
   const body = { model: 'm', input: [] };

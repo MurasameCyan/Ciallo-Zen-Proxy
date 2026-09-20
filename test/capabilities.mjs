@@ -314,6 +314,24 @@ await t('run:max_tokens 那一探失败不该连坐 —— efforts/top 已经探
   assert.equal(caps.get('weird-free').efforts, null, '原文里没有档位词 = 按宽松处理');
   assert.equal(caps.get('weird-free').maxOut, null, '这个值只是留档,探不到就空着');
 });
+await t('run:顶档探测不把上游 400 误当成固定 high', async () => {
+  const file = tmpFile('caps-r9.json');
+  const { post } = fakePost((b) => {
+    if (b.reasoning_effort === '__probe__') {
+      return { throw: { status: 400, body: 'invalid reasoning_effort; use low, medium, high' } };
+    }
+    if (b.max_tokens === 900_000_000) return { throw: { status: 400, body: 'max_tokens must be between 1 and 131072' } };
+    return { throw: { status: 400, body: 'max effort is unsupported' } };
+  });
+  const caps = new Capabilities({ file, post });
+  caps.stamp = () => 1;
+  const r = await caps.probeMissing(['strict-free'], { context: false });
+  assert.equal(r.note, 'ok');
+  assert.equal(caps.get('strict-free').top, 'high');
+  assert.deepEqual(caps.get('strict-free').efforts, ['low', 'medium', 'high']);
+  assert.equal(caps.get('strict-free').maxOut, 131072);
+});
+
 
 await t('run:「探过但没探出数字」也算探过,不会每次开机再花一次 6MB', async () => {
   const file = tmpFile('caps-r7.json');

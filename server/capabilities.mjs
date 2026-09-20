@@ -361,14 +361,14 @@ export class Capabilities {
     return out;
   }
 
-  /** 宽松模型的顶档:max 打得通(且没被当成非法)就是 max */
+  /** 宽松模型的顶档:max 打得通就是 max;失败时若原文点名档位,取其中最强 */
   async topOf(model, ask) {
     try {
       await this.post({ ...ask, reasoning_effort: 'max' });
       return 'max';
     } catch (e) {
       if (!informative(e)) throw e;
-      return 'high';
+      return parseEfforts(e?.body)?.at(-1) || 'high';
     }
   }
 
