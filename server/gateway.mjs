@@ -1181,14 +1181,21 @@ export class Gateway {
     // 主 lane 才动全局 selector。cooling 状态永远共享同一份,不影响。
     // 节点名以子 lane 自己的表为准:名字在它表里就直切,不在(机场刚换节点、
     // 主 lane 名字过期)就退到它表里第一个,保证切得动、不撞 proxy not exist。
-    const resolveChildName = (node) => (lane && lane.nodes && lane.nodes.includes(node))
+    // 子 lane 有独立 mihomo 进程(lane.inst),主 lane 没有 —— 主 lane 是
+    // { id:'main', active, lastUsed },切节点得走全局 selector(switchNode)。
+    // 早先这里按 `lane` 真值判,主 lane 也是个真值对象,于是主 lane 的请求换节点
+    // 时走进 _childSwitch(lane.inst=undefined),崩在 `inst.ctrlPort` —— 表现为
+    // 「子实例切换失败: Cannot read properties of undefined」,换不动节点、重试全废,
+    // 最后把上游那个可重试错误(免费层 403、5xx)原样漏给客户端。按 lane.inst 判才对。
+    const childLane = lane && lane.inst ? lane : null;
+    const resolveChildName = (node) => (childLane && childLane.nodes && childLane.nodes.includes(node))
       ? node
-      : (lane && lane.nodes && lane.nodes.length ? lane.nodes[0] : node);
-    const doSwitch = (node) => lane
-      ? this._childSwitch(lane.inst, resolveChildName(node))
+      : (childLane && childLane.nodes && childLane.nodes.length ? childLane.nodes[0] : node);
+    const doSwitch = (node) => childLane
+      ? this._childSwitch(childLane.inst, resolveChildName(node))
       : this.switchNode(node);
     const switchTo = async (node) => {
-      const target = lane ? resolveChildName(node) : node;
+      const target = childLane ? resolveChildName(node) : node;
       if (!(await doSwitch(node))) {
         unbind(node);
         return false;

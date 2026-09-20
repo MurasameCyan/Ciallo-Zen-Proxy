@@ -1422,6 +1422,28 @@ await t('客户端断开:在飞的上游请求被 abort,而且不再换节点重
   assert.equal(d.total.requests, 0, '客户端自己取消的不算一次失败请求');
 });
 
+await t('主 lane 请求遇可重试错误:走全局 switchNode 换节点,不误入子 lane 的 _childSwitch', async () => {
+  // 回归:主 lane 对象是 { id:'main', active, lastUsed },没有 inst。早先 doSwitch
+  // 按 `lane` 真值判,主 lane 也是真值,于是换节点走进 _childSwitch(lane.inst=undefined),
+  // 崩在 inst.ctrlPort(日志「子实例切换失败: Cannot read properties of undefined」),
+  // 换不动节点、重试全废,最后把上游那个本可重试的错误(免费层 403 / 5xx)漏给客户端。
+  const g = retryGateway('sm-mainlane.json', (i) => {
+    if (i === 0) throw { status: 503, body: 'upstream overloaded' };  // 可重试
+    return { id: 'x', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] };
+  });
+  let childSwitchCalled = false;
+  g._childSwitch = async () => { childSwitchCalled = true; return false; };  // 主 lane 不该碰它
+  g.cooldown.mark5xx = () => {};   // 不关心冷却副作用,只看换节点
+  g.cur = 'A';
+  const mainLane = { id: 'main', active: 1, lastUsed: 0 };   // 主 lane 形状:无 inst
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000, null, '', '', mainLane);
+
+  assert.equal(childSwitchCalled, false, '主 lane 换节点绝不能走 _childSwitch(那是子 lane 专用)');
+  assert.deepEqual(g.tries, ['A', 'B'], '在 A 上 503 后必须换到 B 重试');
+  assert.equal(res.code, 200, '换节点重试后最终成功,而不是把 503 漏给客户端');
+});
+
 await t('正常收尾触发的 close 不会被当成客户端取消', async () => {
   // res.end() 也会 emit 'close'。把它当取消的话,每个正常请求都会在收尾时
   // abort 一个已经完成的 signal —— 无害但会掩盖真取消,也让计数说不清。
