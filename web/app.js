@@ -10,7 +10,7 @@ import {
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
   pushLog, maskKey, endpointBase, anthropicBase, rankBreakdown, COOLDOWN_MS,
   fmtDelay, delayGrade, fmtAgo, hasNewer, callLog, nodeStats, configPayload, updateHours,
-  modelLabel, modelState,
+  modelLabel, modelState, modelTooltip,
 } from './core.js';
 
 const $ = (id) => document.getElementById(id);
@@ -291,6 +291,11 @@ function renderConn() {
  * 元数据,服务端还没探到的就只显示模型名(刚上线的新模型有那么几十秒是这样)。
  * modelAvailability 是最小连通性探针的快照;只有明确 unavailable 的项灰显,
  * unknown/probing 仍保留,避免把暂时限流或网络故障误画成下线。
+ *
+ * 胶囊本身只放得下模型名(21px 高、两列),所以「上下文 / 最大输出 / 思考等级 /
+ * 探针状态」这四项走悬停和读屏:modelTooltip 把它们拼成多行文本,数据缺失时明说
+ * 未知/未探测 —— 上下文上限和最大输出是两件事(Claude Code 拿前者当输出预算发
+ * 1M,换来一句不点名参数的 400),看不见这两个数就只能靠猜。
  */
 function renderModels() {
   const list = Array.isArray(S.status.models) ? S.status.models : [];
@@ -298,18 +303,19 @@ function renderModels() {
   const availability = S.status.modelAvailability
     && typeof S.status.modelAvailability === 'object'
     ? S.status.modelAvailability : {};
+  const metadata = S.status.metadata && typeof S.status.metadata === 'object' ? S.status.metadata : {};
+  const caps = S.status.modelCapabilities && typeof S.status.modelCapabilities === 'object'
+    ? S.status.modelCapabilities : {};
   const ul = $('models');
+  const titleOf = (m) => modelTooltip(m, ctx, metadata, caps, availability);
   // 内容没变就不重建。以前是每轮无条件重建(8 个 <li> 比 diff 还便宜),但下面
   // 要读 scrollWidth 量溢出,那会强制同步重排 —— 2 秒一次地重排一整格不值得,
   // 而这个清单几周才变一次
   //
-  // key 里必须连上下文一起算:新模型是先进清单、几十秒后才探出上限的,只看清单
-  // 的话那个 `[1M]` 要等到清单下次真的变了才补上。状态也放进来:探针后台
-  // 完成时清单本身不变,但胶囊仍要从 probing 变成 available/unavailable
-  const key = JSON.stringify(list.map((m) => {
-    const state = modelState(m, availability);
-    return [m, ctx[m] ?? 0, state.status, state.message];
-  }));
+  // key 直接拿整条 title 算:它已经把上下文、最大输出、思考等级和探针状态都
+  // 折进去了 —— 新模型是先进清单、几十秒后才探出能力的,少算一项就意味着那项
+  // 要等到清单下次真的变了才补上(状态同理:探针后台完成时清单本身不变)。
+  const key = JSON.stringify(list.map((m) => [m, modelState(m, availability).status, titleOf(m)]));
   if (ul.dataset.key === key) return;
   ul.dataset.key = key;
 
@@ -318,18 +324,20 @@ function renderModels() {
     const state = modelState(m, availability);
     li.classList.add(state.status);
     li.textContent = modelLabel(m, ctx);
-    li.setAttribute('aria-label', `${li.textContent} · ${state.label}`);
-    if (state.message) li.title = `${li.textContent} · ${state.message}`;
+    const title = titleOf(m);
+    li.title = title;
+    // 读屏拿到的和悬停一样多:只靠颜色点区分状态的话,状态和能力都读不出来。
+    // 换行在 aria-label 里会被读成一长串,所以折成分隔符
+    li.setAttribute('aria-label', title.replaceAll('\n', ' · '));
     return li;
   }));
 
   // 装不下的那几个:横向滚动条是藏起来的(胶囊只有 21px 高,摆得下条就摆不下字),
-  // 所以得另给键盘和读屏一条路 —— tabindex 让方向键能滚它,title 让悬停/读屏
-  // 拿到全名。只给真的溢出的加:全都能塞下时白占一串 Tab 停留点。
+  // 所以得另给键盘一条路 —— tabindex 让方向键能滚它。title 现在恒有(能力详情),
+  // 不用再拿全名兜底。只给真的溢出的加:全都能塞下时白占一串 Tab 停留点。
   for (const li of ul.children) {
     if (li.scrollWidth <= li.clientWidth + 1) continue;
     li.tabIndex = 0;
-    li.title ||= li.textContent;
   }
 }
 

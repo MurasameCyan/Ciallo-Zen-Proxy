@@ -35,7 +35,7 @@ const {
   NodeCooldown, NodeAffinity, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
   identityHeaders, OPENAI, ANTHROPIC, RESPONSES, readUsage, CALL_LOG_LIMIT, REQUEST_DEADLINE_MS, budgetFor, silentFor,
   classifyUpstreamError, MODEL_COOLDOWN_MS, BLOCKED_COOLDOWN_MS, isNodeBlockedError,
-  StreamKeepAlive, SSE_HEARTBEAT_MS, MODELS_TTL_MS,
+  StreamKeepAlive, SSE_HEARTBEAT_MS, MODELS_TTL_MS, DEAD_NODE_REVIVE_MS,
 } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey, MIXED_PORT, CTRL_PORT } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
@@ -45,7 +45,7 @@ const { MihomoInstance } = await import('../server/mihomo.mjs');
 const { shortSha, buildId, buildInfo, checkUpdate } = await import('../server/build.mjs');
 const { ModelMetadataStore } = await import('../server/model-metadata.mjs');
 const indexMod = await import('../server/index.mjs');
-const { createApp, createSubscriptionUpdater, createModelsSync } = indexMod;
+const { createApp, createSubscriptionUpdater, createModelsSync, createDeadNodeReviver } = indexMod;
 
 let n = 0;
 const t = async (name, fn) => { await fn(); n++; console.log(`  ok  ${name}`); };
@@ -1787,6 +1787,9 @@ await t('流式成功:usage 记在节点上,总览也拿到同一份', async () 
   assert.equal(d.total.success, 1);
   assert.equal(d.total.totalTokens, 12);
   assert.equal(d.byModel[FREE_MODELS[0]].requests, 1, '按客户端真选的模型记,不是写死那个');
+  // 真实请求跑完是比探针更硬的可用性证据:探针对 503/429 留 unknown 并等满六小时,
+  // 不在这里确认的话,面板会在模型明明一直在干活的时候灰着「状态未知」
+  assert.equal(g.availability.status([BODY.model])[BODY.model].status, 'available');
 });
 
 await t('流式中断的节点不锁定,下次请求不能继续优先粘着它', async () => {
@@ -1800,6 +1803,8 @@ await t('流式中断的节点不锁定,下次请求不能继续优先粘着它'
   assert.equal(g.lockedNode, null);
   assert.equal(g.affinity.get(affinityKey), null, '已经中断的节点不能继续粘住该 session');
   assert.equal(g.usage.getStats().byNode.A.upstreamError, 1);
+  assert.equal(g.availability.status([BODY.model])[BODY.model].status, 'unknown',
+    '流被截断不是「这个模型可用」的证据');
 });
 
 await t('换节点失败时继续找下一个,不能回头再打刚限流的节点', async () => {
@@ -2207,6 +2212,61 @@ await t('/v1/models 附带 models.dev 元数据,但不覆盖实测能力字段',
   assert.equal(unknown.name, undefined, '没有元数据时保持基础 OpenAI model 形状');
 });
 
+await t('Responses 出站预算按模型输出上限钳制,原生与转换两条腿一致', async () => {
+  // 2026-10-02 实测:Claude Code 对 muse-spark-1.3 发 max_tokens: 1048576,上游
+  // 回 400「request contains invalid parameters」;同一请求把预算降到元数据里的
+  // 131072 就 200。上游只说「参数不对」不说是哪个参数,所以这条断言是那次对照
+  // 实验的回归 —— 真实上限在出站前夹掉,而不是让客户端自己猜。
+  const model = 'muse-spark-1.3-contributor-free';
+  const build = ({ maxOut, metaOut }) => {
+    const g = new Gateway(load(), () => {});
+    g.models = [model];
+    g.modelsAt = Date.now();
+    g.modelProtocol = () => 'responses';
+    g.modelMetadata = () => (metaOut == null ? null : { maxOutputTokens: metaOut });
+    g.caps.get = () => (maxOut == null ? null : { maxOut });
+    g.getAllNodes = async () => ['A'];
+    g.rankNodes = (nodes) => nodes;
+    g.ensureNode = async () => 'A';
+    g.sent = null;
+    g.attempt = async (_res, body) => { g.sent = body; };
+    return g;
+  };
+  const viaMessages = async (g, maxTokens) => {
+    const req = Readable.from([JSON.stringify({
+      model, max_tokens: maxTokens, stream: false,
+      messages: [{ role: 'user', content: 'hi' }],
+    })]);
+    req.headers = {};
+    await g.handleMessages(req, fakeRes());
+    return g.sent.max_output_tokens;
+  };
+
+  // 实测记录优先于 models.dev:那份元数据对好几个模型是错的(见 handleModels 那组)
+  const measured = build({ maxOut: 131072, metaOut: 262144 });
+  assert.equal(await viaMessages(measured, 1048576), 131072);
+  // 比上限小的预算是客户端自己的选择,夹子只往下夹,不许放大
+  assert.equal(await viaMessages(measured, 64), 64);
+
+  // 没探到 maxOut 时回落 models.dev 的 limit.output
+  const fromMetadata = build({ maxOut: null, metaOut: 65536 });
+  assert.equal(await viaMessages(fromMetadata, 1048576), 65536);
+
+  // 两处都没有上限就一个字都不改:猜一个数会把本来能过的请求夹坏
+  const unknown = build({ maxOut: null, metaOut: null });
+  assert.equal(await viaMessages(unknown, 1048576), 1048576);
+
+  // 原生 Responses 客户端(codex 那类)走同一条钳制,不绕过
+  const native = build({ maxOut: 131072, metaOut: null });
+  const req = Readable.from([JSON.stringify({
+    model, max_output_tokens: 1048576,
+    input: [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
+  })]);
+  req.headers = {};
+  await native.handleResponses(req, fakeRes());
+  assert.equal(native.sent.max_output_tokens, 131072);
+});
+
 // ── mihomo 配置生成 ────────────────────────────────────
 
 /** 去掉注释行。生成的 yaml 里有成段注释解释取舍,别让它们混进断言。 */
@@ -2403,6 +2463,84 @@ await t('免费清单每 24 小时自动同步一次,清单拉失败不会带走
   });
   await good.run();
   assert.equal(lines.at(-1), 'ok:[models-auto] 清单 2 个,元数据 12 条,目录 7 条');
+});
+
+await t('死节点复活:有测不通的才重测,全通时一个字节都不出站', async () => {
+  const scheduled = [];
+  const cleared = [];
+  const lines = [];
+  let tested = 0;
+  let dead = [];
+  const gateway = {
+    deadNodes: () => dead,
+    testNodes: async () => { tested++; return { tested: 3, alive: 3, dead: [] }; },
+  };
+  const reviver = createDeadNodeReviver({
+    gateway,
+    logger: (lv, msg) => lines.push(`${lv}:${msg}`),
+    setTimer: (fn, ms) => { const h = { fn, ms, unref() { h.unrefed = true; } }; scheduled.push(h); return h; },
+    clearTimer: (h) => cleared.push(h),
+  });
+
+  reviver.schedule();
+  assert.equal(scheduled.length, 1, 'schedule 必须真挂一个定时器');
+  assert.equal(scheduled[0].ms, DEAD_NODE_REVIVE_MS, '周期就是复活探测的间隔');
+  assert.equal(scheduled[0].unrefed, true, '定时器必须 unref,否则 SIGTERM 要等满一拍才退得掉');
+
+  // 没有死节点:这一拍不该出站
+  dead = [];
+  assert.equal(await reviver.run(), null, '没有死节点时 run 直接返回,不碰 testNodes');
+  assert.equal(tested, 0, '全通时一个字节都不出站 —— 这是常态,勤跑是白出站');
+
+  // 有死节点:重测一遍
+  dead = ['B'];
+  const r = await reviver.run();
+  assert.equal(tested, 1, '有测不通的节点才 testNodes');
+  assert.deepEqual(r, { tested: 3, alive: 3, dead: [] });
+  assert.ok(lines.some((x) => x.includes('[revive]') && x.includes('1 个节点')), '重测前记一行,说清为什么出站');
+
+  reviver.schedule();
+  assert.equal(cleared.at(-1), scheduled[0], '重排必须先取消旧定时器');
+  reviver.stop();
+  assert.equal(cleared.at(-1), scheduled.at(-1));
+  assert.equal(scheduled.length, 2, 'stop 之后不再安排新的');
+});
+
+await t('死节点复活:testNodes 抛错被自己接住,不变成没人管的 rejection', async () => {
+  const lines = [];
+  const reviver = createDeadNodeReviver({
+    gateway: { deadNodes: () => ['B'], testNodes: async () => { throw new Error('内核没起来'); } },
+    logger: (lv, msg) => lines.push(`${lv}:${msg}`),
+    setTimer: () => ({ unref() {} }),
+    clearTimer: () => {},
+  });
+  // tick 是定时器那条路走的:它不能往外抛,否则 Node 20 起默认把进程带走
+  reviver.tick();
+  await new Promise((r) => setImmediate(r));
+  assert.ok(lines.some((x) => x.startsWith('warn:') && x.includes('[revive]')), '失败要记一行 warn,而不是崩');
+});
+
+await t('复活周期为 0 或非法时不启动空转定时器', () => {
+  let scheduled = 0;
+  const mk = (intervalMs) => createDeadNodeReviver({
+    gateway: { deadNodes: () => [], testNodes: async () => ({}) },
+    logger: () => {},
+    intervalMs,
+    setTimer: () => { scheduled++; return {}; },
+    clearTimer: () => {},
+  });
+  mk(0).schedule();
+  mk(NaN).schedule();
+  mk(-1).schedule();
+  assert.equal(scheduled, 0, '0 / 非法 / 负数一律不挂定时器');
+});
+
+await t('deadNodes 只报测过不通的(delay=null),没测过的不算死', async () => {
+  const g = fakeGateway({ A: 300, B: null, C: 80 });
+  await g.testNodes();
+  assert.deepEqual(g.deadNodes(), ['B'], 'B 测过不通才算死;A/C 通的不报');
+  const g2 = fakeGateway({ A: 100 });
+  assert.deepEqual(g2.deadNodes(), [], '还没测过延迟时,delay 表空,没有死节点');
 });
 
 // ── 鉴权 ────────────────────────────────────────────────
@@ -3434,6 +3572,26 @@ await t('/api/status 带上下文表,而且只带清单里现有的模型', asyn
   // 下线的模型记录还在盘上(id 一样回来了直接复用),但不能挂在面板上
   assert.ok(gateway.caps.get('longcat-2.0-free'), '记录留着');
   assert.ok(!('longcat-2.0-free' in j.ctx), '但清单里没有就不显示');
+
+  // 胶囊悬停要的那三项(最大输出、思考档位)也搭这趟车。只投影这三个字段:
+  // 能力记录里还有 method/ctxAt 这类探测内部状态,摊给前端只会变成第二份事实
+  assert.deepEqual(Object.keys(j.modelCapabilities).sort(), ['big-pickle', 'brand-new-free']);
+  assert.deepEqual(j.modelCapabilities['big-pickle'], {
+    maxOutputTokens: null, reasoningTop: 'high', reasoningEfforts: null,
+  }, 'big-pickle 是宽松型:只有顶档,没有完整档位表,也没探出 maxOut');
+  assert.deepEqual(j.modelCapabilities['brand-new-free'], {
+    maxOutputTokens: null, reasoningTop: null, reasoningEfforts: null,
+  }, '没有记录的模型三项全空,前端据此显示「未知/未探测」');
+  assert.ok(!('longcat-2.0-free' in j.modelCapabilities), '下线模型的记录不挂在面板上');
+
+  // 严格型模型(非法档位报 400 的那种)要把实测的完整档位表和 maxOut 带出来
+  gateway.models = ['ling-3.0-flash-fin-free'];
+  const strict = await (await fetch(`${base}/api/status`, { headers: { authorization: auth } })).json();
+  assert.deepEqual(strict.modelCapabilities['ling-3.0-flash-fin-free'], {
+    maxOutputTokens: 262144,
+    reasoningTop: 'max',
+    reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+  });
 });
 
 await t('拉不到时 /api/models/sync 回 500 而不是假装成功', async () => {

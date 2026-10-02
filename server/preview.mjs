@@ -75,6 +75,45 @@ const DEMO_CTX = {
   'hy3-free': 196608,
 };
 
+/**
+ * 实测的最大输出和思考档位,经 /api/status 的 `modelCapabilities` 下发(真网关
+ * 那份在 server/capabilities.mjs 的记录里)。胶囊悬停要把它和上下文一起说清 ——
+ * 这两个数不是一回事:客户端拿上下文当输出预算发 1M,上游只回一句不点名参数的
+ * 400(2026-10-02 实测 muse-spark-1.3)。
+ *
+ * 刻意铺出四种形态,因为悬停那四行的分支全在这儿:
+ *   big-pickle   实测顶档但档位表没枚举(宽松型:不认的档位是丢字段而不是报错)
+ *   deepseek     严格型,六档全认,列得出完整表
+ *   hy3-free     没有 maxOut 记录 —— 回落到下面 DEMO_META 的 models.dev 值
+ *   其余         什么都没探到,四行里该写「未知/未探测」
+ */
+const DEMO_CAPS = {
+  'big-pickle': { maxOutputTokens: 131072, reasoningTop: 'high', reasoningEfforts: null },
+  'deepseek-v4-flash-free': {
+    maxOutputTokens: 131072,
+    reasoningTop: 'max',
+    reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+  },
+  'hy3-free': { maxOutputTokens: null, reasoningTop: 'high', reasoningEfforts: null },
+};
+
+/** models.dev 的补充元数据。只有 maxOutputTokens 参与悬停(实测缺失时的兜底) */
+const DEMO_META = {
+  'hy3-free': { maxOutputTokens: 65536 },
+};
+
+/**
+ * 最小连通性探针的快照。四种状态各摆一个,因为胶囊的边框色、状态点和悬停末行
+ * 都按它分支;unknown 那条特意带上错误原文 —— 「上游此刻过载」和「还没探过」
+ * 都是 unknown,但只有前者说得出原因,而真网关正是靠这行区分它们。
+ */
+const DEMO_AVAILABILITY = {
+  'big-pickle': { status: 'unknown', checkedAt: Date.now() - 900_000, error: { kind: 'transient', status: 503, message: 'Error from provider (Console): The backend is temporarily overloaded' } },
+  'deepseek-v4-flash-free': { status: 'available', checkedAt: Date.now() - 120_000, error: null },
+  'hy3-free': { status: 'probing', checkedAt: null, error: null },
+  'north-mini-code-free': { status: 'unavailable', checkedAt: Date.now() - 300_000, error: { kind: 'model_unavailable', status: 400, message: 'Model is unavailable' } },
+};
+
 const state = {
   cfg: {
     subscriptionUrl: 'https://demo.example.com/subscribe?token=preview',
@@ -345,6 +384,13 @@ async function handleApi(req, res, path) {
       // 探到的上下文会当场出现在模型胶囊上:glm-5-air-free 先只有名字,
       // 「补探能力」之后才长出 [262K] 后缀
       ctx: state.probed ? { ...DEMO_CTX, 'glm-5-air-free': 262144 } : DEMO_CTX,
+      // 胶囊悬停那四行的后两个来源。glm-5-air-free 同样不在表里:新模型刚进
+      // 清单时「最大输出」和「思考等级」就该明说未知/未探测,而不是显示 0。
+      modelCapabilities: state.probed
+        ? { ...DEMO_CAPS, 'glm-5-air-free': { maxOutputTokens: 65536, reasoningTop: 'high', reasoningEfforts: null } }
+        : DEMO_CAPS,
+      metadata: DEMO_META,
+      modelAvailability: DEMO_AVAILABILITY,
       build: state.build,
       buildUrl: `${REPO_URL}/commit/${state.build}`,
       repoUrl: REPO_URL,

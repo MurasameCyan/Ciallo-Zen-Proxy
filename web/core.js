@@ -74,6 +74,45 @@ export function modelState(id, availability) {
   };
 }
 
+/**
+ * 模型胶囊的悬停详情:名字 + 四行能力。
+ *
+ * 为什么不只显示名字:胶囊上只放得下 `[1M]` 一个后缀,而「这个模型最多能吐多少
+ * 输出」和「它认哪几个思考档位」同样是填客户端时要看的数 —— 2026-10-02 那次
+ * muse-spark 400 就是客户端拿上下文上限当输出预算发上去的(两个数差 8 倍)。
+ *
+ * 取值规则和服务端一致:**实测记录优先,models.dev 兜底**。那份第三方元数据对
+ * 好几个 Zen 模型是错的,但它是唯一在我们还没探到时能给出数的来源。
+ *
+ * 缺字段一律明说「未知」/「未探测」,不显示 0、undefined 或 NaN:这几行是给人
+ * 判断「能不能照着填」的,一个假的 0 比空着更坏。探针错误原文附在状态后面 ——
+ * `unknown` 是「上游过载」还是「还没探」是两件事,但两者都仍是 unknown,这行
+ * 文案不改变状态本身。
+ */
+export function modelTooltip(id, ctxMap, metadataMap, capabilitiesMap, availabilityMap) {
+  const positive = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : null);
+  const cap = capabilitiesMap?.[id];
+  const ctx = positive(ctxMap?.[id]);
+  const out = positive(cap?.maxOutputTokens) ?? positive(metadataMap?.[id]?.maxOutputTokens);
+  // 严格型模型探得出完整档位表;宽松型(不认的档位是丢字段而不是报错)只探得出
+  // 顶档 —— 那种情况光写 "high" 会被读成「只支持 high」,所以点明是顶档。
+  const efforts = Array.isArray(cap?.reasoningEfforts) && cap.reasoningEfforts.length
+    ? cap.reasoningEfforts.join(', ')
+    : (typeof cap?.reasoningTop === 'string' && cap.reasoningTop
+      ? `顶档 ${cap.reasoningTop}（完整等级未枚举）`
+      : '未探测');
+  // 原因直接取探针记录:modelState 的 message 只在 unavailable 时有值,而
+  // unknown 恰恰是最需要说明原因的那个状态。
+  const reason = String(availabilityMap?.[id]?.error?.message ?? '').trim();
+  return [
+    modelLabel(id, ctxMap),
+    `上下文上限：${ctx == null ? '未知' : grouped.format(ctx)}`,
+    `最大输出：${out == null ? '未知' : grouped.format(out)}`,
+    `思考等级：${efforts}`,
+    `探针状态：${modelState(id, availabilityMap).label}${reason ? `（${reason}）` : ''}`,
+  ].join('\n');
+}
+
 /** 毫秒时长 -> 中文粗粒度,只保留两级单位 */
 export function fmtUptime(ms) {
   const s = Math.max(0, Math.floor((Number(ms) || 0) / 1000));

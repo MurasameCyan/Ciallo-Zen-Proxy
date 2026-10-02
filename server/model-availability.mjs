@@ -21,9 +21,10 @@ const normalizeModels = (models) => [...new Set(
 )];
 
 /**
- * 探针失败时把业务 4xx（包括模型下线、鉴权/额度/端点错误）记成
- * unavailable; 429、网络错误、408、5xx 都是临时状态,先保留 unknown,
- * 下一轮六小时探测再确认,不能据此把模型灰掉六小时。
+ * 探针失败时把业务 4xx(包括模型下线、鉴权/额度/端点错误)记成 unavailable。
+ * 429 和上游 408/5xx 保留 unknown,并沿用六小时节奏,避免在配额或上游故障时
+ * 白耗探针；但 transport 是出口节点的瞬时故障,只短暂等待后重探,否则一次坏节点
+ * 会把整张模型状态表卡成 unknown 六小时,即使真实请求随后已经切到了好节点。
  */
 export function classifyAvailabilityError(error) {
   const status = Number(error?.status) || 0;
@@ -108,6 +109,28 @@ export class ModelAvailability {
     }
   }
 
+  /**
+   * 真实请求已经被上游接受。
+   *
+   * 探针对 429/5xx/传输失败只能保留 unknown —— 那些错误说的是此刻的出口或
+   * 上游状态,不是模型属性。于是一次 503 能让胶囊顶着 unknown 熬到下一轮
+   * (六小时),而同一时间真实请求早就在跑了。真实成功是比探针更强的证据:
+   * 它用的是完整请求体、完整身份头,结论就是「这个模型现在能用」。
+   *
+   * 只接已确认的成功。参数错误、取消、5xx、首字节后断流都不走这里 —— 那些
+   * 既不能证明可用,也不该被记成一次确认。
+   */
+  markAvailable(model) {
+    const id = String(model ?? '').trim();
+    if (!id) return;
+    this.records.set(id, {
+      status: 'available',
+      checkedAt: this.now(),
+      error: null,
+      nextTryAt: null,
+    });
+  }
+
   markUnavailable(model, error = { status: 400, body: 'Model is unavailable' }) {
     const id = String(model ?? '').trim();
     if (!id) return;
@@ -162,7 +185,7 @@ export class ModelAvailability {
           status: classified.status,
           checkedAt: this.now(),
           error: classified,
-          nextTryAt: null,
+          nextTryAt: classified.kind === 'transport' ? this.now() + this.retryMs : null,
         });
         this.logger(
           classified.status === 'unavailable' ? 'warn' : 'info',

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {
-  ModelAvailability, MODEL_AVAILABILITY_TTL_MS,
+  ModelAvailability, MODEL_AVAILABILITY_TTL_MS, MODEL_AVAILABILITY_RETRY_MS,
 } from '../server/model-availability.mjs';
 
 let n = 0;
@@ -76,6 +76,54 @@ await t('429 和网络错误保留 unknown,记录原因而不是误报 unavailab
   item = a.status(['limited-free'])['limited-free'];
   assert.equal(item.status, 'unknown');
   assert.equal(item.error.kind, 'transport');
+});
+
+await t('传输失败只短暂冷却,一分钟后重探而不是把模型卡六小时', async () => {
+  let now = 1000;
+  let calls = 0;
+  const a = new ModelAvailability({
+    now: () => now,
+    post: async () => {
+      calls++;
+      if (calls === 1) throw { status: 0, body: 'Client network socket disconnected before secure TLS connection was established' };
+      return { id: 'ok' };
+    },
+  });
+  await a.probe(['flaky-free']);
+  assert.equal(a.status(['flaky-free'])['flaky-free'].status, 'unknown');
+  now += MODEL_AVAILABILITY_RETRY_MS - 1;
+  await a.probe(['flaky-free']);
+  assert.equal(calls, 1, '短冷却未到不能重复出站');
+  now += 2;
+  await a.probe(['flaky-free']);
+  assert.equal(calls, 2, '短冷却到期应重探');
+  assert.equal(a.status(['flaky-free'])['flaky-free'].status, 'available');
+});
+
+await t('真实请求成功清除未知探针错误并标记 available', async () => {
+  // 探针对 503 保留 unknown 并等满六小时(限流/上游故障不是模型属性)。但真实
+  // 请求此刻成功了就是最硬的证据 —— 不让它写回状态的话,面板要顶着那个 unknown
+  // 灰六小时,而同一个模型正在为用户干活。
+  let now = 1000;
+  const a = new ModelAvailability({
+    now: () => now,
+    post: async () => { throw { status: 503, body: 'temporarily overloaded' }; },
+  });
+  await a.probe(['muse-free']);
+  assert.equal(a.status(['muse-free'])['muse-free'].status, 'unknown');
+  now += 10;
+  a.markAvailable('muse-free');
+  assert.deepEqual(a.status(['muse-free'])['muse-free'], {
+    status: 'available', checkedAt: now, error: null,
+  }, '成功要连旧错误一起清掉,不然面板还挂着上一次的原因');
+  assert.equal(a.nextDelay(['muse-free']), MODEL_AVAILABILITY_TTL_MS,
+    '成功之后回到正常的六小时节奏,不额外加探');
+  // 空值不能造出记录:body.model 缺失时写一条空 id 的 available 比不写更坏。
+  // status() 查不到它(normalizeModels 就把空 id 滤掉了),所以直接看记录表
+  a.markAvailable('');
+  a.markAvailable(null);
+  a.markAvailable('   ');
+  assert.deepEqual([...a.records.keys()], ['muse-free']);
 });
 
 await t('明确业务 4xx 都标为 unavailable,包括鉴权和额度错误', async () => {

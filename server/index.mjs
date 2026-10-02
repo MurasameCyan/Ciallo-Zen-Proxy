@@ -15,7 +15,7 @@ import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as cfgMod from './config.mjs';
 import * as mihomo from './mihomo.mjs';
-import { Gateway, OPENAI, ANTHROPIC, RESPONSES, json, MODELS_TTL_MS } from './gateway.mjs';
+import { Gateway, OPENAI, ANTHROPIC, RESPONSES, json, MODELS_TTL_MS, DEAD_NODE_REVIVE_MS } from './gateway.mjs';
 import { buildInfo, checkUpdate } from './build.mjs';
 import {
   matches, parseBasic, readCookie, resolveCredentials,
@@ -294,6 +294,10 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
         // web/core.js 里,现在是探出来的实测记录(见 server/capabilities.mjs)——
         // 于是下线的模型不会再挂在面板上,新上的也不用等人去补一行常量
         ctx: gateway.modelCtx(),
+        // 实测的最大输出和思考档位。胶囊悬停要把「上下文 / 最大输出 / 思考等级」
+        // 一起说清 —— 前两个是两件事(Claude Code 拿上下文当输出预算发 1M,
+        // 换来一句不点名参数的 400),档位列表则决定客户端设的 max 会不会被丢。
+        modelCapabilities: gateway.modelCapabilities(),
         modelsDev: gateway.modelMetadataStatus(),
         catalog: gateway.catalogStatus?.() || null,
         metadata: gateway.modelMetadataMap(),
@@ -658,6 +662,60 @@ export function createModelsSync({
   return { run, schedule, stop };
 }
 
+/**
+ * 死节点周期性复活探测。
+ *
+ * 为什么需要它:rankNodes 把「测过但不通」(delay=null)的节点整个排除出候选,
+ * 于是一个只是抖了一下的节点会一直躺在候选表外,直到下一次 testNodes 才有机会
+ * 回来。而 testNodes 只在四个时机跑:开机、订阅自动更新(默认 1h)、手动点「测
+ * 延迟」、手动重置。把订阅自动更新关掉(subscriptionUpdateHours=0)的话,前三个
+ * 里就只剩「开机」和「手动」—— 一个临时抖动下线的节点可能再也回不来,除非有人
+ * 记得去点按钮。节点越少的订阅,死一个影响越大。
+ *
+ * 所以补一个独立定时器:每 5min 看一眼有没有死节点(delay=null),有才重测一遍。
+ * 没有死节点时一个字节都不出站 —— 判据只查本地那张 delay 表,不碰内核、不发探针。
+ * 这条和可用性探测(6h)、lane 回收(1min)是同一类后台巡检,各管各的。
+ *
+ * 为什么不直接把 testNodes 的周期调短:testNodes 是全量重测(该订阅所有节点都
+ * 打一遍探针),勤跑是白出站;这里的触发条件是「确实有节点掉了」,平时零开销。
+ *
+ * 失败自己接住:testNodes 抛错(内核没起来、全灭)不该变成没人接的 rejection
+ * 把进程带走(Node 20 起默认行为)。测速本身已在 _testNodes 里记了日志,这里
+ * 只兜住异常。
+ */
+export function createDeadNodeReviver({
+  gateway, logger = log, intervalMs = DEAD_NODE_REVIVE_MS,
+  setTimer = setInterval, clearTimer = clearInterval,
+}) {
+  let timer = null;
+
+  const run = async () => {
+    const dead = gateway.deadNodes();
+    if (!dead.length) return null;   // 没有死节点:不出站,这是常态
+    logger('info', `[revive] ${dead.length} 个节点上次测不通,重测一遍看能不能复活`);
+    const r = await gateway.testNodes();
+    return r;
+  };
+
+  const tick = () => { run().catch((e) => logger('warn', `[revive] 重测失败: ${e.message}`)); };
+
+  const stop = () => {
+    if (timer) clearTimer(timer);
+    timer = null;
+  };
+
+  const schedule = () => {
+    stop();
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
+    timer = setTimer(tick, intervalMs);
+    // 不挡进程退出:晚一轮复活没关系,SIGTERM 卡住有关系
+    timer?.unref?.();
+    logger('info', `[revive] 死节点每 ${Math.round(intervalMs / 1000)}s 检查一次,有才重测`);
+  };
+
+  return { run, tick, schedule, stop };
+}
+
 // ── 启动 ────────────────────────────────────────────────
 
 async function main() {
@@ -667,6 +725,7 @@ async function main() {
   const gateway = new Gateway(cfg, log);
   const subscriptionUpdater = createSubscriptionUpdater({ cfg, gateway });
   const modelsSync = createModelsSync({ gateway });
+  const deadNodeReviver = createDeadNodeReviver({ gateway });
   const server = createApp({ cfg, creds, gateway, subscriptionUpdater });
 
   await new Promise((resolve, reject) => {
@@ -731,6 +790,9 @@ async function main() {
   // 免费清单每天自动同步一次。放在这里而不是更早:开机那一次(上面的
   // refreshModels)已经拉过了,这个定时器接的是「之后每天」。
   modelsSync.schedule();
+  // 死节点每 5 分钟复活探测一次。放在 modelsSync 之后:两者都是「有条件才出站」
+  // 的后台定时器 —— 这个只在有测过不通的节点时才 testNodes,全通就一个字节不出。
+  deadNodeReviver.schedule();
   // 可用性结果六小时刷新一次。探测本身只在有节点时执行;没有订阅时定时器
   // 仍然 unref,不会阻止进程退出,配置保存后 /api/status 会立即补一次。
   gateway.startAvailabilityScheduler?.();
@@ -745,6 +807,7 @@ async function main() {
     log('info', `[exit] 收到 ${sig},收尾中`);
     subscriptionUpdater.stop();
     modelsSync.stop();
+    deadNodeReviver.stop();
     gateway.stopAvailabilityScheduler?.();
     clearInterval(laneReaper);
     server.close();

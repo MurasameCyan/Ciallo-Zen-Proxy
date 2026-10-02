@@ -59,6 +59,10 @@ export { ModelAvailability, MODEL_AVAILABILITY_TTL_MS } from './model-availabili
 // env 可调(ZEN_MAX_CHILD_LANES),config.json 里存的 maxChildLanes 优先。
 export const MAX_CHILD_LANES = Number(process.env.ZEN_MAX_CHILD_LANES) || 2;
 export const LANE_IDLE_MS = 5 * 60 * 1000;
+// 死节点复活探测周期。rankNodes 把「测过不通」(delay=null)的节点整个排除出
+// 候选,只有开机 / 订阅更新(默认 1h)/ 手动测速 / 重置才会重测 —— 见 index.mjs
+// 的 createDeadNodeReviver。取 5min:比可用性探测(6h)勤,和 lane 回收同量级。
+export const DEAD_NODE_REVIVE_MS = 5 * 60 * 1000;
 
 /**
  * 从远端日志钉死的三类「机场节点拒绝代理 opencode.ai」,加上 CONNECT 直接回 403:
@@ -700,6 +704,29 @@ export class Gateway {
   }
 
   /**
+   * 面板胶囊悬停要的那份能力投影,只给当前清单里的模型。
+   *
+   * 刻意只投三个字段,而不是把 `capabilities.json` 的记录整条丢出去:那里面
+   * 还有 `method`/`ctxAt` 这类探测内部状态,面板不读,放进 `/api/status` 只是
+   * 让一个 2 秒一轮的接口多背几十字节、并且把内部格式变成对外契约。
+   *
+   * 没探到的字段给 null 而不是省略或编一个数 —— 前端据此显示「未知/未探测」,
+   * 那和「探到了,就是这个值」必须能分开(见 web/core.js 的 modelTooltip)。
+   */
+  modelCapabilities() {
+    const out = {};
+    for (const id of this.models) {
+      const r = this.caps.get(id);
+      out[id] = {
+        maxOutputTokens: Number.isInteger(r?.maxOut) && r.maxOut > 0 ? r.maxOut : null,
+        reasoningTop: typeof r?.top === 'string' && r.top ? r.top : null,
+        reasoningEfforts: Array.isArray(r?.efforts) && r.efforts.length ? [...r.efforts] : null,
+      };
+    }
+    return out;
+  }
+
+  /**
    * 模型的上游原生协议:'chat' | 'responses' | 'anthropic'。
    * 目录说了算(它的 npm 字段唯一决定端点),目录里没有就按 chat 兜底 ——
    * 免费清单绝大多数是 chat,而且老行为就是全走 chat。
@@ -997,6 +1024,27 @@ export class Gateway {
         'invalid_model', { cooldown: [{ model, remain: unavailable.remain }] });
     }
     body.model = model;
+
+    /**
+     * 输出预算按这个模型真实的上限夹一次。
+     *
+     * 2026-10-02 实测:Claude Code 对 muse-spark-1.3 发 `max_tokens: 1048576`
+     * (它拿上下文上限当输出预算),上游回 400「The request contains invalid
+     * parameters」—— 原文不说是哪个参数,所以这条很难从错误里读出来。同一请求
+     * 只把预算降到元数据报的 131072 就 200,夹子因此放在出站前。
+     *
+     * 只夹已经有的正数,不新增字段也不放大:比上限小的预算是客户端自己要的
+     * 「尽量短」。实测记录优先于 models.dev —— 那份元数据对好几个模型是错的
+     * (见 handleModels);两处都没有上限就一个字不改,猜一个数会把本来能过的
+     * 请求夹坏。上下文上限不参与:它和输出预算是两件事。
+     */
+    if (dialect.path === RESPONSES_PATH && Number.isFinite(body.max_output_tokens) && body.max_output_tokens > 0) {
+      const measured = this.caps.get(model)?.maxOut;
+      const cap = Number.isFinite(measured) && measured > 0
+        ? measured
+        : this.modelMetadata(model)?.maxOutputTokens;
+      if (Number.isFinite(cap) && cap > 0 && cap < body.max_output_tokens) body.max_output_tokens = cap;
+    }
 
     /**
      * 思考强度。reasoningEffort 从客户端的四种写法(reasoning_effort /
@@ -1329,6 +1377,11 @@ export class Gateway {
             this.cooldown.clear(cur, providerGroup(body.model));
             consecutive5xx = 0;
             bind(cur);
+            // 上游刚刚接受并跑完了这个模型的请求 —— 这是比探针更硬的证据。
+            // 探针对 503/429 保留 unknown 并等满六小时,于是一次上游抖动能让
+            // 面板上的胶囊灰着「状态未知」好几个小时,而真实请求其实一直在成功。
+            // 只在确认成功的出口写,失败/取消/中断都不碰(见下面 catch 和 ok:false)。
+            this.availability.markAvailable(body.model);
           } else {
             unbind(cur);
           }
@@ -1358,6 +1411,8 @@ export class Gateway {
         this.cooldown.clear(cur, providerGroup(body.model));
         consecutive5xx = 0;
         bind(cur);
+        // 非流式(网关替客户端收流拼装)那条腿的同一件事:已确认成功才写状态。
+        this.availability.markAvailable(body.model);
         this.usage.recordAttempt(cur, 'success', result.usage, { ttfb: result._ttfb, total: dt }, call);
         this.usage.record(body.model, result.usage, true);
         this.logger('ok', `[ok] node="${cur}"${lane ? ` lane=${lane.id}` : ''} ${dt}ms tokens=${result.usage?.total_tokens ?? '?'}`
@@ -2038,6 +2093,17 @@ export class Gateway {
 
   delayMap() {
     return Object.fromEntries(this.delay);
+  }
+
+  /**
+   * 测过但不通的节点名(delay=null)。给死节点复活探测用:有这种节点才值得
+   * 重测一遍(见 index.mjs 的 createDeadNodeReviver),否则一个字节都不出站。
+   * 没测过的节点(delay 里没有条目)不算死 —— 它们本来就还没被判过。
+   */
+  deadNodes() {
+    const out = [];
+    for (const [node, d] of this.delay) if (d == null) out.push(node);
+    return out;
   }
 
   async restoreLastNode() {
