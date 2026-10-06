@@ -2267,6 +2267,86 @@ await t('Responses 出站预算按模型输出上限钳制,原生与转换两条
   assert.equal(native.sent.max_output_tokens, 131072);
 });
 
+await t('System One(jev)走自己的入口:body 原样上行、不塞 stream/tools,成功体原样回', async () => {
+  // 2026-10-06 实测:jev-1.13-free 打 chat 回 400 ModelProtocolUnsupported,打
+  // /zen/v1/systemone 才 200。那条入口对 body 里出现的 stream(true/false 都算)一律
+  // 400,所以既不能过 gateChatBody(塞 stream:true + 五个工具名),也不能走
+  // forwardBuffered/forwardStream(各自强塞 stream)。
+  const model = 'jev-1.13-free';
+  const answer = { model: 'jev-1.13.0', answers: { ok: { type: 'noul', noul: 0.97 } }, usage: { input_tokens: 290, output_tokens: 20 }, cost: '0' };
+  const g = retryGateway('sm-systemone.json', () => Object.defineProperty({ ...answer }, '_ttfb', { value: 5 }));
+  g.forwardBuffered = g.forwardStream = async () => { throw new Error('System One 不收流,不该走流式出站'); };
+  g.models = [model];
+  g.modelsAt = Date.now();
+  g.getAllNodes = async () => ['A'];
+  g.rankNodes = (nodes) => nodes;
+  g.ensureNode = async () => 'A';
+  g.cur = 'A';
+  const inbound = { model, state: 'Help! payouts failing', questions: { urgent: { type: 'noul', instructions: 'Urgent?' } }, stream: false };
+  const req = Readable.from([JSON.stringify(inbound)]);
+  req.headers = {};
+  const res = fakeRes();
+  await g.handleSystemOne(req, res);
+
+  assert.equal(res.code, 200);
+  assert.equal(g.forwardArgs.length, 1);
+  const [body, , identity, upstreamPath] = g.forwardArgs[0];
+  assert.equal(upstreamPath, '/zen/v1/systemone');
+  assert.deepEqual(body, { model, state: inbound.state, questions: inbound.questions }, 'stream 剥掉,其余原样,不塞 tools');
+  assert.match(identity['User-Agent'], /^opencode\//, '准入身份头照发');
+  assert.deepEqual(JSON.parse(res.body), answer, '成功体原样回,不翻成 chat 形状');
+});
+
+await t('System One 与对话协议不串门:出站前 400 指明入口,不查节点', async () => {
+  const g = new Gateway(load(), () => {});
+  g.models = ['jev-1.13-free', 'big-pickle'];
+  g.modelsAt = Date.now();
+  g.getAllNodes = async () => { throw new Error('不该查节点'); };
+  const call = async (method, body) => {
+    const req = Readable.from([JSON.stringify(body)]);
+    req.headers = {};
+    const res = fakeRes();
+    await method.call(g, req, res);
+    return res;
+  };
+  const questions = { q: { type: 'noul', instructions: 'y' } };
+
+  const chatToJev = await call(g.handleChat, { model: 'jev-1.13-free', messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(chatToJev.code, 400);
+  assert.match(chatToJev.body, /\/v1\/systemone/, '告诉客户端该走哪个入口');
+  const msgToJev = await call(g.handleMessages, { model: 'jev-1.13-free', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(msgToJev.code, 400);
+  assert.equal(JSON.parse(msgToJev.body).type, 'error', 'Anthropic 入口仍出 Anthropic 错误体');
+
+  const oneToChatModel = await call(g.handleSystemOne, { model: 'big-pickle', state: 'x', questions });
+  assert.equal(oneToChatModel.code, 400);
+  assert.match(oneToChatModel.body, /chat\/completions/);
+  const streamed = await call(g.handleSystemOne, { model: 'jev-1.13-free', stream: true, state: 'x', questions });
+  assert.equal(streamed.code, 400, 'System One 不出流,stream:true 当场拒');
+  const noQuestions = await call(g.handleSystemOne, { model: 'jev-1.13-free', state: 'x' });
+  assert.equal(noQuestions.code, 400, '缺 questions 上游回 422 且原文无信息,出站前就挡');
+});
+
+await t('可用性探针对 System One 走它自己的入口,能力探测不碰它', async () => {
+  // 不分流的话探针拿 chat 形状去问 jev:可用性被判成不可用(面板灰掉一个能用的
+  // 模型),能力探测把协议不符的 400 读成「宽松、顶档 high」落盘且永不重探。
+  const g = new Gateway(load(), () => {});
+  g.models = ['jev-1.13-free', 'big-pickle'];
+  const seen = [];
+  g.forward = async (body, _budget, _identity, upstreamPath) => { seen.push({ body, upstreamPath }); return { answers: {} }; };
+  g.forwardBuffered = async () => { throw new Error('System One 探针不该走流式出站'); };
+  await g.probeRequest({ model: 'jev-1.13-free', messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].upstreamPath, '/zen/v1/systemone');
+  assert.ok(seen[0].body.state != null && seen[0].body.questions, '探针是 System One 形状');
+  assert.equal('messages' in seen[0].body, false);
+
+  let asked = null;
+  g.caps.probeMissing = async (models) => { asked = models; return { probed: [], skipped: [] }; };
+  await g.probeCapabilities();
+  assert.deepEqual(asked, ['big-pickle']);
+});
+
 // ── mihomo 配置生成 ────────────────────────────────────
 
 /** 去掉注释行。生成的 yaml 里有成段注释解释取舍,别让它们混进断言。 */

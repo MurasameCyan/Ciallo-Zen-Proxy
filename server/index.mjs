@@ -184,6 +184,9 @@ export function createApp({ cfg, creds, gateway, subscriptionUpdater = null, pro
       if (path === '/v1/messages' && req.method === 'POST') return run(gateway.handleMessages(req, res));
       // OpenAI Responses API。上游原生支持(见 gateway 的 RESPONSES 方言),透传而非翻译。
       if (path === '/v1/responses' && req.method === 'POST') return run(gateway.handleResponses(req, res));
+      // TypeSafe System One(jev 系分类器):{model, state, questions} 原样透传,非流式。
+      // 错误体和 OpenAI 同形,上面 D 按 OPENAI 兜底即可。
+      if (path === '/v1/systemone' && req.method === 'POST') return run(gateway.handleSystemOne(req, res));
       // Claude Code 等客户端开工前会先问一次 token 数,没有这个路由它直接报错退出
       if (path === '/v1/messages/count_tokens' && req.method === 'POST') return run(gateway.handleCountTokens(req, res));
 

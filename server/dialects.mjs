@@ -22,6 +22,10 @@ export const CHAT_PATH = '/inference/openai/v1/chat/completions';
 // 新入口下的 responses 目前回 503 Endpoint is unavailable,所以仍指向老路径,
 // 等它恢复再切。
 export const RESPONSES_PATH = '/zen/v1/responses';
+// TypeSafe System One(jev 系分类器)的原生入口。和上面两条不是一类:非流式、
+// 一问一答,body 原样透传。2026-10-06 实测 jev-1.13-free 打这里 200(cost "0"),
+// 打 /chat/completions 回 400 ModelProtocolUnsupported、打 /zen/v1/chat/completions 500。
+export const SYSTEMONE_PATH = '/zen/v1/systemone';
 export const MODELS_PATH = '/zen/v1/models';
 
 
@@ -535,6 +539,41 @@ export const RESPONSES = {
   // 完整对象在 response.completed 的 response 字段里,直接取它 —— 比重新
   // 拼装各段 output 更可靠(上游的 output 分片规则我们没必要猜)。
   collect: (sseText, model) => assembleFromResponsesEvents(sseText, model),
+};
+
+/**
+ * TypeSafe System One(jev 系分类器)。它不是对话协议,所以这条是**纯透传**:
+ * 请求 {model, state, questions},回 {model, answers, usage, cost}。
+ *
+ * 和另外三种方言差在两件事上,attempt / handleChat 靠 `unary` 和 path 分辨:
+ *   1. 非流式。上游对 body 里出现的 `stream` 一律 400(true 和 false 都是,实测),
+ *      所以客户端要流式就当场拒,`stream:false` 只是「非流式」的意思,剥掉再发;
+ *   2. 不过免费层准入闸。gateChatBody 会塞 stream:true 和五个工具名,这里塞进去
+ *      就是 400 —— 实测不带 tools 照样 200,所以 body 由客户端负责、原样上行。
+ *
+ * 思考强度对分类器没有意义,applyEffort 不动 body。
+ */
+export const SYSTEMONE = {
+  name: 'systemone',
+  path: SYSTEMONE_PATH,
+  unary: true,
+  toUpstream: (body) => {
+    const out = { ...body };
+    delete out.stream;
+    return out;
+  },
+  validate: (b) => {
+    if (b.stream === true) return 'System One does not support streaming; omit stream';
+    if (b.state == null) return 'state required';
+    const q = b.questions;
+    if (!q || typeof q !== 'object' || Array.isArray(q) || !Object.keys(q).length) {
+      return 'questions required: a non-empty object keyed by question id';
+    }
+    return null;
+  },
+  fail: (res, status, message, type, extra) => json(res, { error: { message, type, ...extra } }, status),
+  applyEffort: () => {},
+  respond: (res, payload) => json(res, payload),
 };
 
 /** OpenAI 流:上游字节原样透传,不解析不重排 */

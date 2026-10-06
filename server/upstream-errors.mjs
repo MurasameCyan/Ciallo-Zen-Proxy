@@ -62,7 +62,8 @@ export function isCapabilityError(status, body) {
  * 上游正常回答里可能带 error:null,工具调用的响应里 choices 可能是空数组
  * 但 usage 在 —— 误判会把真实回答吞掉,那比漏判更糟。
  */
-const PAYLOAD_KEYS = ['choices', 'output', 'output_text', 'content', 'delta', 'response'];
+// answers 是 System One(jev 分类器)的业务载荷,见 dialects 的 SYSTEMONE
+const PAYLOAD_KEYS = ['choices', 'output', 'output_text', 'content', 'delta', 'response', 'answers'];
 
 export function isErrorShapedOk(payload) {
   if (!payload || typeof payload !== 'object') return false;

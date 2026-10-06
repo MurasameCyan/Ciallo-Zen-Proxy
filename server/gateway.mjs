@@ -22,7 +22,7 @@ import { MihomoInstance } from './mihomo.mjs';
 import { LaneManager } from './lane.mjs';
 import { errTypeFor, flattenText, reasoningEffort, setModelEfforts } from './anthropic.mjs';
 import { Capabilities } from './capabilities.mjs';
-import { ModelMetadataStore, MODELS_DEV_TTL_MS, metadataFree } from './model-metadata.mjs';
+import { ModelMetadataStore, MODELS_DEV_TTL_MS, metadataFree, isSystemOneModel } from './model-metadata.mjs';
 import { OpencodeCatalog, CATALOG_TTL_MS } from './model-catalog.mjs';
 import { ModelAvailability, MODEL_AVAILABILITY_TTL_MS } from './model-availability.mjs';
 import { safeEqual } from './auth.mjs';
@@ -36,12 +36,12 @@ import {
 
 import { CALL_LOG_LIMIT, readUsage, UsageTracker } from './usage.mjs';
 import {
-  OPENCODE_HOST, CHAT_PATH, MODELS_PATH, RESPONSES_PATH, OPENAI, ANTHROPIC, RESPONSES,
+  OPENCODE_HOST, CHAT_PATH, MODELS_PATH, RESPONSES_PATH, OPENAI, ANTHROPIC, RESPONSES, SYSTEMONE,
   gateChatBody, gateResponsesBody, responsesUpstreamDialect, chatToResponsesBody,
 } from './dialects.mjs';
 import { json, readUtf8Body } from './http-util.mjs';
 export { json } from './http-util.mjs';
-export { OPENAI, ANTHROPIC, RESPONSES } from './dialects.mjs';
+export { OPENAI, ANTHROPIC, RESPONSES, SYSTEMONE } from './dialects.mjs';
 
 // 轮换状态机搬到 rotation.mjs、用量统计搬到 usage.mjs 了。这里继续原样导出,
 // 免得调用方和测试跟着改 import
@@ -576,6 +576,14 @@ export class Gateway {
     // 全判成不可用(那是假警报,比对上游的真实错误更难发现)。
     this.probeRequest = (body) => {
       const model = typeof body.model === 'string' ? body.model.trim() : '';
+      // System One(jev 分类器)没有 messages/max_tokens 这回事:可用性探针换成它
+      // 自己的最小形状(一个 noul 问题,几百 token、cost 0),走它自己的入口,
+      // 一问一答不收流。失败照样以 {status, body} reject,分类器照读。能力探测
+      // 不会走到这里 —— probeCapabilities 已经把这类模型排除了。
+      if (this.modelProtocol(model) === 'systemone') {
+        const probe = { model, state: 'ping', questions: { ok: { type: 'noul', instructions: 'Is this a ping?' } } };
+        return this.forward(probe, Infinity, this.identity(model), SYSTEMONE.path);
+      }
       // 原生 Responses 模型(muse-spark 那类):探测也得走对端点,否则打 chat 一律
       // 500/503,会把能用的模型判成不可用/探不到能力 —— 面板灰点与真实请求相反。
       // body 先翻成 Responses 形状,再过 Responses 门禁(扁平式 tools),经 bridge
@@ -620,7 +628,10 @@ export class Gateway {
    * 真上了新模型才会掏钱。
    */
   probeCapabilities(reason = '') {
-    return this.caps.probeMissing(this.models)
+    // System One 分类器没有上下文/输出预算/思考强度可探:拿 chat 形状的探针去问
+    // 它只会换来协议不符的 400,而 400 在探测里算「校验器在说话」,会落一条假记录
+    // (宽松、顶档 high),之后再也不重探。所以压根不探。
+    return this.caps.probeMissing(this.models.filter((m) => this.modelProtocol(m) !== 'systemone'))
       .then((r) => {
         if (r.probed?.length) setModelEfforts(this.caps.effortMap());
         return r;
@@ -716,7 +727,9 @@ export class Gateway {
   modelCapabilities() {
     const out = {};
     for (const id of this.models) {
-      const r = this.caps.get(id);
+      // System One 没有这几个维度;盘上若有旧版对它写下的探测记录(打错端点换来
+      // 的 400 被读成「宽松、顶档 high」),也不投给面板。
+      const r = this.modelProtocol(id) === 'systemone' ? null : this.caps.get(id);
       out[id] = {
         maxOutputTokens: Number.isInteger(r?.maxOut) && r.maxOut > 0 ? r.maxOut : null,
         reasoningTop: typeof r?.top === 'string' && r.top ? r.top : null,
@@ -727,11 +740,13 @@ export class Gateway {
   }
 
   /**
-   * 模型的上游原生协议:'chat' | 'responses' | 'anthropic'。
-   * 目录说了算(它的 npm 字段唯一决定端点),目录里没有就按 chat 兜底 ——
-   * 免费清单绝大多数是 chat,而且老行为就是全走 chat。
+   * 模型的上游原生协议:'chat' | 'responses' | 'anthropic' | 'systemone'。
+   * System One(jev 系)先按 id 认:目录不收它,收了也会按 provider 默认 npm 误判
+   * 成 chat(见 isSystemOneModel)。其余目录说了算(它的 npm 字段唯一决定端点),
+   * 目录里没有就按 chat 兜底 —— 免费清单绝大多数是 chat,而且老行为就是全走 chat。
    */
   modelProtocol(model) {
+    if (isSystemOneModel(model)) return 'systemone';
     return this.catalog.protocol(model) || 'chat';
   }
 
@@ -989,6 +1004,24 @@ export class Gateway {
     // 明确报告纯文本时才让方言降级附件;元数据缺失时 fail-open,保持原请求。
     const wantStream = inbound.stream === true;
     const requestedModel = typeof inbound.model === 'string' ? inbound.model.trim() : '';
+    // System One(jev 系)是分类器,不是对话:它要的是 state + 带类型的 questions,
+    // 回的是每个问题的概率,和三种对话协议之间没有不靠猜的互译。所以两边串门一律
+    // 出站前 400、指明该走哪个入口 —— 发上去只会换来 ModelProtocolUnsupported(chat
+    // 那条)或 500(打错端点),后者还会被当成可重试,挨个节点烧过去。
+    // 必须排在下面 Responses 改道之前:那一步会把 SYSTEMONE 也包成 responses 腿。
+    if (requestedModel) {
+      const systemOne = this.modelProtocol(requestedModel) === 'systemone';
+      if (systemOne && dialect !== SYSTEMONE) {
+        return dialect.fail(res, 400,
+          `System One model: ${requestedModel} —— jev 系是分类器不是对话模型,改用 POST /v1/systemone({model, state, questions})`,
+          'invalid_request_error');
+      }
+      if (!systemOne && dialect === SYSTEMONE) {
+        return dialect.fail(res, 400,
+          `Not a System One model: ${requestedModel} —— 对话模型走 /v1/chat/completions、/v1/responses 或 /v1/messages`,
+          'invalid_request_error');
+      }
+    }
     // 原生协议路由:muse-spark 1.2/1.3 这类模型的上游端点是 /zen/v1/responses,
     // 打 chat 一律 500(实测)。客户端说 chat/anthropic 时,把上游那条腿换成
     // Responses:body 翻成 Responses 形状发上去,回来的 response.* 事件由 sink 里的
@@ -1001,10 +1034,10 @@ export class Gateway {
     // 免费层准入:上游要求 stream:true 且 tools 里集齐五个核心工具名(见 dialects
     // 的 gateChatBody / gateResponsesBody)。这一步必须紧跟在 toUpstream 之后 ——
     // 它改的是**出站 body**,放在翻译之后才对得上形状。走 Responses 那条腿用扁平式
-    // tools(嵌套式回 400),chat 那条腿用嵌套式。客户端原生 Responses 仍不过闸
-    // (它的 body 由客户端负责,历史行为不变)。
+    // tools(嵌套式回 400),chat 那条腿用嵌套式。客户端原生 Responses 和 System One
+    // 不过闸(body 由客户端负责;System One 塞了 stream/tools 反而 400)。
     if (dialect.path === RESPONSES_PATH && dialect !== RESPONSES) gateResponsesBody(body);
-    else if (dialect !== RESPONSES) gateChatBody(body);
+    else if (dialect.path === CHAT_PATH) gateChatBody(body);
 
     // 严格透传:客户端点哪个模型就发哪个,但只放行实时免费清单里的。
     // 以前这里无条件改写成一个固定模型 —— 客户端于是拿到的是另一个模型的回答,
@@ -1131,6 +1164,14 @@ export class Gateway {
   /** OpenAI Responses API 入口。上游原生支持,同一条路换个方言(近乎透传)。 */
   async handleResponses(req, res) {
     return this.handleChat(req, res, RESPONSES);
+  }
+
+  /**
+   * TypeSafe System One 入口(jev 系分类器)。复用同一套节点轮换和准入身份头,
+   * body 原样上行、成功体原样回(见 dialects 的 SYSTEMONE)。
+   */
+  async handleSystemOne(req, res) {
+    return this.handleChat(req, res, SYSTEMONE);
   }
 
   /** 选定本次要用的节点并让 mihomo 切过去;返回节点名,失败返回 null(已响应) */
@@ -1328,7 +1369,7 @@ export class Gateway {
       if (!attemptRecorded) this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
       this.usage.record(body.model, null, false);
       this.logger('error', `[chat] HTTP ${status}: ${String(e?.body ?? e?.message ?? '').slice(0, 300)}`);
-      if (dialect === OPENAI || dialect === RESPONSES) {
+      if (dialect === OPENAI || dialect === RESPONSES || dialect === SYSTEMONE) {
         let payload;
         try { payload = JSON.parse(e?.body); } catch { payload = { error: { message: `HTTP ${status}` } }; }
         return json(res, payload, status);
@@ -1355,10 +1396,14 @@ export class Gateway {
         // 客户端要非流式就一律缓冲拼装:上游本来就只收 stream:true(见
         // gateChatBody),RESPONSES 那条不过闸但也同理 —— 与其逐个方言判断
         // 「上游这条路上收不收流」,不如统一成「客户端要非流式 → 我们替他收」。
+        // 例外是一问一答的方言(System One):上游根本不出流,validate 已经挡掉
+        // stream:true,这里一次 POST 收 JSON。
         const useBuffered = !wantStream;
-        const result = useBuffered
-          ? await this.forwardBuffered(res, body, dialect, left(), identity, lane?.agent, signal)
-          : await this.forwardStream(res, body, dialect, left(), identity, lane?.agent, signal);
+        const result = dialect.unary
+          ? await this.forward(body, left(), identity, dialect.path, lane?.agent, signal)
+          : useBuffered
+            ? await this.forwardBuffered(res, body, dialect, left(), identity, lane?.agent, signal)
+            : await this.forwardStream(res, body, dialect, left(), identity, lane?.agent, signal);
 
         const dt = Date.now() - t0;
         if (wantStream) {
@@ -1629,7 +1674,9 @@ export class Gateway {
 
   forward(body, budget = Infinity, identity = null, path = CHAT_PATH, agent = this.agent, signal = undefined) {
     return new Promise((resolve, reject) => {
-      const bodyStr = JSON.stringify({ ...body, stream: false });
+      // 原样序列化:这条只服务一问一答的方言(System One),它对 body 里出现的 stream
+      // 字段一律 400。chat/Responses 的非流式走 forwardBuffered(上游只收流)。
+      const bodyStr = JSON.stringify(body);
       // 单次超时不能超过整体剩余预算,否则一次慢请求就把预算吃穿
       const timeout = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
       const t0 = Date.now();

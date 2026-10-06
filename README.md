@@ -61,6 +61,8 @@ compose 默认只绑 `127.0.0.1:9527`。想让同网段其它机器连,把端口
 
 **「在清单里」不等于「此刻能出结果」。** 上游列出来的免费模型里有一部分是坏的,而且坏在上游供应商那侧,换节点、换出口 IP 都一样。网关现在会对每个模型做低成本连通性探测:每 6 小时最多一次,只发 `max_tokens: 1` 的短请求,不记入用量统计。明确的业务 4xx(模型不可用、鉴权、额度等)会在面板里灰显为「不可用」;429、网络错误和 5xx 只记为「待重试」,不误报成下线。真实请求遇到 `400 Model is unavailable` 时,只把该模型短暂冷却 15 分钟,不切出口、不烧其它 IP,并在 `/api/status` 的 `modelCooldowns` 里显示剩余时间。`429` 仍按出口节点冷却,`408`/`5xx` 会换节点重试,其它 4xx 原样返回。上游状态会变,下一轮探测或冷却过期后会再次确认。
 
+`deepseek-v4-flash-free` 就是这种:2026-08-21 opencode 的限时免费推广结束(models.dev 同日标成 deprecated),上游清单里还列着它,但 chat / Responses 一律回 `400 Upstream request failed: Model is unavailable.`,换 UA、换出口都一样。网关把它灰显成「不可用」并按模型冷却一段时间,冷却期内的请求出站前就回 400,不切节点、不烧额度。付费的 `deepseek-v4-flash` 仍在,但那要 Zen 余额,不在本网关范围内。
+
 这份清单是**现拉的**:`GET https://opencode.ai/zen/v1/models`,从 60 多个模型里挑出免费的(`-free` 后缀,外加 `big-pickle` 这个没后缀的例外)。不写死是因为写死过一次就漏了 —— 上游后来上线 `longcat-2.0-free`,而代码里那份列表没人记得改。面板模型列表与 `/v1/models` 使用同一份缓存。
 
 ### 模型可用性
@@ -164,7 +166,7 @@ However, you requested about 1500001 tokens (1500000 of text input, 1 in the out
 curl http://127.0.0.1:9527/v1/chat/completions \
   -H "Authorization: Bearer <你的 Key>" \
   -H "content-type: application/json" \
-  -d '{"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 Cherry Studio / Chatbox / LobeChat / 任何填得了 Base URL 的客户端,照常填 `http://127.0.0.1:9527/v1` + Key。
@@ -184,6 +186,21 @@ curl http://127.0.0.1:9527/v1/responses \
 
 - **`input` 得传数组。** 官方 SDK 允许 `"input":"hi"` 这种字符串,但上游只认数组,纯字符串会被回 400 `Empty input messages`。网关会把字符串补成 `[{role:"user",content:[{type:"input_text",text}]}]` 再发,已经是数组的原样过 —— 两种写法都能用,只是别指望上游自己认字符串。
 - **流式里有一类模型会漏个杂块,网关替你吞了。** zen 的 Responses 流是精简事件集(纯文本只有 `response.output_text.delta` / `response.completed` / `ping`,函数调用另加 `output_item.added` + `function_call_arguments.delta`)。其中 `deepseek-v4-flash` / `hy3` 这类收尾没翻干净:`response.completed` 不带 usage,末尾反而漏出一个原始 `chat.completion.chunk`。严格的 Responses 客户端(官方 SDK)碰到这个非 `response.*` 的块会解析报错,所以网关的流式 sink 按行把它拦掉(它携带的 usage 照样记进面板,不靠转发)。干净型模型(big-pickle / nemotron / laguna)不漏,这层对它们等同透传。
+
+### System One 协议(jev 分类器)
+
+```bash
+curl http://127.0.0.1:9527/v1/systemone \
+  -H "Authorization: Bearer <你的 Key>" \
+  -H "content-type: application/json" \
+  -d '{"model":"jev-1.13-free","state":"Help! My payouts have been failing for 3 days.","questions":{"urgent":{"type":"noul","instructions":"Does this convey urgency?"}}}'
+```
+
+`jev-1.13-free` 是 TypeSafe 的 System One **分类器,不是对话模型**:请求给一段 `state` 和若干带类型的 `questions`(`noul` 是非题回概率、`choice` 单选回分布、`score` 按刻度打分),回每个问题的答案,形状见 [TypeSafe API 文档](https://docs.typesafe.ai/api.md)。拿它打 `/v1/chat/completions` / `/v1/responses` / `/v1/messages` 会在出站前回 400 指明入口 —— 上游那几条路对它回 `ModelProtocolUnsupported` 或 500,而把对话包装成分类问题只能替客户端猜 questions。
+
+这条是**纯透传**:body 原样上行(只剥掉 `stream:false`,上游对 body 里出现 `stream` 一律 400;`stream:true` 当场拒,它没有流式),成功体 `{model, answers, usage, cost}` 原样回。节点轮换、准入身份头和 chat 共用;免费层准入闸不过 —— 塞进去的 stream/tools 反而换 400,实测不带也 200。
+
+模型按 id 认(`jev-` 前缀):opencode 的两份能力目录都不收它,唯一的权威来源是 zen 文档的端点表。可用性探针改发一个最小的 `noul` 问题;能力探测(上下文 / 输出上限 / 思考强度)直接跳过它 —— 分类器没有这几个维度,拿 chat 探针去问只会把协议错误记成假记录。
 
 ### Anthropic 协议(Claude Code、Cline)
 
@@ -227,6 +244,7 @@ openai-compatibility:
 | --- | --- | --- |
 | `POST /v1/chat/completions` | OpenAI | 流式/非流式都支持,流式原样透传 |
 | `POST /v1/responses` | OpenAI Responses | 流式/非流式都支持,近乎透传;`input` 允许字符串(补成数组),流式吞掉一类模型漏出的 chat 杂块 |
+| `POST /v1/systemone` | TypeSafe System One | jev 分类器,纯透传,只支持非流式;对话模型打这里、jev 打对话入口都在出站前 400 |
 | `POST /v1/messages` | Anthropic | 非流式转形状,流式实时翻译成 Messages 事件 |
 | `POST /v1/messages/count_tokens` | Anthropic | 估算值。缺这个路由 Claude Code 开工前就退出了 |
 | `GET /v1/models` | 两者 | |

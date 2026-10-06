@@ -22,6 +22,7 @@ function protocolValue(value) {
   if (p === 'anthropic' || p === 'messages' || p === 'claude') return 'anthropic';
   if (p === 'responses' || p === 'response' || p === 'openai-responses') return 'responses';
   if (p === 'chat' || p === 'openai' || p === 'completions') return 'chat';
+  if (p === 'systemone' || p === 'system-one' || p === 'typesafe-system-one') return 'systemone';
   return '';
 }
 
@@ -107,10 +108,24 @@ export function metadataFree(meta, id = '') {
   return !!meta && !meta.deprecated && meta.inputCost === 0 && meta.outputCost === 0;
 }
 
+/**
+ * TypeSafe 的 System One 分类器(jev 系)。它不是对话模型:上游端点是
+ * /zen/v1/systemone,body 是 {model,state,questions},回的是每个问题的概率答案。
+ *
+ * 只能按 id 认。opencode 的两份目录(models.opencode.ai / models.dev 的 api.json)
+ * 都不收它,唯一的权威来源是 zen 文档那张端点表(jev-1.13 / jev-1.13-free →
+ * /zen/v1/systemone);而且 provider 默认 npm 是 openai-compatible,哪天目录收了它
+ * 也会被误判成 chat —— 所以这条判据排在目录之前(见 gateway.modelProtocol)。
+ */
+export function isSystemOneModel(id) {
+  return /^jev-/i.test(String(id ?? '').trim());
+}
+
 export function inferNativeProtocol(meta, id = '') {
   const explicit = protocolValue(meta?.nativeProtocol || meta?.protocol || meta?.api);
   if (explicit) return explicit;
   const value = String(meta?.id || id || meta?.name || '').toLowerCase();
+  if (isSystemOneModel(value)) return 'systemone';
   if (/^(claude[-_/]|anthropic[/_-])/.test(value) || value.includes('anthropic')) return 'anthropic';
   if (/^(gpt[-_/]|o[134](?:[-_/]|$)|grok[-_/]|muse[-_/])/.test(value)) return 'responses';
   return 'chat';
