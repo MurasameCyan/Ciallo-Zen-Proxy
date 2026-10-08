@@ -302,6 +302,18 @@ openai-compatibility:
 
 **exo-free 后端锁定。** 模型名后的纯开关默认开启，点击立即保存，不用点「保存并应用」，重启后保留。开启时按实测响应 ID 前缀识别后端：只接受 `msg_`，遇到 `resp_` 就在同一节点换 `x-opencode-request` 重抽，保持 session 不变；最多重抽八次，仍未匹配或无法确认身份时返回 502，不悄悄放行其它后端。关闭后接受上游的随机后端。锁定可能增加等待和出站次数；开关对后续出站生效，不中断已经开始的响应。支持 Tab 聚焦、空格切换，保存失败会拨回原状态。
 
+**OpenCode 客户端身份兼容。** 已按官方 `v1.18.35` 的[请求构造](https://github.com/anomalyco/opencode/blob/53d1eabb61e21162157817bf677da0a4ad3332e3/packages/opencode/src/session/llm/request.ts#L177-L206)与[消息 ID 生成](https://github.com/anomalyco/opencode/blob/53d1eabb61e21162157817bf677da0a4ad3332e3/packages/opencode/src/id/id.ts#L16-L69)对齐，并用正式发行二进制抓包核对：
+
+- `x-opencode-session-id` 优先于旧会话头；清洗、归一化后，与 `x-opencode-session` 始终使用同一个值。关闭完整身份头开关也保留这两个会话字段，普通重试和后端重抽都不改变会话。
+- 网关生成的请求 ID 为 `msg_` + 12 位小写 hex（6 字节时间/计数器）+ 14 位 Base62。客户端已有的 request ID 保留，仅在缺失或显式后端重抽时生成新值。能力与可用性探针复用同一身份构造，并按模型隔离稳定会话。
+- UA 使用本次正式版抓包中的版本组合；不额外覆盖客户端的提示词、工具定义或输出预算，也不因这次兼容调整切换上游入口。
+
+这组修正让 `ling-3.1-flash-free` 恢复可用。2026-10-08 在同一个隔离出口、同一份请求体上对照：发布版身份头（缺 `x-opencode-session-id`、旧 UA、旧 request ID 形状）回 429 `Endpoint is unavailable.`，修正后回 200 并拿到回答。随后经本网关走真实上游，Chat 与 Anthropic 两种协议、流式与非流式四种组合，加上可用性/能力探针共用的那条出站路径，全部 200；出站入口仍是 `/inference/openai/v1/chat/completions`，客户端的 `legacy` 会话头不会顶掉规范会话头。
+
+`/v1/responses` 这条腿不受此修正影响：上游对免费层的 Responses 入口在 `/zen/v1/responses` 和 `/inference/openai/v1/responses` 上一律回 403 `FreeTierError`，与身份头无关。
+
+这也不等于确认 `exo-free` 当前可用。2026-10-08 的隔离出口实测中，官方 CLI `1.18.35` 也收到 `Upstream request failed: Endpoint is unavailable.`；完整官方请求回放到 `/zen/v1/chat/completions` 和 `/inference/openai/v1/chat/completions` 均返回 503。新 inference 服务的准入与 provider 实际配置未在所查公开源码中提供，不能仅凭这条错误认定「限定客户端」，也不能把失败伪写成能力记录。
+
 **登录。** 没登录时任何页面都会被送到 `/login`,填 `PANEL_USER` / `PANEL_PASS`。这是面板自己的一页,不是浏览器那个凭据弹框 —— 弹框是 401 响应里的 `WWW-Authenticate` 头带出来的,样式不可控、密码错了给不出自己的提示、想退出只能关浏览器。现在服务端一律不发这个头,所以浏览器不再弹框。
 
 登录成功给一张 HttpOnly 会话 cookie,有效期 12 小时,存在网关进程内存里 —— 容器重启要重新登录一次。页头最右的 ⇥ 是退出登录,当场作废那张 cookie。凭据连错 10 次会锁 1 分钟(按次数不按 IP,反代后面 IP 全一样),已登录的会话不受影响,别人在外面爆破锁不掉你手上这张。

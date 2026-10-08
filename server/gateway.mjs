@@ -87,9 +87,9 @@ export function isNodeBlockedError(e) {
  *   id 以 `msg_`  开头 -> Claude
  *   id 以 `resp_` 开头 -> GPT
  *
- * 于是钉选的办法只有一条:看第一个 id,不是想要的后端就断开、换一个新的
- * `x-opencode-request` 重发,直到抽中。这个头不参与会话路由也不在准入门槛里
- * (见 newRequestId),所以换它是安全的、也是唯一能改变这次抽样的输入。
+ * 保留此前实测采用的钉选策略:首个 id 不匹配时更换 `x-opencode-request` 重发,
+ * session 和节点不变。这是网关自己的策略,不是官方 CLI 提供的后端选择 API;
+ * 重抽次数有上限,不保证一定能匹配到目标后端。
  *
  * 判定**必须在首帧转发给客户端之前**完成:头一发出去这次请求就不能重试了
  * (见 forwardStream 的 started 标志)。forwardStream 本来就为了识别「200 +
@@ -377,7 +377,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * `x-opencode-project` 用 global 对齐真实 CLI(它默认就是这个值)。
  */
 const IDENTITY_DEFAULTS = {
-  'User-Agent': 'opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14',
+  'User-Agent': 'opencode/1.18.35 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14',
   'x-opencode-client': 'cli',
   'x-opencode-project': 'global',
 };
@@ -470,24 +470,23 @@ function stableSessionId(signal) {
   return `ses_${hex}${alnum}`;
 }
 
+let lastRequestTimestamp = 0;
+let requestCounter = 0;
+
 /**
- * 请求 ID。形状对齐真实 CLI 的 `msg_<6 位 hex><19 位 mixed alnum>`。
- *
- * 实测它**不在准入门槛里**(去掉照样 200),这里只求形状一致,少一个和真
- * CLI 的差异。每个请求独立生成(不像 session 那样按对话稳定)—— 真 CLI 就是
- * 每请求一个,而且这个值不参与会话路由,不需要在重试之间保持。
- *
- * 时间戳那 6 位仍取当前毫秒的低 24 位,和 CLI 的写法一致。
+ * 对齐 OpenCode v1.18.35 的 Identifier.create:6 字节时间/计数器 + 14 位 Base62。
+ * 官方 x-opencode-request 是 user message ID;已有值由 identityHeaders 保留,
+ * 网关仅在缺值及显式后端重抽时生成新值,普通网络重试继续使用原 ID。
  */
 function newRequestId() {
-  const digest = crypto.createHash('sha256')
-    .update(`${Date.now()}\0${crypto.randomUUID()}`).digest();
-  const byteAt = (i) => digest[i % digest.length];
-  let hex = '';
-  for (let i = 0; i < 6; i++) hex += (byteAt(i) % 16).toString(16);
+  const timestamp = Date.now();
+  requestCounter = timestamp === lastRequestTimestamp ? requestCounter + 1 : 1;
+  lastRequestTimestamp = timestamp;
+  const time = BigInt.asUintN(48, (BigInt(timestamp) << 12n) + BigInt(requestCounter));
+  const bytes = crypto.randomBytes(14);
   let alnum = '';
-  for (let i = 0; i < 19; i++) alnum += SESSION_ALNUM[byteAt(6 + i) % 62];
-  return `msg_${hex}${alnum}`;
+  for (const byte of bytes) alnum += SESSION_ALNUM[byte % 62];
+  return `msg_${time.toString(16).padStart(12, '0')}${alnum}`;
 }
 
 /**
@@ -529,7 +528,7 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
   // body 里的两个入口同样要洗 —— 它们不经入站头解析器,所以 CR/LF 和中文都能活着
   // 走到这里(头那条路会先被 Node 的入站解析器 400 挡下)。洗完为空就当没给,
   // 退回对话哈希/uuid,而不是拿个空串当 session。
-  const explicitSession = pick('x-opencode-session', 'x-claude-code-session-id', 'x-session-id', 'conversation-id', 'x-session-affinity')
+  const explicitSession = pick('x-opencode-session-id', 'x-opencode-session', 'x-claude-code-session-id', 'x-session-id', 'conversation-id', 'x-session-affinity')
     || (typeof body?.conversation_id === 'string' ? headerSafe(body.conversation_id) : '')
     || (typeof body?.metadata?.session_id === 'string' ? headerSafe(body.metadata.session_id) : '');
   const seed = conversationSeed(body);
@@ -537,9 +536,9 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
   // 上游只接受固定形状的 session。客户端的 Claude/通用 session 通常是 UUID 或
   // 自定义字符串,不能原样塞进 x-opencode-session;合法的 OpenCode ID 才透传,
   // 其余按原值稳定哈希,既过门槛又保持同一对话跨请求/换节点不变。
-  out['x-opencode-session'] = SESSION_ID_RE.test(rawSession)
-    ? rawSession
-    : stableSessionId(rawSession);
+  const session = SESSION_ID_RE.test(rawSession) ? rawSession : stableSessionId(rawSession);
+  out['x-opencode-session'] = session;
+  out['x-opencode-session-id'] = session;
   // 请求 ID 客户端给了就透传,没给就按 msg_ 形状造一个
   out['x-opencode-request'] = pick('x-opencode-request') || newRequestId();
   // 这两个没有合理的默认值,客户端没给就别凭空造
@@ -613,12 +612,9 @@ export class Gateway {
     // 于是每个模型都被这句 400 判成 terminal/unavailable,面板整片灰掉 —— 而
     // big-pickle 走真实请求连打三次全是 200。探测反而比它要测的东西更容易失败,
     // 这就是那种「绿着的模型被涂灰」的假警报。
-    this.identity = (model) => ({
-      ...IDENTITY_DEFAULTS,
-      'x-opencode-request': `req_${stableSessionId(`probe:${model}`)}`,
-      // 按模型定 session:探测内容固定是 'ping',不掺模型名的话所有模型会算成
-      // 同一个会话,上游的会话级限流就会让它们互相踩。
-      'x-opencode-session': stableSessionId(`probe-session:${model}`),
+    // 探针复用客户端身份构造,但按模型隔离稳定会话,避免不同模型互相踩限流。
+    this.identity = (model) => identityHeaders({
+      headers: { 'x-opencode-session-id': stableSessionId(`probe-session:${model}`) },
     });
     this.availability = new ModelAvailability({
       post: (body) => this.probeRequest(body),
@@ -1209,22 +1205,16 @@ export class Gateway {
     const effort = reasoningEffort(inbound, model);
     dialect.applyEffort(body, effort);
 
-    // session 同时服务稳定上游标识和节点 affinity。完整 OpenCode 请求头开关
-    // 关着时只发 x-opencode-session,其余头不发。
+    // 两种 OpenCode session 头与节点 affinity 共用同一个归一化会话。
+    // 即使完整身份头开关关闭,也必须保持这两个会话字段一致。
     const requestIdentity = identityHeaders({ headers: req.headers, body: inbound });
-    // 稳定 session 是独立能力:即使完整 OpenCode 头开关关闭,也把会话标识发给
-    // 上游,让同一对话有机会命中 prompt cache。其余 client/project/user-agent
-    // 仍遵守原有实验开关,避免无意改变免费端点的请求画像。
-    //
-    // **但 UA 和 session 现在是准入门槛,不再可选**。2026-09-19 实测:免费层
-    // 要求首 token 是 opencode/<version>(低于 1.18.0 还回 426)、且带形状正确的
-    // x-opencode-session,缺任一条一律 403 FreeTierError。所以这两个头无论如何
-    // 都要发;实验开关只管 client/project/request 那几个可选的。
+    // UA 与稳定会话兼容不受实验开关控制;开关仍只管 client/project/request 等可选头。
     const identity = this.config.opencodeIdentityHeaders
       ? requestIdentity
       : {
           'User-Agent': requestIdentity['User-Agent'],
           'x-opencode-session': requestIdentity['x-opencode-session'],
+          'x-opencode-session-id': requestIdentity['x-opencode-session-id'],
         };
     const affinityKey = this.affinity.key(requestIdentity['x-opencode-session'], model);
 

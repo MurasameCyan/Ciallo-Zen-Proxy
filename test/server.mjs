@@ -748,11 +748,25 @@ await t('身份头:User-Agent 用我们的,其余缺的补默认、客户端给�
   assert.match(h['User-Agent'], /^opencode\/\d+\.\d+\.\d+/);
   assert.equal(h['x-opencode-client'], 'cli');
   assert.equal(h['x-opencode-project'], 'my-proj', '客户端值优先');
-  // 请求 ID 按会话派生(不是直接拿 uuid),形状对齐真实 CLI 的
-  // msg_<6位hex><21位 alnum>。上游不校验它,但形状一致少一个变量。
-  assert.match(h['x-opencode-request'], /^msg_[0-9a-f]{6}[0-9A-Za-z]{19}$/);
   assert.match(h['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
   assert.equal(h['x-title'], undefined, '没合理默认值的就别凭空造');
+});
+
+await t('请求 ID 可按官方六字节时间和计数器解码，同毫秒生成也不重复', () => {
+  const originalNow = Date.now;
+  const now = 1791440000123;
+  let ids;
+  try {
+    Date.now = () => now;
+    ids = [identityHeaders({}), identityHeaders({})].map(h => h['x-opencode-request']);
+  } finally {
+    Date.now = originalNow;
+  }
+  for (const id of ids) assert.match(id, /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  const encoded = ids.map(id => BigInt(`0x${id.slice(4, 16)}`));
+  assert.equal(encoded[0] >> 12n, BigInt(now) & 0xfffffffffn);
+  assert.equal(encoded[1], encoded[0] + 1n);
+  assert.notEqual(ids[0], ids[1]);
 });
 
 await t('身份头:UA 版本不低于上游下限(低于 1.18.0 会被 426 挡回)', () => {
@@ -818,8 +832,36 @@ await t('身份头:显式 session 按头和 body 的优先级选,不被内容 ha
   } }, () => 'req-5')['x-opencode-session'], 'ses_333333333333CCCCCCCCCCCCCC');
 });
 
+await t('OpenCode session-id 优先于旧头，两种出站会话头始终一致', () => {
+  const session = 'ses_0123456789abcdef0123456789';
+  const headers = {
+    'X-Opencode-Session-Id': ` ${session} `,
+    'x-opencode-session': 'ses_111111111111AAAAAAAAAAAAAA',
+  };
+  for (const content of ['first message', 'different follow-up']) {
+    const h = identityHeaders({ headers, body: { messages: [{ role: 'user', content }] } });
+    assert.equal(h['x-opencode-session'], session);
+    assert.equal(h['x-opencode-session-id'], session);
+  }
+});
+
+await t('能力探针按模型隔离会话，每次探测使用独立的合法消息 ID', () => {
+  const gateway = new Gateway(load(), () => {});
+  const first = gateway.identity('exo-free');
+  const next = gateway.identity('exo-free');
+  const other = gateway.identity('ling-3.1-flash-free');
+  assert.equal(first['x-opencode-session'], next['x-opencode-session']);
+  assert.notEqual(first['x-opencode-session'], other['x-opencode-session']);
+  for (const h of [first, next, other]) {
+    assert.equal(h['x-opencode-session-id'], h['x-opencode-session']);
+    assert.match(h['x-opencode-request'], /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  }
+  assert.notEqual(first['x-opencode-request'], next['x-opencode-request']);
+});
+
 await t('身份头:所有显式 session 来源都归一成稳定的上游格式', () => {
   const cases = [
+    ['x-opencode-session-id', { headers: { 'x-opencode-session-id': 'canonical-session' } }],
     ['x-opencode-session', { headers: { 'x-opencode-session': 'open-session' } }],
     ['x-claude-code-session-id', { headers: { 'x-claude-code-session-id': 'claude-conversation-1' } }],
     ['x-session-id', { headers: { 'x-session-id': 'generic-session' } }],
@@ -835,6 +877,8 @@ await t('身份头:所有显式 session 来源都归一成稳定的上游格式'
     } }, () => 'fallback-b');
     assert.match(first['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/, source);
     assert.equal(first['x-opencode-session'], grown['x-opencode-session'], `${source} 归一结果必须稳定`);
+    assert.equal(first['x-opencode-session-id'], first['x-opencode-session'], source);
+    assert.equal(grown['x-opencode-session-id'], grown['x-opencode-session'], source);
   }
 
   const valid = 'ses_0123456789abcdef0123456789';
@@ -866,7 +910,6 @@ await t('身份头:没有显式 session 时按第一条 user 内容生成稳定 
   assert.equal(first['x-opencode-session'], grown['x-opencode-session'],
     '对话增长后第一条 user 不变,session 就必须不变');
   assert.notEqual(first['x-opencode-session'], other['x-opencode-session']);
-  assert.match(first['x-opencode-request'], /^msg_[0-9a-f]{6}[0-9A-Za-z]{19}$/);
   assert.notEqual(first['x-opencode-request'], grown['x-opencode-request'],
     '同一对话的两轮请求 ID 不同(它按请求生成,不像 session 按对话稳定)');
 });
@@ -918,8 +961,9 @@ await t('身份头的值必须洗掉 Node 不认的字符 —— 否则一个畸
   assert.equal(clean['x-opencode-session'], 'ses_444444444444DDDDDDDDDDDDDD');
 });
 
-await t('Chat、Responses、Anthropic 三个入口用同一套稳定 session', async () => {
-  const cfg = { ...load(), opencodeIdentityHeaders: true };
+await t('三个协议在身份开关切换后仍按规范会话保持节点亲和性', async () => {
+  const session = 'ses_0123456789abcdef0123456789';
+  const cfg = { ...load(), opencodeIdentityHeaders: false };
   const g = new Gateway(cfg, () => {});
   g.getAllNodes = async () => ['A'];
   g.rankNodes = (nodes) => nodes;
@@ -929,25 +973,31 @@ await t('Chat、Responses、Anthropic 三个入口用同一套稳定 session', a
   const sessions = [];
   g.attempt = async (...args) => {
     sessions.push(args[7]['x-opencode-session']);
+    assert.equal(args[7]['x-opencode-session-id'], session, '规范会话头不能被身份开关剥掉');
     assert.equal(args[9], affinityKeys.at(-1), '选点和重试必须拿同一个 affinity key');
   };
   const run = async (method, body) => {
     const req = Readable.from([JSON.stringify(body)]);
-    req.headers = {};
+    req.headers = {
+      'x-opencode-session-id': session,
+      'x-opencode-session': 'ses_111111111111AAAAAAAAAAAAAA',
+    };
     await method.call(g, req, fakeRes());
   };
   const model = FREE_MODELS[0];
-  await run(g.handleChat, { model, messages: [{ role: 'user', content: 'same opening' }] });
-  await run(g.handleResponses, {
-    model, input: [{ role: 'user', content: [{ type: 'input_text', text: 'same opening' }] }],
-  });
-  await run(g.handleMessages, {
-    model, max_tokens: 16, messages: [{ role: 'user', content: [{ type: 'text', text: 'same opening' }] }],
-  });
+  for (const enabled of [false, true]) {
+    cfg.opencodeIdentityHeaders = enabled;
+    await run(g.handleChat, { model, messages: [{ role: 'user', content: 'same opening' }] });
+    await run(g.handleResponses, {
+      model, input: [{ role: 'user', content: [{ type: 'input_text', text: 'same opening' }] }],
+    });
+    await run(g.handleMessages, {
+      model, max_tokens: 16, messages: [{ role: 'user', content: [{ type: 'text', text: 'same opening' }] }],
+    });
+  }
 
-  assert.equal(sessions.length, 3);
-  assert.equal(new Set(sessions).size, 1, '协议形状不同,相同首条 user 内容仍应落到同一 session');
-  assert.equal(new Set(affinityKeys).size, 1, '三种协议必须共用同一套 session+model 调度键');
+  assert.deepEqual(new Set(sessions), new Set([session]), '新会话头优先，旧头不能让请求串入其它会话');
+  assert.deepEqual(new Set(affinityKeys), new Set([g.affinity.key(session, model)]), '切协议或开关不能改变节点亲和性');
 });
 
 await t('完整身份头开关关闭时,UA 与稳定 session 仍必须发(它们是准入门槛)', async () => {
@@ -1022,14 +1072,6 @@ await t('请求体跨 UTF-8 分片时保留中文,不把多字节字符替换成
 
   assert.equal(sent.messages[0].content, '它有检查清单',
     '跨 chunk 的 UTF-8 字符必须原样进入上游 body');
-});
-
-await t('身份头:不同请求的 request ID 不一样', () => {
-  const a = identityHeaders({ headers: {} });
-  const b = identityHeaders({ headers: {} });
-  assert.notEqual(a['x-opencode-request'], b['x-opencode-request']);
-  // 形状对齐真实 CLI:msg_<6 位 hex><19 位 alnum>
-  assert.match(a['x-opencode-request'], /^msg_[0-9a-f]{6}[0-9A-Za-z]{19}$/);
 });
 
 await t('会话调度:所有会话粘同一个节点,用完额度才整体迁移', () => {
@@ -1537,7 +1579,7 @@ await t('后端钉选重抽:换 x-opencode-request 原地重发,不换节点、�
     return { id: 'x', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] };
   });
   g.cur = 'A';
-  const ident = { 'User-Agent': 'opencode/1.18.31', 'x-opencode-session': 'ses_keepme', 'x-opencode-request': 'msg_first' };
+  const ident = { 'User-Agent': 'opencode/1.18.31', 'x-opencode-session': 'ses_keepme', 'x-opencode-session-id': 'ses_keepme', 'x-opencode-request': 'msg_first' };
   const res = fakeRes();
   await g.attempt(res, { model: 'exo-free', messages: [{ role: 'user', content: 'hi' }] },
     ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000, ident);
@@ -1546,10 +1588,9 @@ await t('后端钉选重抽:换 x-opencode-request 原地重发,不换节点、�
   assert.deepEqual(seen.map((s) => s.node), ['A', 'A', 'A'], '重抽不换节点 —— 节点没有问题');
   const ids = seen.map((s) => s.ident['x-opencode-request']);
   assert.equal(new Set(ids).size, 3, '每次重抽都要换一个新的 x-opencode-request,否则抽的是同一个样本');
-  assert.ok(ids.every((v) => /^msg_[0-9a-f]{6}[0-9A-Za-z]{19}$/.test(v) || v === 'msg_first'),
-    `新 request id 必须保持真 CLI 的形状,得到 ${JSON.stringify(ids)}`);
   for (const s of seen) {
     assert.equal(s.ident['x-opencode-session'], 'ses_keepme', 'session 不能跟着换:那会丢掉 prompt cache 和节点粘滞');
+    assert.equal(s.ident['x-opencode-session-id'], 'ses_keepme', '新会话头同样不能在重抽时变化');
   }
   assert.equal(g.cooldown.isCooling('A', 'default'), false, '重抽不该冷却这个出口');
   const d = g.usage.getStats();
