@@ -105,8 +105,7 @@ jobs:
           # 面板必须挡住匿名访问
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9527/api/config)
           [ "$code" = 401 ] || { echo "面板没鉴权! 返回 $code"; docker logs verify; exit 1; }
-          key=$(curl -fsS -u admin:ci-test http://127.0.0.1:9527/api/status | grep -o deepseek | head -1)
-          [ -n "$key" ] || { echo "/api/status 不对"; docker logs verify; exit 1; }
+          # 清单由上游动态同步,不要求固定模型存在;下方校验状态响应中的构建标识。
 
           # 构建标识必须真的进到镜像里。这条链是 ARG → ENV → /api/status,
           # 断在哪一环面板都只显示 unknown,而那时「检查更新」永远说已是最新 ——

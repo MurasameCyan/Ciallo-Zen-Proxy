@@ -420,6 +420,8 @@ server/
 
 `ghcr.io/murasamecyan/ciallo-zen-proxy:latest`,多架构(`linux/amd64` + `linux/arm64`)。
 
+CI 先跑测试和 TLS 出站验证，再构建镜像；容器烟测检查健康、鉴权、构建标识及协议接口。免费模型清单跟随上游变化，不要求某个固定模型必须存在。
+
 | 标签 | 来源 |
 | --- | --- |
 | `latest` | `beta` 的每次推送 |
