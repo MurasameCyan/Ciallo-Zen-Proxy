@@ -40,6 +40,10 @@ const DEFAULTS = {
   subscriptionUrl: '', apiKey: '', port: 9527,
   opencodeIdentityHeaders: false, subscriptionUpdateHours: 1,
   persistUsage: false,
+  // 默认开:钉选是这个模型的推荐跑法(见 gateway 的 PINNED_BACKENDS)。
+  // 关掉等于接受上游的随机抽样 —— 省掉重抽那几次出站,代价是这次可能落在
+  // 质量不等价的那套后端上。
+  pinClaudeBackend: true,
   maxChildLanes: Number(process.env.ZEN_MAX_CHILD_LANES) || 2,
 };
 
@@ -74,6 +78,9 @@ export function load() {
   // 免得前端的 toggle 拿到 undefined 显示成不确定状态
   cfg.opencodeIdentityHeaders = cfg.opencodeIdentityHeaders === true;
   cfg.persistUsage = cfg.persistUsage === true;
+  // 旧 config.json 里没这个字段,读出来 undefined —— 归一成 true(保持钉选),
+  // 不然升级上来的用户会在无声无息里从「锁 Claude」变成「随机后端」。
+  cfg.pinClaudeBackend = cfg.pinClaudeBackend !== false;
   const hours = Number(cfg.subscriptionUpdateHours);
   cfg.subscriptionUpdateHours = Number.isInteger(hours) && hours >= 0 && hours <= 8760
     ? hours : DEFAULTS.subscriptionUpdateHours;
@@ -90,13 +97,14 @@ export function save(cfg) {
   const {
     subscriptionUrl = '', apiKey = '', port = 9527,
     opencodeIdentityHeaders = false, subscriptionUpdateHours = 1,
-    persistUsage = false, maxChildLanes = 2,
+    persistUsage = false, pinClaudeBackend = true, maxChildLanes = 2,
   } = cfg;
   fs.writeFileSync(CONFIG_FILE, JSON.stringify({
     subscriptionUrl, apiKey, port,
     opencodeIdentityHeaders: opencodeIdentityHeaders === true,
     subscriptionUpdateHours,
     persistUsage: persistUsage === true,
+    pinClaudeBackend: pinClaudeBackend !== false,
     maxChildLanes: Number(maxChildLanes) || 2,
   }, null, 2), 'utf8');
 }

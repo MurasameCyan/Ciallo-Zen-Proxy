@@ -44,12 +44,10 @@ const NODES = [
 ];
 
 /**
- * 真网关这一份是从上游 /zen/v1/models 现拉的(一天一次)。这里写死 2026-08-11
- * 实测拉到的 11 个 —— 预览要照出最长的那一列,少列几个就看不出模型区块够不够高。
- * 11 个现在都有上下文后缀(hy3-free 的 197K 是 2026-08-12 补测的)。
+ * 真网关从上游每天同步清单;预览保留长名字与各状态,并带 exo-free 后端开关。
  */
 const DEMO_MODELS = [
-  'big-pickle', 'deepseek-v4-flash-free', 'hy3-free', 'laguna-s-2.1-free',
+  'big-pickle', 'deepseek-v4-flash-free', 'exo-free', 'hy3-free', 'laguna-s-2.1-free',
   'ling-3.0-flash-free', 'ling-3.0-tiny-free', 'longcat-2.0-free', 'mimo-v2.5-free',
   'nemotron-3-ultra-free', 'nemotron-3.5-lightning-free', 'north-mini-code-free',
 ];
@@ -63,6 +61,7 @@ const DEMO_MODELS = [
  */
 const DEMO_CTX = {
   'big-pickle': 1048576,
+  'exo-free': 1048576,
   'deepseek-v4-flash-free': 1048576,
   'mimo-v2.5-free': 1048576,
   'longcat-2.0-free': 1048580,
@@ -97,9 +96,10 @@ const DEMO_CAPS = {
   'hy3-free': { maxOutputTokens: null, reasoningTop: 'high', reasoningEfforts: null },
 };
 
-/** models.dev 的补充元数据。只有 maxOutputTokens 参与悬停(实测缺失时的兜底) */
+/** 预览用补充元数据,覆盖最大输出兜底和输入模态。 */
 const DEMO_META = {
   'hy3-free': { maxOutputTokens: 65536 },
+  'exo-free': { inputModalities: ['text', 'image'] },
 };
 
 /**
@@ -120,6 +120,7 @@ const state = {
     apiKey: 'zen-a1b2c3d4', port: 9527,
     opencodeIdentityHeaders: false, subscriptionUpdateHours: 1,
     persistUsage: false,
+    pinClaudeBackend: true,
   },
   build: '9dfba56',
   hasUpdate: false,
@@ -391,6 +392,8 @@ async function handleApi(req, res, path) {
         : DEMO_CAPS,
       metadata: DEMO_META,
       modelAvailability: DEMO_AVAILABILITY,
+      pinnableBackends: { 'exo-free': 'Claude' },
+      pinClaudeBackend: state.cfg.pinClaudeBackend,
       build: state.build,
       buildUrl: `${REPO_URL}/commit/${state.build}`,
       repoUrl: REPO_URL,
@@ -434,6 +437,9 @@ async function handleApi(req, res, path) {
     if (b.persistUsage !== undefined) {
       state.cfg.persistUsage = b.persistUsage === true;
       log('info', state.cfg.persistUsage ? '[usage] 统计持久储存已开启' : '[usage] 统计持久储存已关闭');
+    }
+    if (b.pinClaudeBackend !== undefined) {
+      state.cfg.pinClaudeBackend = b.pinClaudeBackend === true;
     }
     log('info', '[config] 已保存');
     if (b.subscriptionUrl === undefined) {

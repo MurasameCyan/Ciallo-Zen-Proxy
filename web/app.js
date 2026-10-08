@@ -10,7 +10,7 @@ import {
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
   pushLog, maskKey, endpointBase, anthropicBase, rankBreakdown, COOLDOWN_MS,
   fmtDelay, delayGrade, fmtAgo, hasNewer, callLog, nodeStats, configPayload, updateHours,
-  modelLabel, modelState, modelTooltip,
+  modelLabel, modelState, modelTooltip, backendPin,
 } from './core.js';
 
 const $ = (id) => document.getElementById(id);
@@ -22,6 +22,7 @@ const S = {
   nodes: [], cooldowns: [], current: '', locked: '',
   delay: {}, excluded: [], testedAt: null, testing: false,
   logs: [], filter: 'all', follow: true,
+  pinSaving: false, pinRevision: 0,
   // 检查更新查到的远端 hash。记 hash 而不是布尔:更新完镜像重启后 status 里的
   // build 就变成它,「有新版本」标记自己消失,不用再点一次才知道好了
   latest: '',
@@ -293,11 +294,12 @@ function renderConn() {
  * unknown/probing 仍保留,避免把暂时限流或网络故障误画成下线。
  *
  * 胶囊本身只放得下模型名(21px 高、两列),所以「上下文 / 最大输出 / 思考等级 /
- * 探针状态」这四项走悬停和读屏:modelTooltip 把它们拼成多行文本,数据缺失时明说
+ * 输入模态 / 探针状态」走悬停和读屏:modelTooltip 拼成多行文本,数据缺失时明说
  * 未知/未探测 —— 上下文上限和最大输出是两件事(Claude Code 拿前者当输出预算发
  * 1M,换来一句不点名参数的 400),看不见这两个数就只能靠猜。
  */
 function renderModels() {
+  if (S.pinSaving) return;
   const list = Array.isArray(S.status.models) ? S.status.models : [];
   const ctx = S.status.ctx && typeof S.status.ctx === 'object' ? S.status.ctx : {};
   const availability = S.status.modelAvailability
@@ -307,6 +309,10 @@ function renderModels() {
   const caps = S.status.modelCapabilities && typeof S.status.modelCapabilities === 'object'
     ? S.status.modelCapabilities : {};
   const ul = $('models');
+  // 哪些模型可钉后端,服务端给(见 core.js 的 backendPin)
+  const pinnable = S.status.pinnableBackends && typeof S.status.pinnableBackends === 'object'
+    ? S.status.pinnableBackends : {};
+  const pinOn = S.status.pinClaudeBackend !== false;
   const titleOf = (m) => modelTooltip(m, ctx, metadata, caps, availability);
   // 内容没变就不重建。以前是每轮无条件重建(8 个 <li> 比 diff 还便宜),但下面
   // 要读 scrollWidth 量溢出,那会强制同步重排 —— 2 秒一次地重排一整格不值得,
@@ -315,29 +321,64 @@ function renderModels() {
   // key 直接拿整条 title 算:它已经把上下文、最大输出、思考等级和探针状态都
   // 折进去了 —— 新模型是先进清单、几十秒后才探出能力的,少算一项就意味着那项
   // 要等到清单下次真的变了才补上(状态同理:探针后台完成时清单本身不变)。
-  const key = JSON.stringify(list.map((m) => [m, modelState(m, availability).status, titleOf(m)]));
+  //
+  // 钉选开关的两个输入也要进 key:不算的话,点完开关下一轮轮询不重绘,
+  // 滑块停在旧位置上(而服务端已经按新值跑了)。
+  const key = JSON.stringify([
+    list.map((m) => [m, modelState(m, availability).status, titleOf(m)]),
+    pinnable, pinOn,
+  ]);
   if (ul.dataset.key === key) return;
+  const focusedPin = document.activeElement?.dataset.pin;
   ul.dataset.key = key;
 
   ul.replaceChildren(...list.map((m) => {
     const li = document.createElement('li');
     const state = modelState(m, availability);
     li.classList.add(state.status);
-    li.textContent = modelLabel(m, ctx);
     const title = titleOf(m);
     li.title = title;
     // 读屏拿到的和悬停一样多:只靠颜色点区分状态的话,状态和能力都读不出来。
     // 换行在 aria-label 里会被读成一长串,所以折成分隔符
     li.setAttribute('aria-label', title.replaceAll('\n', ' · '));
+
+    // 名字单独滚动,后端开关留在胶囊内。
+    const name = document.createElement('span');
+    name.className = 'mname';
+    name.textContent = modelLabel(m, ctx);
+    li.append(name);
+
+    // 可钉后端的模型多一个开关(目前只有 exo-free)。纯开关,不配文字 ——
+    // 胶囊只有 21px 高,放得下滑块就放不下说明,用途靠 title 和 aria-label 说。
+    const pin = backendPin(m, pinnable, pinOn);
+    if (pin) {
+      const sw = document.createElement('label');
+      sw.className = 'pin-switch';
+      sw.title = pin.title;
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.setAttribute('role', 'switch');
+      box.checked = pin.on;
+      box.dataset.pin = m;
+      box.setAttribute('aria-label', `锁定 ${pin.label} 后端`);
+      const track = document.createElement('span');
+      track.className = 'track';
+      track.setAttribute('aria-hidden', 'true');
+      sw.append(box, track);
+      li.append(sw);
+    }
     return li;
   }));
 
-  // 装不下的那几个:横向滚动条是藏起来的(胶囊只有 21px 高,摆得下条就摆不下字),
-  // 所以得另给键盘一条路 —— tabindex 让方向键能滚它。title 现在恒有(能力详情),
-  // 不用再拿全名兜底。只给真的溢出的加:全都能塞下时白占一串 Tab 停留点。
-  for (const li of ul.children) {
-    if (li.scrollWidth <= li.clientWidth + 1) continue;
-    li.tabIndex = 0;
+  updateModelNameFocus();
+  if (focusedPin) {
+    [...ul.querySelectorAll('input[data-pin]')].find((box) => box.dataset.pin === focusedPin)?.focus();
+  }
+}
+
+function updateModelNameFocus() {
+  for (const name of $('models').querySelectorAll('.mname')) {
+    name.tabIndex = name.scrollWidth > name.clientWidth + 1 ? 0 : -1;
   }
 }
 
@@ -392,12 +433,20 @@ function toast(msg, kind = '') {
 // ── 轮询 ────────────────────────────────────────────────
 
 async function refresh() {
+  const pinRevision = S.pinRevision;
   try {
     const [status, cfg, usage, pool] = await Promise.all([
       api('/status'), api('/config'), api('/usage'), api('/nodes'),
     ]);
+    const preservePin = S.pinSaving || pinRevision !== S.pinRevision;
+    const pin = S.status.pinClaudeBackend;
     S.status = status || {};
     S.cfg = cfg || {};
+    // 切换前发出的慢轮询不能覆盖较新的保存结果。
+    if (preservePin) {
+      S.status.pinClaudeBackend = pin;
+      S.cfg.pinClaudeBackend = pin;
+    }
     S.usage = usage;
     S.nodes = pool?.nodes || [];
     S.current = pool?.current || '';
@@ -637,6 +686,39 @@ function wire() {
       e.target.checked = !on;   // 失败拨回,别让界面和服务端不一致
     }
   };
+
+  // 模型清单会重建,开关事件委托在容器上。保存期间禁止重复提交。
+  $('models').addEventListener('change', async (e) => {
+    const box = e.target;
+    if (!(box instanceof HTMLInputElement) || !box.dataset.pin || S.pinSaving) return;
+    const on = box.checked;
+    const before = S.status.pinClaudeBackend !== false;
+    const wasFocused = document.activeElement === box;
+    S.pinSaving = true;
+    S.pinRevision++;
+    box.disabled = true;
+    try {
+      const saved = await api('/config', { method: 'POST', body: JSON.stringify({ pinClaudeBackend: on }) });
+      S.cfg.pinClaudeBackend = saved.pinClaudeBackend;
+      S.status.pinClaudeBackend = saved.pinClaudeBackend;
+      toast(on
+        ? '已锁定 Claude 后端:重抽失败会报错,不会切换到其它后端'
+        : '已关闭后端锁定:接受上游的随机后端', 'ok');
+    } catch (err) {
+      toast(`后端锁定切换失败:${err.message}`, 'err');
+      box.checked = before;
+    } finally {
+      const restoreFocus = wasFocused && (document.activeElement === document.body || document.activeElement === box);
+      S.pinSaving = false;
+      S.pinRevision++;
+      box.disabled = false;
+      renderModels();
+      if (restoreFocus) {
+        [...$('models').querySelectorAll('input[data-pin]')].find((next) => next.dataset.pin === box.dataset.pin)?.focus();
+      }
+    }
+  });
+  new ResizeObserver(updateModelNameFocus).observe($('models'));
 
   for (const seg of document.querySelectorAll('.seg')) {
     seg.onclick = () => {

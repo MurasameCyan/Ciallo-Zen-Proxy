@@ -15,7 +15,10 @@ import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as cfgMod from './config.mjs';
 import * as mihomo from './mihomo.mjs';
-import { Gateway, OPENAI, ANTHROPIC, RESPONSES, json, MODELS_TTL_MS, DEAD_NODE_REVIVE_MS } from './gateway.mjs';
+import {
+  Gateway, OPENAI, ANTHROPIC, RESPONSES, json, MODELS_TTL_MS, DEAD_NODE_REVIVE_MS,
+  PINNED_BACKENDS,
+} from './gateway.mjs';
 import { buildInfo, checkUpdate } from './build.mjs';
 import {
   matches, parseBasic, readCookie, resolveCredentials,
@@ -304,6 +307,13 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
         modelsDev: gateway.modelMetadataStatus(),
         catalog: gateway.catalogStatus?.() || null,
         metadata: gateway.modelMetadataMap(),
+        // 哪些模型可以钉后端,以及钉选现在开没开。面板据此只在这几个胶囊旁边
+        // 画开关 —— 清单是服务端的常量(见 gateway 的 PINNED_BACKENDS),
+        // 前端再抄一份就会和上游的实测结论对不上。
+        pinnableBackends: Object.fromEntries(
+          Object.entries(PINNED_BACKENDS).map(([id, p]) => [id, p.label]),
+        ),
+        pinClaudeBackend: cfg.pinClaudeBackend !== false,
         // build / buildUrl / repoUrl / trackRef:面板右上角那个 hash 徽标。
         // 搭轮询的车带过去,不另开一个路由 —— 它是个常量,不值得再来一次请求
         ...buildInfo(),
@@ -328,6 +338,7 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
         opencodeIdentityHeaders: cfg.opencodeIdentityHeaders,
         subscriptionUpdateHours: cfg.subscriptionUpdateHours,
         persistUsage: cfg.persistUsage,
+        pinClaudeBackend: cfg.pinClaudeBackend,
       });
     }
 
@@ -360,6 +371,11 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
       if (b.persistUsage !== undefined) {
         cfg.persistUsage = b.persistUsage === true;
         gateway.usage.setPersist(cfg.persistUsage);
+      }
+      // 后端钉选开关:下一次请求就按新值走(forwardStream 每次现读 config),
+      // 不用重启,也不碰订阅/内核。
+      if (b.pinClaudeBackend !== undefined) {
+        cfg.pinClaudeBackend = b.pinClaudeBackend === true;
       }
 
       // 端口刻意不接受修改。容器对外端口由 compose 的 ports 决定,进程改绑
@@ -421,6 +437,7 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
         opencodeIdentityHeaders: cfg.opencodeIdentityHeaders,
         subscriptionUpdateHours: cfg.subscriptionUpdateHours,
         persistUsage: cfg.persistUsage,
+        pinClaudeBackend: cfg.pinClaudeBackend,
         nodes: refreshed,   // 前端据此提示「刷到了几个节点」,null=没订阅地址
         speed,              // {tested,alive,dead,fastest,ms};null=没测或还没测完
       });

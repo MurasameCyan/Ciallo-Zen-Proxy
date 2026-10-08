@@ -76,6 +76,55 @@ export function isNodeBlockedError(e) {
   const text = String(e?.body ?? e?.message ?? '');
   return /disconnected before secure TLS connection was established|does not match certificate's altnames|tlsv1 unrecognized name|SSL alert number 112|CONNECT[^\n]*(?:403|拒绝)/i.test(text);
 }
+
+/**
+ * 后端钉选:同一个模型 id 在上游会被随机路由到不同厂商的后端。
+ *
+ * `exo-free` 实测会随机落到 Claude 或 GPT 两套后端上,而它们的响应质量/行为
+ * 并不等价。上游没有任何参数能指定后端,但**响应里第一个带 id 的数据块会暴露
+ * 它落在哪**:
+ *
+ *   id 以 `msg_`  开头 -> Claude
+ *   id 以 `resp_` 开头 -> GPT
+ *
+ * 于是钉选的办法只有一条:看第一个 id,不是想要的后端就断开、换一个新的
+ * `x-opencode-request` 重发,直到抽中。这个头不参与会话路由也不在准入门槛里
+ * (见 newRequestId),所以换它是安全的、也是唯一能改变这次抽样的输入。
+ *
+ * 判定**必须在首帧转发给客户端之前**完成:头一发出去这次请求就不能重试了
+ * (见 forwardStream 的 started 标志)。forwardStream 本来就为了识别「200 +
+ * 错误壳子」而先攒首帧再发头,这里搭的是同一趟车,不多一次缓冲。
+ *
+ * 面板上那个开关(`pinClaudeBackend`)只管关掉它:钉选要花重抽的出站,想省掉
+ * 就接受随机后端。所以这张表是「哪些模型**可以**钉」,开着才真的钉。
+ */
+export const PINNED_BACKENDS = Object.freeze({
+  'exo-free': { want: 'msg_', reject: 'resp_', label: 'Claude' },
+});
+
+/**
+ * 从攒下的首帧里读出后端身份。
+ *
+ * 返回 `''` 表示**还没看到 id**(再等下一个 chunk),不是「不匹配」—— 这两件事
+ * 混起来会把「首帧只有一个 `: ping` 注释」当成抽中了错后端,于是每次都重发。
+ *
+ * 只认第一个 id:之后的 chunk 里 chat.completion.chunk 每帧都带同一个 id,
+ * 而 Responses 那套的 `response.created` 里还会嵌套出现别的 id 字段。
+ */
+export function sniffBackendId(text) {
+  const m = /"id"\s*:\s*"([^"]*)"/.exec(String(text ?? ''));
+  return m ? m[1] : '';
+}
+
+/**
+ * 是否明确识别到需要重抽的后端。未知 id 不代表匹配:
+ * forwardStream 在锁定开启时另行检查 want 前缀,无法确认身份就报错。
+ */
+export function backendMismatch(model, id) {
+  const pin = PINNED_BACKENDS[String(model ?? '').trim()];
+  if (!pin || !id) return false;
+  return id.startsWith(pin.reject);
+}
 // availability 不是节点限流:没有节点时状态探测最多每分钟尝试一次,避免面板轮询
 // 把 mihomo 控制端口和上游一起打满。真正的成功/失败结果六小时才过期。
 const MODEL_AVAILABILITY_RETRY_MS = 60 * 1000;
@@ -167,6 +216,11 @@ const STREAM_IDLE_MS = 300_000;              // 流式:开始吐了以后允许�
 const MAX_NODE_TRIES = 6;                    // 最多换几个节点。48 个全试一遍没意义:
                                              // 连续 6 个都 429 基本就是整体被限了
 const MIN_TRY_MS = 8_000;                    // 剩这么点时间就别再开新的尝试了
+// 探测最多换几个出口。比真实请求(MAX_NODE_TRIES=6)小:探测是后台行为,
+// 撞上坏出口时宁可这一轮记不到结论,也不该为了一条记录把节点池扫一遍 ——
+// 3 次足够越过「健康检查放过去但连不上 opencode.ai」那一类节点(2026-10-07
+// 实测占活跃节点的 ~17%,连续 3 个都踩中的概率不到 0.5%)。
+const PROBE_NODE_TRIES = 3;
 
 /**
  * 上面两个上限都按请求体积放大。免费清单里有 6 个模型是 1M 级上下文(见 README
@@ -574,7 +628,7 @@ export class Gateway {
     // 用缓冲出口把流收成一份完整响应 —— 探测要的是「成没成 / 错误原文是什么」,
     // 不需要流式。2026-09-19 实测:不走准入的探测一律 403,会把能用的模型
     // 全判成不可用(那是假警报,比对上游的真实错误更难发现)。
-    this.probeRequest = (body) => {
+    this.probeOnce = (body) => {
       const model = typeof body.model === 'string' ? body.model.trim() : '';
       // System One(jev 分类器)没有 messages/max_tokens 这回事:可用性探针换成它
       // 自己的最小形状(一个 noul 问题,几百 token、cost 0),走它自己的入口,
@@ -597,6 +651,66 @@ export class Gateway {
       const probe = { ...body };
       gateChatBody(probe);
       return this.forwardBuffered({ write() {} }, probe, OPENAI, Infinity, this.identity(model));
+    };
+    /**
+     * 探测的出站。单发不够:探针和真实请求共用同一个出口,而出口有两类
+     * **与模型无关**的失败会把结论彻底带偏:
+     *
+     *   1. 机场拒连该域名(TLS 握手就断,status 0)—— 2026-10-07 实测,
+     *      健康检查(gstatic)放过去的节点里有 ~17% 连不上 opencode.ai
+     *      (301 个「活」节点里只有 260 个真能到)。撞上这种节点时,
+     *      14 个模型会**全部**失败,面板整片灰着「状态未知」,而同一时刻
+     *      真实请求早就换到好节点上跑完了。
+     *   2. 上游这一刻的 429 / 5xx —— 和模型能不能用无关。
+     *
+     * 真实请求路径(attempt)对这两类早就换节点重试了,探测没有,于是
+     * 「探不到」被当成了模型的属性:可用性记 unknown 并每 60s 重来一次
+     * (日志里每小时 ~790 条),能力探测则一条记录都不落、下次开机再探。
+     *
+     * 所以这里补上**有界**轮换:最多试 PROBE_NODE_TRIES 个出口。
+     *
+     * 刻意不重试 terminal / model_unavailable:那正是「上游的校验器在说话」,
+     * 能力探测要的就是它的错误原文(parseCtx / parseEfforts 从里面读上限和档位),
+     * 而且上下文那一探一发就是几 MB —— 换个节点重发同一个必然违规的请求,
+     * 只会把出站预算烧掉一倍,换不来任何新信息。
+     */
+    this.probeRequest = async (body) => {
+      const model = typeof body.model === 'string' ? body.model.trim() : '';
+      const group = providerGroup(model);
+      const tried = new Set();
+      let last = null;
+      for (let attempt = 0; attempt < PROBE_NODE_TRIES; attempt++) {
+        const cur = await this.getCurrentNode().catch(() => null);
+        if (cur) tried.add(cur);
+        try {
+          return await this.probeOnce(body);
+        } catch (e) {
+          last = e;
+          const kind = classifyUpstreamError(e?.status, e?.body);
+          // 校验器在说话:原样抛给调用方,它要的就是这段原文
+          if (kind === 'terminal' || kind === 'model_unavailable') throw e;
+          // 机场拒连是确定性的:把这个出口按封域冷却,别让下一轮探测再撞上它。
+          // 真实请求路径同样这么处置(见 attempt 的 isNodeBlockedError 分支),
+          // 两边共用同一张冷却表,所以这一笔对真实请求也生效。
+          if (isNodeBlockedError(e)) {
+            if (cur) {
+              this.cooldown.markBlocked(cur, group);
+              this.logger('warn', `[probe] node="${cur}" 疑似机场拒连该域名,冷却 ${BLOCKED_COOLDOWN_MS / 60_000}min,换下一个`);
+            }
+          }
+          if (attempt === PROBE_NODE_TRIES - 1) break;
+          const nodes = this.rankNodes(await this.getAllNodes());
+          const next = this.cooldown.pickAvailable(nodes, group, tried);
+          // 没有别的出口可换:再试同一个只是重复同一个错误,直接抛原错
+          if (!next) break;
+          if (!(await this.switchNode(next))) {
+            tried.add(next);
+            break;
+          }
+          tried.add(next);
+        }
+      }
+      throw last;
     };
     this.availabilityFetch = null;
     this.availabilityNextTryAt = 0;
@@ -1262,6 +1376,13 @@ export class Gateway {
     // 连续 5xx 秒拒计数:连续 3 个节点都被上游 5xx 拒就停(见 retryable 分支),
     // 不在这批坏出口里空转。任何非 5xx 分支(成功、429、超时、其它 4xx)都重置。
     let consecutive5xx = 0;
+    // 后端钉选的重抽计数(见 PINNED_BACKENDS)。和 switches / netRetry 分开计:
+    // 重抽既不换节点也不是网络故障,混进那两个计数会让「换过几个节点」这句
+    // 日志和 429 的处置都失真。
+    //
+    // 最多重抽八次;耗尽后明确失败,不能违反用户的锁定选择放行其它后端。
+    const MAX_BACKEND_RETRY = 8;
+    let backendRetry = 0;
     const left = () => deadline - Date.now();
     const call = { model: body.model, effort };
     const fails = { timeout: 0, rateLimited: 0 };
@@ -1486,6 +1607,28 @@ export class Gateway {
           try { res.end(); } catch {}
           finishLane();
           return;
+        }
+
+        // 抽中了不想要的后端(见 PINNED_BACKENDS)。一个字节都没发给客户端,
+        // 所以这是最干净的一类重试:**不换节点、不记节点失败、不动冷却** ——
+        // 节点和额度都没有问题,问题只是上游这次把请求路由到了另一套后端。
+        // 唯一要换的是 x-opencode-request:它是这次抽样的输入,其余头保持不变
+        // (换 session 会把同一对话的 prompt cache 和节点粘滞一起丢掉)。
+        if (e.backendPinFailed) return returnUpstreamError(e);
+        if (e.backendMismatch) {
+          this.usage.recordAttempt(cur, 'backendMismatch', null, null, call);
+          if (++backendRetry > MAX_BACKEND_RETRY) {
+            return returnUpstreamError({
+              status: 502,
+              body: JSON.stringify({ error: {
+                type: 'backend_pin_failed',
+                message: `无法锁定 Claude 后端：重抽 ${MAX_BACKEND_RETRY} 次仍未匹配。可稍后重试，或在面板关闭后端锁定。`,
+              } }),
+            }, true);
+          }
+          this.logger('info', `[pin] model="${body.model}" 后端 id=${e.backendId},换 x-opencode-request 重抽(${backendRetry}/${MAX_BACKEND_RETRY})`);
+          identity = { ...identity, 'x-opencode-request': newRequestId() };
+          continue;
         }
 
         if (status === 429) {
@@ -1808,6 +1951,9 @@ export class Gateway {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: true });
       const ttfb = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
+      // 每次出站现读开关;仅影响尚未开始的响应,不打断在飞的流。
+      const pin = this.config.pinClaudeBackend !== false
+        ? PINNED_BACKENDS[String(body.model ?? '').trim()] : null;
 
       // 头一旦发出去,这个请求就不能重试了 —— 换节点重发等于把两半响应拼给
       // 客户端。所以所有失败路径都得先看这个标志:started 之前 reject 让上层
@@ -1869,6 +2015,11 @@ export class Gateway {
           return /^(?:data:|event:|id:|retry:|:)/.test(line.trim());
         };
 
+        const pinError = (message) => ({
+          status: 502, notStarted: true, backendPinFailed: true,
+          body: JSON.stringify({ error: { type: 'backend_pin_failed', message } }),
+        });
+
         const openStream = () => {
           res.writeHead(200, {
             'Content-Type': 'text/event-stream; charset=utf-8',
@@ -1889,33 +2040,48 @@ export class Gateway {
         };
 
         resp.on('data', (chunk) => {
+          if (settled) return;
           // 保活计时重置:活跃的流不发 ping,静默满一个间隔才补
           keepAlive?.touch();
           firstByte ||= Date.now() - t0;
           if (!started) {
             // 头还没发:先攒着判形状。判不出来就继续等,别急着发头
             buf += decoder.decode(chunk, { stream: true });
-            if (looksLikeSSE(buf)) {
-              openStream();
-              sink.write(Buffer.from(buf, 'utf8'));   // 攒下的这段也要转发出去
-            } else {
-              let parsed = null;
-              try { parsed = JSON.parse(buf); } catch { return; }  // JSON 还没收全,等下一个 chunk
+            const sse = looksLikeSSE(buf);
+            if (!sse) {
+              let parsed;
+              try { parsed = JSON.parse(buf); } catch { return; }
+              // 先识别错误壳子:校验错误没有响应 id,不能卡在后端锁定上。
               if (isErrorShapedOk(parsed)) {
-                // 头没发,这次失败仍然可以换节点重试 —— 这正是延后发头的目的
                 return finish(() => reject({
                   status: embeddedStatus(parsed), body: buf, notStarted: true,
                 }));
               }
-              // 是完整 JSON 又不是错误壳子:上游把非流式响应塞给了流式请求。
-              // 交给 sink 走正常路径,它认得 chat.completion 这种整块形状。
-              openStream();
-              sink.write(Buffer.from(buf, 'utf8'));
             }
-            return;
+            if (pin) {
+              const id = sniffBackendId(buf);
+              // SSE 的注释或半帧还不能判定;完整 JSON 没有 id 则无法确认后端。
+              if (!id && sse) return;
+              if (backendMismatch(body.model, id)) {
+                finish(() => reject({
+                  status: 0, body: `backend mismatch: id=${id}`, notStarted: true,
+                  backendMismatch: true, backendId: id,
+                }));
+                r.destroy();
+                return;
+              }
+              if (!id.startsWith(pin.want)) {
+                finish(() => reject(pinError('无法确认 Claude 后端：上游响应 id 缺失或无法识别。可在面板关闭后端锁定。')));
+                r.destroy();
+                return;
+              }
+            }
+            openStream();
+            sink.write(Buffer.from(buf, 'utf8'));
+          } else {
+            sink.write(chunk);
+            buf += decoder.decode(chunk, { stream: true });
           }
-          sink.write(chunk);          // 先转发,统计是副产品,别让它拖慢流
-          buf += decoder.decode(chunk, { stream: true });
           const lines = buf.split('\n');
           buf = lines.pop();          // 末行可能被截断,留着等下一个 chunk
           for (const line of lines) {
@@ -1932,12 +2098,18 @@ export class Gateway {
         });
         resp.on('end', () => finish(() => {
           stopHeartbeat();
+          if (!started) {
+            return reject(pin
+              ? pinError('无法确认 Claude 后端：上游在返回响应 id 之前结束。可在面板关闭后端锁定。')
+              : { status: 502, body: '上游在首帧之前结束', notStarted: true });
+          }
           sink.end();
           resolve({ ok: true, usage, ttfb: firstByte, started });
         }));
         resp.on('error', (e) => finish(() => {
           stopHeartbeat();
           this.logger('error', `[stream] 中断: ${e.message}`);
+          if (!started) return reject({ status: 0, body: e.message, notStarted: true });
           // sink.fail 会补一个合法收尾(Anthropic 那边是 error + message_stop),
           // 客户端的状态机于是能正常结束,而不是等到自己超时
           sink.fail(e.message);

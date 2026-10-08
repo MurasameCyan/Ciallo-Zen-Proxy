@@ -649,13 +649,57 @@ input[readonly] { color: var(--fg-2); }
      会把自己那一列撑开,两列就不等宽了 */
   min-width: 0;
   /* 装不下的自己左右滚,不用省略号:模型名要照着填进客户端,
-     `nemotron-3.5-lightning…` 这种截断看不出是哪个,复制也复制不全。 */
-  overflow-x: auto; white-space: nowrap;
-  /* 胶囊连边框才 21px 高,横滚动条摆进去字就没地方了。滚动条藏了但滚动照旧,
-     溢出的那几个另外给 tabindex + title(见 app.js 的 renderModels)。 */
-  scrollbar-width: none;
+     `nemotron-3.5-lightning…` 这种截断看不出是哪个,复制也复制不全。
+     滚的是里面那层 .mname(见下)—— 滚在胶囊上会把右边那颗开关一起推走。 */
+  white-space: nowrap;
 }
-.models li::-webkit-scrollbar { display: none; }
+
+/* 胶囊里的「锁后端」开关(目前只有 exo-free,见 core.js 的 backendPin)。
+   和概况卡头那颗同一套做法:原生 checkbox 视觉上藏掉但留在可访问性树里,
+   可见的轨道和滑块是 <span>,靠 :checked 换色换位。
+
+   尺寸砍到 22x12:胶囊连边框才 21px 高,34px 那颗塞进去会把胶囊顶开。
+   名字用 .mname 单独包一层并 flex:0 1 auto —— 开关必须留在视野里,长名字
+   滚动时不能把它推出去。 */
+.models li { display: flex; align-items: center; gap: 6px; }
+.models li .mname { min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.models li .mname::-webkit-scrollbar { display: none; }
+.models li .mname:focus-visible { outline: 2px solid var(--mint); outline-offset: -2px; }
+.pin-switch {
+  position: relative; display: inline-flex; flex: 0 0 auto;
+  cursor: pointer;
+}
+.pin-switch input {
+  position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer;
+}
+.pin-switch input:disabled ~ .track { opacity: .5; }
+.pin-switch .track {
+  display: block; width: 22px; height: 12px;
+  border-radius: 999px;
+  background: var(--line-2);
+  border: 1px solid var(--line);
+  transition: background .16s, border-color .16s;
+  position: relative;
+  pointer-events: none;
+}
+.pin-switch .track::after {
+  content: ""; position: absolute; top: 1px; left: 1px;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--fg-2);
+  transition: transform .16s, background .16s;
+}
+.pin-switch input:checked ~ .track {
+  background: var(--mint);
+  border-color: transparent;
+}
+.pin-switch input:checked ~ .track::after {
+  transform: translateX(10px);
+  background: #04201c;
+}
+/* 键盘可达:焦点环落在开关本体上(和页面其余 :focus-visible 一致) */
+.pin-switch input:focus-visible ~ .track {
+  outline: 2px solid var(--mint); outline-offset: 2px;
+}
 
 /* 模型状态用胶囊边框左侧的小点表达,文字仍保持完整可复制。只有上游明确
    判定不可用的模型灰显;未知/探测中不能因为网络问题被误当成下线。 */

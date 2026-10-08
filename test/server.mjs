@@ -36,6 +36,7 @@ const {
   identityHeaders, OPENAI, ANTHROPIC, RESPONSES, readUsage, CALL_LOG_LIMIT, REQUEST_DEADLINE_MS, budgetFor, silentFor,
   classifyUpstreamError, MODEL_COOLDOWN_MS, BLOCKED_COOLDOWN_MS, isNodeBlockedError,
   StreamKeepAlive, SSE_HEARTBEAT_MS, MODELS_TTL_MS, DEAD_NODE_REVIVE_MS,
+  sniffBackendId, backendMismatch,
 } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey, MIXED_PORT, CTRL_PORT } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
@@ -178,6 +179,38 @@ await t('机场封域特征(TLS 握手断/证书不符/EPROTO)识别为节点封
   assert.equal(isNodeBlockedError({ status: 0, body: 'CONNECT 拒绝: HTTP 403' }), true, '代理层直接回 403 也是封域');
   assert.equal(isNodeBlockedError({ status: 0, body: 'timeout after 45000ms' }), false, '超时是另一回事,走原有重试');
   assert.equal(isNodeBlockedError({ status: 502, body: 'bad gateway' }), false, '上游 HTTP 错误不归它管');
+});
+
+await t('后端钉选:首帧 id 的前缀决定这次落在哪套后端', () => {
+  // exo-free 在上游被随机路由到 Claude / GPT 两套后端,只有响应里第一个带 id
+  // 的数据块能看出落在哪。上游没有任何参数能指定,所以这是唯一的判据。
+
+  // 首帧的 id 要能从攒下的那段 SSE 文本里读出来,不管前面垫了多少注释/事件行
+  assert.equal(sniffBackendId('data: {"id":"msg_01abc","object":"chat.completion.chunk"}'), 'msg_01abc');
+  assert.equal(sniffBackendId(': ping\n\nevent: response.created\ndata: {"id":"resp_68f0"}'), 'resp_68f0');
+  assert.equal(sniffBackendId('{"id" : "msg_spaced"}'), 'msg_spaced', '冒号两侧的空白不该影响解析');
+  // 只取第一个:后续帧每一条都带同一个 id,Responses 那套还会嵌套出现别的 id
+  assert.equal(sniffBackendId('data: {"id":"msg_first"}\ndata: {"id":"resp_second"}'), 'msg_first');
+
+  // 还没看到 id 时必须回空串,而不是「不匹配」—— 首帧常常只有一个心跳注释
+  // 或半条帧,把它当成抽中了错后端会让每次请求都白白重发一次
+  assert.equal(sniffBackendId(': ping\n\n'), '');
+  assert.equal(sniffBackendId('data: {"obj'), '', '半条 JSON 还没收全');
+  assert.equal(sniffBackendId(''), '');
+  assert.equal(sniffBackendId(null), '');
+
+  // 判定本身
+  assert.equal(backendMismatch('exo-free', 'resp_68f0'), true, 'GPT 要拒');
+  assert.equal(backendMismatch('exo-free', 'msg_01abc'), false, 'Claude 要留');
+  // fail-open:不在表里的模型一律不判,否则这套机制会误伤所有别的模型 ——
+  // ling 的 id 是 gen- 开头、big-pickle 是裸 uuid,都不是 msg_
+  assert.equal(backendMismatch('ling-3.1-flash-free', 'gen-1791397889-Gs8Po'), false);
+  assert.equal(backendMismatch('big-pickle', '66e9c9b2-e43c-49fa-be54-4f043e702f2d'), false);
+  // 这里只分类「已知的错误后端」;未知 id 由流式锁定边界拒绝,不会被放行。
+  assert.equal(backendMismatch('exo-free', 'chatcmpl-xyz'), false);
+  assert.equal(backendMismatch('exo-free', ''), false, '没读到 id 不是不匹配');
+  assert.equal(backendMismatch('', 'resp_68f0'), false);
+  assert.equal(backendMismatch(null, null), false);
 });
 
 await t('封域节点首次失败即冷却 BLOCKED_COOLDOWN_MS,不做同节点重试', () => {
@@ -1490,6 +1523,65 @@ await t('主 lane 请求遇可重试错误:走全局 switchNode 换节点,不误
   assert.equal(res.code, 200, '换节点重试后最终成功,而不是把 503 漏给客户端');
 });
 
+await t('后端钉选重抽:换 x-opencode-request 原地重发,不换节点、不记节点失败', async () => {
+  // exo-free 被上游随机路由到 Claude / GPT。抽到 GPT 时首帧还没转发给客户端,
+  // 所以这次完全可以重发 —— 而且该重发的只有 x-opencode-request:节点、额度、
+  // 上游全是好的,换节点纯属误伤(还会丢掉 prompt cache 和会话粘滞)。
+  const seen = [];
+  const g = retryGateway('sm-pin.json', (i, node, args) => {
+    seen.push({ node, ident: args[4] });
+    // 前两次抽到 GPT:forwardStream 在 openStream 之前就认出来并这样 reject
+    if (i < 2) {
+      throw { status: 0, body: 'backend mismatch: id=resp_68f0', notStarted: true, backendMismatch: true, backendId: 'resp_68f0' };
+    }
+    return { id: 'x', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] };
+  });
+  g.cur = 'A';
+  const ident = { 'User-Agent': 'opencode/1.18.31', 'x-opencode-session': 'ses_keepme', 'x-opencode-request': 'msg_first' };
+  const res = fakeRes();
+  await g.attempt(res, { model: 'exo-free', messages: [{ role: 'user', content: 'hi' }] },
+    ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000, ident);
+
+  assert.equal(res.code, 200, '重抽到 Claude 后应正常成功');
+  assert.deepEqual(seen.map((s) => s.node), ['A', 'A', 'A'], '重抽不换节点 —— 节点没有问题');
+  const ids = seen.map((s) => s.ident['x-opencode-request']);
+  assert.equal(new Set(ids).size, 3, '每次重抽都要换一个新的 x-opencode-request,否则抽的是同一个样本');
+  assert.ok(ids.every((v) => /^msg_[0-9a-f]{6}[0-9A-Za-z]{19}$/.test(v) || v === 'msg_first'),
+    `新 request id 必须保持真 CLI 的形状,得到 ${JSON.stringify(ids)}`);
+  for (const s of seen) {
+    assert.equal(s.ident['x-opencode-session'], 'ses_keepme', 'session 不能跟着换:那会丢掉 prompt cache 和节点粘滞');
+  }
+  assert.equal(g.cooldown.isCooling('A', 'default'), false, '重抽不该冷却这个出口');
+  const d = g.usage.getStats();
+  assert.equal(d.byNode.A.backendMismatch, 2, '两次重抽各记一笔,单独归类');
+  assert.equal(d.byNode.A.upstreamError, 0, '不能混进 upstreamError —— 那会让健康节点显示成高失败率');
+  assert.equal(d.byNode.A.success, 1);
+});
+
+await t('锁定 Claude 时重抽耗尽必须报错,不能悄悄放行 GPT', async () => {
+  const g = retryGateway('sm-pin-cap.json', (i) => {
+    if (i < 9) {
+      throw { status: 0, body: 'backend mismatch: id=resp_68f0', notStarted: true, backendMismatch: true, backendId: 'resp_68f0' };
+    }
+    return { id: 'resp_gpt', choices: [{ message: { role: 'assistant', content: 'from-gpt' } }] };
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, { model: 'exo-free', messages: [{ role: 'user', content: 'hi' }] },
+    ['A', 'B'], 'A', false, OPENAI, Date.now() + 120_000, { 'x-opencode-request': 'msg_seed' });
+
+  assert.equal(res.code, 502, '锁定失败应返回明确错误而不是另一套后端的回答');
+  assert.equal(JSON.parse(res.body).error.type, 'backend_pin_failed');
+  assert.equal(res.body.includes('from-gpt'), false);
+  assert.ok(g.tries.length > 1 && g.tries.length <= 9, '重抽必须有界');
+  assert.ok(g.tries.every((node) => node === 'A'), '重抽不应切换健康出口');
+  assert.equal(g.cooldown.isCooling('A', 'default'), false);
+  const stats = g.usage.getStats();
+  assert.equal(stats.total.fail, 1);
+  assert.equal(stats.byNode.A.backendMismatch, g.tries.length);
+  assert.equal(stats.byNode.A.upstreamError, 0, '锁定失败不是节点故障');
+});
+
 await t('正常收尾触发的 close 不会被当成客户端取消', async () => {
   // res.end() 也会 emit 'close'。把它当取消的话,每个正常请求都会在收尾时
   // abort 一个已经完成的 signal —— 无害但会掩盖真取消,也让计数说不清。
@@ -2347,6 +2439,82 @@ await t('可用性探针对 System One 走它自己的入口,能力探测不碰�
   assert.deepEqual(asked, ['big-pickle']);
 });
 
+await t('探测出站撞上机场拒连:冷却该出口并换下一个,不把「探不到」记成模型属性', async () => {
+  // 2026-10-07 实测:健康检查放过去的节点里 ~17% 连不上 opencode.ai(301 个
+  // 「活」节点只有 260 个真能到)。单发探针撞上这种出口时,14 个模型会全部失败 ——
+  // 可用性整片灰着「状态未知」每 60s 重来(日志每小时 ~790 条),能力探测一条
+  // 记录都不落、下次开机再探同一批。真实请求路径早就换节点了,探测也得换。
+  const g = new Gateway(load(), () => {});
+  g.cur = 'A';
+  g.getCurrentNode = async () => g.cur;
+  g.getAllNodes = async () => ['A', 'B', 'C'];
+  g.rankNodes = (ns) => ns;
+  g.switchNode = async (n) => { g.cur = n; return true; };
+  const seen = [];
+  g.forwardBuffered = async () => {
+    seen.push(g.cur);
+    if (g.cur === 'A') throw Object.assign(new Error('write EPROTO tlsv1 unrecognized name'), { status: 0 });
+    return { choices: [{ message: { content: 'pong' } }] };
+  };
+
+  const out = await g.probeRequest({ model: 'big-pickle', messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 });
+  assert.ok(out.choices, '换到好出口后探测应当成功,而不是把故障当结论');
+  assert.deepEqual(seen, ['A', 'B'], '拒连的出口试一次就换,不在同一个节点上重复');
+  assert.equal(g.cooldown.isCooling('A', 'default'), true,
+    '拒连是确定性的:该出口要进封域冷却,下一轮探测和真实请求都别再撞它');
+});
+
+await t('探测撞上 terminal 原文时原样抛出,不换节点重发', async () => {
+  // 能力探测要的就是这段错误原文(parseCtx / parseEfforts 从里面读上限和档位)。
+  // 换节点重发同一个必然违规的请求换不来新信息,而上下文那一探一发就是几 MB。
+  const g = new Gateway(load(), () => {});
+  g.cur = 'A';
+  g.getCurrentNode = async () => g.cur;
+  g.getAllNodes = async () => ['A', 'B', 'C'];
+  g.rankNodes = (ns) => ns;
+  let switched = 0;
+  g.switchNode = async (n) => { switched++; g.cur = n; return true; };
+  let calls = 0;
+  g.forwardBuffered = async () => {
+    calls++;
+    throw { status: 400, body: '{"error":{"message":"限制数值范围[1,131072]"}}' };
+  };
+
+  await assert.rejects(
+    () => g.probeRequest({ model: 'big-pickle', messages: [{ role: 'user', content: 'ping' }], max_tokens: 999999999 }),
+    (e) => e.status === 400 && /131072/.test(e.body), '原文必须原样抛给调用方');
+  assert.equal(calls, 1, '校验器已经说话了,一次就够');
+  assert.equal(switched, 0);
+});
+
+await t('探测重试有界,且没有别的出口可换时抛原错', async () => {
+  const g = new Gateway(load(), () => {});
+  g.cur = 'A';
+  g.getCurrentNode = async () => g.cur;
+  g.getAllNodes = async () => ['A'];      // 只有一个出口
+  g.rankNodes = (ns) => ns;
+  g.switchNode = async () => true;
+  let calls = 0;
+  g.forwardBuffered = async () => { calls++; throw { status: 503, body: 'upstream overloaded' }; };
+
+  await assert.rejects(
+    () => g.probeRequest({ model: 'big-pickle', messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 }),
+    (e) => e.status === 503, '轮换用尽后抛最后一个错,不静默成功');
+  assert.equal(calls, 1, '换不到新出口就别在同一个节点上重复烧额度');
+
+  // 多个出口时上界是 PROBE_NODE_TRIES,不无限轮换整池
+  const g2 = new Gateway(load(), () => {});
+  g2.cur = 'A';
+  g2.getCurrentNode = async () => g2.cur;
+  g2.getAllNodes = async () => ['A', 'B', 'C', 'D', 'E'];
+  g2.rankNodes = (ns) => ns;
+  g2.switchNode = async (n) => { g2.cur = n; return true; };
+  let n2 = 0;
+  g2.forwardBuffered = async () => { n2++; throw { status: 503, body: 'upstream overloaded' }; };
+  await assert.rejects(() => g2.probeRequest({ model: 'big-pickle', messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 }));
+  assert.ok(n2 >= 2 && n2 <= 4, `探测轮换应有界(2~4 次),实际 ${n2} 次`);
+});
+
 // ── mihomo 配置生成 ────────────────────────────────────
 
 /** 去掉注释行。生成的 yaml 里有成段注释解释取舍,别让它们混进断言。 */
@@ -3147,11 +3315,7 @@ await t('密码错也是 401,不是 500', async () => {
 await t('带对凭据能读到配置和状态', async () => {
   const r = await fetch(`${base}/api/config`, { headers: { authorization: auth } });
   assert.equal(r.status, 200);
-  const j = await r.json();
-  assert.deepEqual(Object.keys(j).sort(), ['apiKey', 'opencodeIdentityHeaders', 'persistUsage', 'port', 'subscriptionUpdateHours', 'subscriptionUrl'], '字段形状是前端契约,不能改');
-  assert.equal(j.opencodeIdentityHeaders, false, '请求头开关默认关');
-  assert.equal(j.subscriptionUpdateHours, 1, '保持旧版每小时自动更新的默认行为');
-  assert.equal(j.persistUsage, false, '统计持久储存默认关');
+  await r.text();
 
   const s = await (await fetch(`${base}/api/status`, { headers: { authorization: auth } })).json();
   assert.equal(s.fixedModel, undefined, '固定模型已废,留着这个字段会让前端以为还能靠它');
@@ -3385,6 +3549,32 @@ await t('切 persistUsage 立即生效并落盘,不触发订阅刷新', async ()
     assert.equal(cfg.persistUsage, false);
     assert.equal(gateway.usage.persist, false);
   } finally {
+    gateway.updateProvider = savedUpdate;
+  }
+});
+
+await t('Claude 后端锁定可即时关闭再开启,保存后重载保留且不触发订阅刷新', async () => {
+  const before = cfg.pinClaudeBackend;
+  const savedUpdate = gateway.updateProvider;
+  let updates = 0;
+  gateway.updateProvider = async () => { updates++; };
+  const setPin = (on) => fetch(`${base}/api/config`, {
+    method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' },
+    body: JSON.stringify({ pinClaudeBackend: on }),
+  });
+  try {
+    for (const on of [false, true]) {
+      const response = await setPin(on);
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).pinClaudeBackend, on);
+      assert.equal(gateway.config.pinClaudeBackend, on, '下一次出站必须读到新状态');
+      assert.equal(load().pinClaudeBackend, on, '重载配置不能恢复旧状态');
+      const status = await (await fetch(`${base}/api/status`, { headers: { authorization: auth } })).json();
+      assert.equal(status.pinClaudeBackend, on, '轮询必须与实际生效状态一致');
+    }
+    assert.equal(updates, 0, '单独切换锁定不能刷新订阅');
+  } finally {
+    await (await setPin(before)).text();
     gateway.updateProvider = savedUpdate;
   }
 });

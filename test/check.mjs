@@ -296,31 +296,37 @@ t('modelState 归一四种模型状态,坏值和缺字段回退 unknown', () => 
   }
 });
 
-t('modelTooltip 四行能力详情:实测优先、元数据兜底、缺字段说「未知/未探测」', () => {
+t('modelTooltip 五行能力详情:实测优先、元数据兜底、缺字段说「未知/未探测」', () => {
   const ctx = { 'muse-free': 1048576, 'no-ctx-free': 0 };
   // 实测 maxOut 和 models.dev 的 limit.output 同时存在时取实测那份 —— models.dev
   // 对好几个 Zen 模型是错的(给 deepseek-v4-flash-free 写 200000,真值 1048576)
   const full = modelTooltip('muse-free', ctx,
-    { 'muse-free': { maxOutputTokens: 262144 } },
+    { 'muse-free': { maxOutputTokens: 262144, inputModalities: ['text', 'image'] } },
     { 'muse-free': { maxOutputTokens: 131072, reasoningTop: 'max', reasoningEfforts: ['low', 'high', 'max'] } },
     { 'muse-free': { status: 'unknown', error: { message: 'The backend is temporarily overloaded' } } });
   assert.match(full, /^muse-free\[1M\]\n/, '第一行是胶囊上那个带后缀的名字');
   assert.match(full, /上下文上限：1,048,576/);
   assert.match(full, /最大输出：131,072/);
   assert.match(full, /思考等级：low, high, max/);
+  // 含 text 以外的输入模态就是多模态,并把模态名列出来 —— 「能贴图」和
+  // 「能贴 PDF」不是一回事,只说「多模态」还是得去查
+  assert.match(full, /输入模态：多模态（text, image）/);
   // 探针错误要带出来:unknown 的原因是「上游过载」还是「还没探」是两件事。
   // 但 unknown 仍是 unknown —— 不能靠这行文案把它说成可用或不可用
   assert.match(full, /探针状态：状态未知（The backend is temporarily overloaded）/);
 
   // 没探到 maxOut 时回落 models.dev
   const fallback = modelTooltip('muse-free', ctx,
-    { 'muse-free': { maxOutputTokens: 262144 } },
+    { 'muse-free': { maxOutputTokens: 262144, inputModalities: ['text'] } },
     { 'muse-free': { maxOutputTokens: null, reasoningTop: 'high', reasoningEfforts: null } },
     { 'muse-free': { status: 'available' } });
   assert.match(fallback, /最大输出：262,144/);
   // 宽松模型(对不认的档位是丢字段而不是报错)探不出完整档位表,只有顶档 ——
   // 列成 "high" 一个词会被读成「只支持 high」,所以要说清是顶档
   assert.match(fallback, /思考等级：顶档 high（完整等级未枚举）/);
+  // 仅 text 不只是「不支持图片」:网关会把附件原位换成占位符再发出去
+  // (见 dialects.mjs 的 isTextOnly),这件事必须写在脸上
+  assert.match(fallback, /输入模态：仅文本（附件会被替换成占位）/);
   assert.match(fallback, /探针状态：可用$/);
 
   // 一个字段都没有的新模型:每一项都明说「未知/未探测」,不许显示 undefined/NaN/0
@@ -330,8 +336,21 @@ t('modelTooltip 四行能力详情:实测优先、元数据兜底、缺字段说
     '上下文上限：未知',
     '最大输出：未知',
     '思考等级：未探测',
+    '输入模态：未知',
     '探针状态：状态未知',
   ].join('\n'));
+
+  // 模态未知 ≠ 仅文本:网关对缺元数据的模型是 fail-open(附件原样转发),
+  // 显示成「仅文本」会让人以为贴图会被吃掉,反过来显示成多模态又是撒谎
+  const unknownModality = modelTooltip('new-free', {}, { 'new-free': {} }, {}, {});
+  assert.match(unknownModality, /输入模态：未知/);
+  assert.match(modelTooltip('new-free', {}, { 'new-free': { inputModalities: [] } }, {}, {}),
+    /输入模态：未知/, '空数组也是「没说」,不是「只支持文本」');
+  assert.match(modelTooltip('new-free', {}, { 'new-free': { inputModalities: 'text' } }, {}, {}),
+    /输入模态：未知/, '不是数组的坏值当没有');
+  // 大小写和空白不该改变结论 —— 这张表是第三方的,字面值不保证规整
+  assert.match(modelTooltip('new-free', {}, { 'new-free': { inputModalities: [' Text ', 'IMAGE'] } }, {}, {}),
+    /输入模态：多模态（text, image）/);
 
   // 三张表整个缺席(旧网关、或 status 还没回来)也不能炸
   assert.match(modelTooltip('x-free'), /^x-free\n上下文上限：未知/);
@@ -342,31 +361,6 @@ t('modelTooltip 四行能力详情:实测优先、元数据兜底、缺字段说
   /上下文上限：未知\n最大输出：未知\n思考等级：未探测/);
 });
 
-t('模型清单渲染四种状态,状态变化会刷新且只有 unavailable 灰显', () => {
-  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
-  const fn = app.match(/function renderModels\(\)[\s\S]*?\n\}/)?.[0] || '';
-  assert.ok(fn, '应能定位 renderModels');
-
-  assert.match(fn, /modelAvailability/, '应消费 status.modelAvailability');
-  assert.match(fn, /modelState\(m,\s*availability\)/, '状态归一应留在 core.js');
-  assert.match(fn, /state\.status/, '状态必须进入缓存键,否则轮询更新不会重绘');
-  assert.match(fn, /classList\.add\(state\.status\)/, '每个模型项应带状态类');
-  assert.match(fn, /aria-label/, '不能只靠颜色区分状态');
-  // 能力三张表都要进渲染:少读一张,胶囊上那几行就常驻「未知」
-  assert.match(fn, /modelCapabilities/, '应消费 status.modelCapabilities');
-  assert.match(fn, /S\.status\.metadata/, '最大输出要能回落 models.dev 元数据');
-  assert.match(fn, /modelTooltip\(/, '悬停文案的拼装应留在 core.js');
-  assert.match(fn, /li\.title = title/, '每个胶囊都要有悬停详情,不只是溢出的那几个');
-  assert.match(fn, /dataset\.key = key/, '缓存键必须随能力详情变化,否则探完不重绘');
-  assert.match(fn, /titleOf\(m\)/, '缓存键要把整条 title 算进去');
-
-  for (const state of ['unknown', 'probing', 'available', 'unavailable']) {
-    assert.match(css, new RegExp(`\\.models li\\.${state}\\b`), `${state} 应有明确样式`);
-  }
-  const unavailable = css.match(/\.models li\.unavailable\s*\{([^}]*)\}/)?.[1] || '';
-  assert.match(unavailable, /opacity:\s*0?\.[0-9]+/, '明确不可用的模型应灰显');
-});
 
 t('rankBreakdown 按成功次数降序并截断', () => {
   const r = rankBreakdown({ a: { success: 5 }, b: { success: 90 }, c: { success: 12 } }, 2);

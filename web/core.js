@@ -75,7 +75,7 @@ export function modelState(id, availability) {
 }
 
 /**
- * 模型胶囊的悬停详情:名字 + 四行能力。
+ * 模型胶囊的悬停详情:名字 + 五行能力。
  *
  * 为什么不只显示名字:胶囊上只放得下 `[1M]` 一个后缀,而「这个模型最多能吐多少
  * 输出」和「它认哪几个思考档位」同样是填客户端时要看的数 —— 2026-10-02 那次
@@ -101,6 +101,25 @@ export function modelTooltip(id, ctxMap, metadataMap, capabilitiesMap, availabil
     : (typeof cap?.reasoningTop === 'string' && cap.reasoningTop
       ? `顶档 ${cap.reasoningTop}（完整等级未枚举）`
       : '未探测');
+  // 模态。这一行和别的几行不同:它不是实测的,只有 models.dev 这一个来源,
+  // 而网关**已经按它改请求**了 —— 明确标成仅 text 的模型,三种协议里的图片和
+  // 文档会在出站前被换成 [image attached] / [document attached](见 dialects.mjs
+  // 的 isTextOnly)。所以这一行回答的是「我贴图进去会不会被吃掉」,看不见它
+  // 的话附件被降级了也不知道。
+  //
+  // 三态,不是两态:元数据缺失时网关的行为是 fail-open(原样转发附件),
+  // 那和「确认支持图片」不是一回事,也不该显示成「纯文本」—— 两个方向都会
+  // 让人按错误的预期去贴附件。
+  const modalities = metadataMap?.[id]?.inputModalities;
+  const inputs = Array.isArray(modalities)
+    ? modalities.map((v) => String(v ?? '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  const extra = inputs.filter((m) => m !== 'text');
+  const modality = !inputs.length
+    ? '未知'
+    : (extra.length
+      ? `多模态（${inputs.join(', ')}）`
+      : '仅文本（附件会被替换成占位）');
   // 原因直接取探针记录:modelState 的 message 只在 unavailable 时有值,而
   // unknown 恰恰是最需要说明原因的那个状态。
   const reason = String(availabilityMap?.[id]?.error?.message ?? '').trim();
@@ -109,8 +128,38 @@ export function modelTooltip(id, ctxMap, metadataMap, capabilitiesMap, availabil
     `上下文上限：${ctx == null ? '未知' : grouped.format(ctx)}`,
     `最大输出：${out == null ? '未知' : grouped.format(out)}`,
     `思考等级：${efforts}`,
+    `输入模态：${modality}`,
     `探针状态：${modelState(id, availabilityMap).label}${reason ? `（${reason}）` : ''}`,
   ].join('\n');
+}
+
+/**
+ * 这个模型该不该在胶囊里带一个「锁后端」开关,带的话开关长什么样。
+ *
+ * 同一个模型 id 在上游会被随机路由到不同厂商的后端(`exo-free` 实测会落到
+ * Claude 或 GPT),而网关能把它钉在想要的那套上 —— 办法是看响应首帧的 id
+ * 前缀,抽错了就换 `x-opencode-request` 重发(见 server/gateway.mjs 的
+ * PINNED_BACKENDS)。重抽要花额外出站,所以得是个开关而不是写死的行为。
+ *
+ * 哪些模型可钉由服务端给(status.pinnableBackends: id -> 后端名)。前端不抄
+ * 这张表:它是从上游实测出来的结论,抄一份就会和服务端的判定错开 —— 面板上
+ * 画着开关而网关根本不钉,或者反过来。
+ *
+ * @returns {{label:string, on:boolean, title:string}|null} null = 这个模型不画开关
+ */
+export function backendPin(id, pinnableMap, on) {
+  const label = pinnableMap && typeof pinnableMap === 'object'
+    ? String(pinnableMap[id] ?? '').trim()
+    : '';
+  if (!label) return null;
+  const locked = on !== false;   // 缺省当开:服务端默认钉选
+  return {
+    label,
+    on: locked,
+    title: locked
+      ? `已锁定 ${label} 后端：识别到其它后端会重抽，最多八次；仍未匹配或无法确认身份则报错，不会放行。点一下关闭，接受上游随机后端。`
+      : `未锁定后端：上游随机路由，这次可能落在 ${label} 以外的后端上。点一下锁定 ${label}。`,
+  };
 }
 
 /** 毫秒时长 -> 中文粗粒度,只保留两级单位 */

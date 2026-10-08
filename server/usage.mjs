@@ -25,7 +25,11 @@ const blankTotals = () => ({
 // clientCanceled 和 upstreamError 分开:前者是客户端中途断开(我们主动 abort 了
 // 在飞的上游请求),不是节点的错;混在 upstreamError 里会把「用户按了取消」误算
 // 成「这个节点上游出错」,面板成功率的分母跟着虚高。
-const NODE_OUTCOMES = ['success', 'rateLimited', 'timeout', 'upstreamError', 'clientCanceled'];
+//
+// backendMismatch 同理,而且更该分开:它是后端钉选的重抽(见 gateway.mjs 的
+// PINNED_BACKENDS)—— 节点、额度、上游全是好的,只是这次被路由到了不想要的
+// 那套后端。记成 upstreamError 会让一个完全健康的节点在面板上显示成高失败率。
+const NODE_OUTCOMES = ['success', 'rateLimited', 'timeout', 'upstreamError', 'clientCanceled', 'backendMismatch'];
 
 const blankNode = () => ({
   requests: 0, ...Object.fromEntries(NODE_OUTCOMES.map((k) => [k, 0])),
