@@ -48,6 +48,8 @@ const cfgMod = await import('../server/config.mjs');
 const cfg = cfgMod.load();
 cfg.apiKey = 'k';
 const gw = new Gateway(cfg, () => {});
+// 模型清单同样属于假上游:后台刷新不能让真实清单移除正在测试的模型或触发探测。
+gw.upstreamGet = async () => ({ data: FREE_MODELS.map((id) => ({ id })) });
 // 主 lane 的控制端口原本硬编码成 CTRL_PORT。改走假服务实际监听的那个端口,
 // 真实的 _mihomoApi 仍然被执行(还是走一次真 HTTP),只是不再抢固定端口。
 gw.mihomoApi = (p, method = 'GET', body = null) => gw._mihomoApi(CTRL_PORT, p, method, body);

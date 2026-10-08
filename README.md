@@ -399,6 +399,8 @@ npm run verify:logout     # 无头浏览器走一遍登录/退出登录(要 Chro
 
 `server/anthropic.mjs` 是纯函数 + 一个可注入回调的 `AnthropicStream`,所以整个转换层不用起 HTTP 就能断言。前端同一个思路:`web/core.js` 只放算出来的东西(节点排序、Key 掩码、时长格式化、新旧判断),`web/app.js` 只负责把结果贴到 DOM 上 —— 所以 `test/check.mjs` 不用浏览器就能把那些规则钉住。`server/capabilities.mjs` 也是这个切法:发请求的部分收在一个可注入的 `post` 回调后面,解析错误原文的三个函数(`parseEfforts` / `parseMaxOut` / `parseCtx`)单独导出 —— 花钱的是发请求,会错的是解析,所以 `test/capabilities.mjs` 一次都不出站就能把探测的每条分支跑一遍。
 
+`test/e2e.mjs` 的模型清单和推理响应都来自测试数据：后台清单刷新不访问真实上游，也不会因上游模型下线而移除用例模型或触发额外探测。
+
 ```
 server/
   index.mjs      路由、静态文件、面板 API
