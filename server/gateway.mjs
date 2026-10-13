@@ -702,6 +702,10 @@ export class Gateway {
               this.logger('warn', `[probe] node="${cur}" 疑似机场拒连该域名,冷却 ${BLOCKED_COOLDOWN_MS / 60_000}min,换下一个`);
             }
           }
+          // 429 同样记进共享冷却表(带上 Retry-After):免费额度按出口 IP 计,上游给的
+          // 时长往往是几个小时(2026-10-13 实测 muse 回 retry-after: 20661)。不记的话,
+          // 下一轮探测和真实请求都会再撞同一批耗尽的出口,探针就一直灰着。
+          if (kind === 'rate_limited' && cur) this.cooldown.mark429(cur, group, e?.retryAfter ?? null);
           if (attempt === PROBE_NODE_TRIES - 1) break;
           const nodes = this.rankNodes(await this.getAllNodes());
           const next = this.cooldown.pickAvailable(nodes, group, tried);

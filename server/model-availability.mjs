@@ -10,6 +10,11 @@ import { classifyUpstreamError, upstreamErrorMessage } from './upstream-errors.m
 
 export const MODEL_AVAILABILITY_TTL_MS = 6 * 60 * 60 * 1000;
 export const MODEL_AVAILABILITY_RETRY_MS = 60 * 1000;
+// 429 是「这个出口的额度用完了」,不是模型属性。网关会把耗尽的出口按 Retry-After
+// 冷却,下一轮探测自然换到别的出口;但等满六小时的话,面板会一直灰着,而真实请求
+// 早就在别的出口上跑通了。15 分钟:比 transport 的 60s 慢,免得额度普遍吃紧时
+// 每分钟都去撞一次。
+export const MODEL_AVAILABILITY_RATE_LIMIT_RETRY_MS = 15 * 60 * 1000;
 export const MODEL_AVAILABILITY_STATES = Object.freeze([
   'unknown', 'probing', 'available', 'unavailable',
 ]);
@@ -22,9 +27,10 @@ const normalizeModels = (models) => [...new Set(
 
 /**
  * 探针失败时把业务 4xx(包括模型下线、鉴权/额度/端点错误)记成 unavailable。
- * 429 和上游 408/5xx 保留 unknown,并沿用六小时节奏,避免在配额或上游故障时
- * 白耗探针；但 transport 是出口节点的瞬时故障,只短暂等待后重探,否则一次坏节点
- * 会把整张模型状态表卡成 unknown 六小时,即使真实请求随后已经切到了好节点。
+ * 上游 408/5xx 保留 unknown,并沿用六小时节奏,避免在上游故障时白耗探针；
+ * transport 是出口节点的瞬时故障,只短暂等待后重探;429 是出口额度耗尽,按
+ * MODEL_AVAILABILITY_RATE_LIMIT_RETRY_MS 换出口再探。否则一次坏节点或一个耗尽
+ * 的出口会把模型状态卡成 unknown 六小时,即使真实请求随后已经切到了好节点。
  */
 export function classifyAvailabilityError(error) {
   const status = Number(error?.status) || 0;
@@ -48,6 +54,7 @@ export class ModelAvailability {
   constructor({
     post, logger = () => {}, now = () => Date.now(),
     ttlMs = MODEL_AVAILABILITY_TTL_MS, retryMs = MODEL_AVAILABILITY_RETRY_MS,
+    rateLimitRetryMs = MODEL_AVAILABILITY_RATE_LIMIT_RETRY_MS,
   }) {
     if (typeof post !== 'function') throw new TypeError('ModelAvailability.post must be a function');
     this.post = post;
@@ -55,6 +62,7 @@ export class ModelAvailability {
     this.now = now;
     this.ttlMs = ttlMs;
     this.retryMs = retryMs;
+    this.rateLimitRetryMs = rateLimitRetryMs;
     this.records = new Map();
     this.running = null;
     this.scheduler = null;
@@ -185,7 +193,8 @@ export class ModelAvailability {
           status: classified.status,
           checkedAt: this.now(),
           error: classified,
-          nextTryAt: classified.kind === 'transport' ? this.now() + this.retryMs : null,
+          nextTryAt: classified.kind === 'transport' ? this.now() + this.retryMs
+            : classified.kind === 'rate_limited' ? this.now() + this.rateLimitRetryMs : null,
         });
         this.logger(
           classified.status === 'unavailable' ? 'warn' : 'info',

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   ModelAvailability, MODEL_AVAILABILITY_TTL_MS, MODEL_AVAILABILITY_RETRY_MS,
+  MODEL_AVAILABILITY_RATE_LIMIT_RETRY_MS,
 } from '../server/model-availability.mjs';
 
 let n = 0;
@@ -147,7 +148,10 @@ await t('免费层抽检 403(FreeTierError)保持 unknown,不灰掉能用的模�
   assert.equal(a.status(['muse-free'])['muse-free'].status, 'unknown');
 });
 
-await t('临时错误保持 unknown,也只随六小时周期重探', async () => {
+await t('429 保持 unknown,一分钟内不重打,15 分钟后换出口重探', async () => {
+  // 429 是出口额度耗尽:网关会按 Retry-After 冷却那个出口,下一轮自然换出口。
+  // 等满六小时的话面板一直灰着(2026-10-13 muse / space-bunny 实测),而每分钟
+  // 重打又会在额度普遍吃紧时白烧出口。
   let now = 1000;
   let calls = 0;
   const a = new ModelAvailability({
@@ -155,11 +159,28 @@ await t('临时错误保持 unknown,也只随六小时周期重探', async () =>
     post: async () => { calls++; throw { status: 429, body: 'slow down' }; },
   });
   await a.probe(['limited-free']);
-  now += 60_000 + 1;
+  now += MODEL_AVAILABILITY_RETRY_MS + 1;
   await a.probe(['limited-free']);
   assert.equal(calls, 1, '一分钟后不能重打,否则长期 429 会白耗出口额度');
-  now += MODEL_AVAILABILITY_TTL_MS;
+  now += MODEL_AVAILABILITY_RATE_LIMIT_RETRY_MS;
   await a.probe(['limited-free']);
+  assert.equal(calls, 2, '15 分钟窗口过后要重探,不能等满六小时');
+  assert.ok(MODEL_AVAILABILITY_RATE_LIMIT_RETRY_MS < MODEL_AVAILABILITY_TTL_MS);
+});
+
+await t('上游 5xx 保持 unknown,只随六小时周期重探', async () => {
+  let now = 1000;
+  let calls = 0;
+  const a = new ModelAvailability({
+    now: () => now,
+    post: async () => { calls++; throw { status: 503, body: 'Endpoint is unavailable.' }; },
+  });
+  await a.probe(['down-free']);
+  now += MODEL_AVAILABILITY_RATE_LIMIT_RETRY_MS + 1;
+  await a.probe(['down-free']);
+  assert.equal(calls, 1, '5xx 不是出口额度问题,换出口也换不来新信息');
+  now += MODEL_AVAILABILITY_TTL_MS;
+  await a.probe(['down-free']);
   assert.equal(calls, 2);
 });
 

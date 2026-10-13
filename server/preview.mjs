@@ -148,13 +148,15 @@ const state = {
   logs: [],
 };
 
-// 「模型统计」那格按 success 排序取值,所以每个都得有这个字段。
-// 刻意让两种名次分叉:big-pickle 请求数(168)高于 mimo(73),但成功数(51)
-// 反而更低 —— 于是预览里能看出排的是成功次数而不是请求数,写错排序键就露馅。
-// 最后一个 success=0(全失败):它不该出现在列表里,列一行 0 只是占位。
+// 「模型统计」那格按 totalTokens 排序、用 K/M/B 显示。
+// 刻意让两种名次分叉:big-pickle 成功数(51)低于 mimo(71),但 token(561K)
+// 反而更高 —— 于是预览里能看出排的是用量而不是成功次数,写错排序键就露馅。
+// 各行 totalTokens 加起来正好等于上面 total.totalTokens(3,827,743):两处是
+// 同一次 record 累加出来的,预览里对不上的话面板会显示两个互相矛盾的总量。
+// 最后一个用量为 0(全失败):它不该出现在列表里,列一行 0 只是占位。
 // 条数按上游真实清单铺满(11 个 free 模型):模型统计那格限高 5 行、内部滚动,
 // 只造三四条的话列表根本不溢出,滚动和键盘可达那条路在预览里就永远试不到。
-state.usage.byModel['deepseek-v4-flash-free'] = { requests: 1043, success: 1002, fail: 41, totalTokens: 3_102_884 };
+state.usage.byModel['deepseek-v4-flash-free'] = { requests: 1043, success: 1002, fail: 41, totalTokens: 2_656_342 };
 state.usage.byModel['big-pickle'] = { requests: 168, success: 51, fail: 117, totalTokens: 561_209 };
 state.usage.byModel['mimo-v2.5-free'] = { requests: 73, success: 71, fail: 2, totalTokens: 163_650 };
 state.usage.byModel['longcat-2.0-free'] = { requests: 64, success: 60, fail: 4, totalTokens: 148_902 };

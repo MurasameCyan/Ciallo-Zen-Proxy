@@ -339,24 +339,19 @@ export function anthropicBase(origin) {
 }
 
 /**
- * byModel / byDay 这种 { key: {requests,...} } 映射 -> 按成功次数降序的数组。
+ * byModel 这种 { key: {totalTokens,...} } 映射 -> 按 token 用量降序的数组。
  *
- * 排序和显示都用 success 而不是 requests:面板上那格叫「模型统计」,一个模型
- * 每次都 429 却排在榜首没有意义 —— 「哪个模型真的在为我干活」才是要看的。
- * requests/totalTokens 一并带出来,调用方要总量时不用再翻原始映射。
- * 一次都没成功过的直接不出现:列一行 0 只是占位,列表要留给有量的那几个。
+ * 「模型统计」那格回答「token 都花在哪个模型上」:和左上角「Token 消耗」同一
+ * 口径(同一次 record 累加进 total 和 byModel),各行加起来就是那个总数。
+ * 按请求数或成功数排的话,一个跑了很多短问答的模型会压过真正吃掉大头的那个。
+ * 用量为 0 的不出现:每次都失败的模型没有 token,列一行 0 只是占位。
  * limit = 0 表示不截断(模型统计那格全量显示,自己滚动)。
  */
 export function rankBreakdown(map, limit = 5) {
   const rows = Object.entries(map || {})
-    .map(([key, v]) => ({
-      key,
-      success: Number(v?.success) || 0,
-      requests: Number(v?.requests) || 0,
-      totalTokens: Number(v?.totalTokens) || 0,
-    }))
-    .filter((r) => r.success > 0)
-    .sort((a, b) => b.success - a.success || a.key.localeCompare(b.key));
+    .map(([key, v]) => ({ key, totalTokens: Number(v?.totalTokens) || 0 }))
+    .filter((r) => r.totalTokens > 0)
+    .sort((a, b) => b.totalTokens - a.totalTokens || a.key.localeCompare(b.key));
   return limit > 0 ? rows.slice(0, limit) : rows;
 }
 

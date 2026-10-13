@@ -94,7 +94,7 @@ function renderStats() {
     + ` · 缓存写 ${fmtTokens(t.cacheWriteTokens)}`;
 
   $('s-up').textContent = fmtUptime(Date.now() - (S.usage.startTime || Date.now()));
-  // 不再写「主用 X」:同一张卡的「模型统计」格已经把全部模型按次数列出来了
+  // 不再写「主用 X」:同一张卡的「模型统计」格已经把全部模型按 token 用量列出来了
   $('s-up-sub').textContent = S.usage.lastRequest
     ? `最后请求 ${fmtClock(S.usage.lastRequest)}`
     : '还没有请求';
@@ -103,11 +103,11 @@ function renderStats() {
 }
 
 /**
- * 模型统计格:各模型的**成功**调用次数,按次数降序(排序和过滤都在
- * core.js 的 rankBreakdown 里)。
+ * 模型统计格:各模型累计的 token 用量,按用量降序(排序和过滤都在 core.js 的
+ * rankBreakdown 里)。数值用和左上角同一套 K/M/B 紧凑写法,精确值放在 title 里。
  *
  * 口径和「调用日志」刻意不同:那张表是最近 200 条的时间线,翻得到「这一次
- * 发生了什么」;这一格是开机至今的累计分布,回答「总体在用哪个模型」。
+ * 发生了什么」;这一格是开机至今的累计分布,回答「token 都花在哪个模型上」。
  * 逐条日志被环形缓冲截断后,早期的调用只在这个累计数里还留着。
  */
 function renderModelStats() {
@@ -121,7 +121,8 @@ function renderModelStats() {
     const nm = tag('nm', r.key);
     nm.title = r.key;              // 窄档会省略号截断,悬停看全名
     const n = document.createElement('b');
-    n.textContent = fmtCount(r.success);
+    n.textContent = fmtTokens(r.totalTokens);
+    n.title = `${fmtCount(r.totalTokens)} tokens`;
     li.append(nm, n);
     return li;
   }));

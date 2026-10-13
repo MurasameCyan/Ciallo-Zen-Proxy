@@ -362,34 +362,38 @@ t('modelTooltip 五行能力详情:实测优先、元数据兜底、缺字段说
 });
 
 
-t('rankBreakdown 按成功次数降序并截断', () => {
-  const r = rankBreakdown({ a: { success: 5 }, b: { success: 90 }, c: { success: 12 } }, 2);
+t('rankBreakdown 按 token 用量降序并截断', () => {
+  const r = rankBreakdown({ a: { totalTokens: 5_000 }, b: { totalTokens: 9_000_000 }, c: { totalTokens: 120_000 } }, 2);
   assert.deepEqual(r.map((x) => x.key), ['b', 'c']);
+  assert.equal(r[0].totalTokens, 9_000_000);
   assert.deepEqual(rankBreakdown(null), []);
 });
 
-t('rankBreakdown 排的是成功数而不是请求数', () => {
-  // 「模型统计」那格问的是「哪个模型真在干活」。按 requests 排的话,一个每次
-  // 都撞 429 的模型会凭失败次数占住榜首
+t('rankBreakdown 排的是用量而不是成功数或请求数', () => {
+  // 「模型统计」那格问的是「token 都花在哪个模型上」。按成功数排的话,一个跑了
+  // 一堆短问答的模型会压过真正吃掉大头的长对话模型
   const r = rankBreakdown({
-    busy: { requests: 500, success: 3 },      // 打得最多,几乎全失败
-    good: { requests: 20, success: 19 },
+    chatty: { requests: 500, success: 490, totalTokens: 80_000 },
+    heavy: { requests: 20, success: 19, totalTokens: 6_000_000 },
   });
-  assert.deepEqual(r.map((x) => x.key), ['good', 'busy']);
-  assert.equal(r[0].success, 19);
-  assert.equal(r[0].requests, 20, 'requests 仍要带出来,调用方要总量时不用翻原映射');
+  assert.deepEqual(r.map((x) => x.key), ['heavy', 'chatty']);
 });
 
-t('rankBreakdown 丢掉零成功的模型', () => {
-  // 全失败的模型列一行 0 只是占位,那格宽度要留给真有量的
-  assert.deepEqual(rankBreakdown({ dead: { requests: 12, success: 0 } }), []);
-  // 旧 usage.json 的桶可能没有 success 字段,不能因此把它当成 0 次成功之外的东西
-  assert.deepEqual(rankBreakdown({ old: { requests: 9 } }), []);
+t('rankBreakdown 用量相同时按模型名排,不随对象键序抖动', () => {
+  const r = rankBreakdown({ zeta: { totalTokens: 10 }, alpha: { totalTokens: 10 } });
+  assert.deepEqual(r.map((x) => x.key), ['alpha', 'zeta']);
+});
+
+t('rankBreakdown 丢掉零用量的模型', () => {
+  // 全失败的模型没有 token,列一行 0 只是占位,那格宽度要留给真有量的
+  assert.deepEqual(rankBreakdown({ dead: { requests: 12, success: 0, totalTokens: 0 } }), []);
+  // 坏值和缺字段都按 0 处理,不能让 NaN 混进排序
+  assert.deepEqual(rankBreakdown({ old: { requests: 9 }, bad: { totalTokens: 'x' } }), []);
 });
 
 t('rankBreakdown limit=0 不截断', () => {
   // 模型统计那格全量显示(模型是个位数量级),截到 5 会悄悄少几行
-  const map = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`m${i}`, { success: i + 1 }]));
+  const map = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`m${i}`, { totalTokens: (i + 1) * 1000 }]));
   assert.equal(rankBreakdown(map, 0).length, 8);
   assert.equal(rankBreakdown(map).length, 5, '默认仍截断到 5');
 });

@@ -42,6 +42,7 @@ const { buildMihomoYaml, load, genApiKey, MIXED_PORT, CTRL_PORT } = await import
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
 const { connectTunnel } = await import('../server/proxy.mjs');
 const { LaneManager } = await import('../server/lane.mjs');
+const { providerGroup } = await import('../server/rotation.mjs');
 const { MihomoInstance } = await import('../server/mihomo.mjs');
 const { shortSha, buildId, buildInfo, checkUpdate } = await import('../server/build.mjs');
 const { ModelMetadataStore } = await import('../server/model-metadata.mjs');
@@ -2525,6 +2526,34 @@ await t('探测出站撞上机场拒连:冷却该出口并换下一个,不把「
   assert.deepEqual(seen, ['A', 'B'], '拒连的出口试一次就换,不在同一个节点上重复');
   assert.equal(g.cooldown.isCooling('A', 'default'), true,
     '拒连是确定性的:该出口要进封域冷却,下一轮探测和真实请求都别再撞它');
+});
+
+await t('探测撞上 429:按 Retry-After 冷却该出口并换下一个,真实请求也跳过它', async () => {
+  // 2026-10-13 实测:muse 的免费额度按出口 IP 耗尽,上游回 429 FreeUsageLimitError
+  // + retry-after: 20661(约 5.7 小时),官方 CLI 在同一出口上也一样。探针以前只换
+  // 节点不记冷却,下一轮探测和真实请求于是继续撞同一批耗尽的出口,面板一直灰着。
+  const g = new Gateway(load(), () => {});
+  g.cur = 'A';
+  g.getCurrentNode = async () => g.cur;
+  g.getAllNodes = async () => ['A', 'B', 'C'];
+  g.rankNodes = (ns) => ns;
+  g.switchNode = async (n) => { g.cur = n; return true; };
+  const seen = [];
+  g.forwardBuffered = async () => {
+    seen.push(g.cur);
+    if (g.cur === 'A') throw { status: 429, body: '{"type":"error","error":{"type":"FreeUsageLimitError"}}', retryAfter: 20661 };
+    return { choices: [{ message: { content: 'pong' } }] };
+  };
+
+  const model = 'muse-spark-1.3-contributor-free';
+  const out = await g.probeRequest({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 });
+  assert.ok(out.choices, '换到有额度的出口后探测应当成功');
+  assert.deepEqual(seen, ['A', 'B']);
+  const group = providerGroup(model);
+  assert.equal(g.cooldown.isCooling('A', group), true, '耗尽的出口要进共享冷却表');
+  const entry = g.cooldown.summary().find((x) => x.node === 'A');
+  assert.ok(entry.remain > 20_000, `冷却要按上游 Retry-After 记(约 5.7 小时),实际剩 ${entry.remain}s`);
+  assert.equal(g.cooldown.pickAvailable(['A', 'B', 'C'], group), 'B', '真实请求的选点也要跳过它');
 });
 
 await t('探测撞上 terminal 原文时原样抛出,不换节点重发', async () => {
