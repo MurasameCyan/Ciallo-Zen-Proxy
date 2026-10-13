@@ -450,24 +450,32 @@ function conversationSeed(body) {
  * `x-opencode-session` 必须匹配 `ses_<12 位小写 hex><14 位 [0-9A-Za-z]>`
  * —— 2026-09-19 实测,不带这个头一律 403 `FreeTierError`。
  *
- * 原来是 `ses_` + sha256 前 24 位 hex(纯小写 hex),形状对不上:服务端只做
- * 形状检查(shapeless 的 id 也照样被接受),但纯 hex 不满足「第 13 位起可以是
- * 大写字母和数字混合」那一段。这里把 sha256 的字节按位切出来,前 6 字节编成
- * 12 位 hex、后 14 字节查表编成 14 位 alnum。
+ * 2026-10-13 起门槛又多一条:那 12 位 hex 必须能按官方 `Identifier.descending`
+ * 解出一个**合理的时间戳**(48 位按位取反后 >>12 得毫秒)。官方 1.19.0 抓包 +
+ * 同节点单变量消融:
  *
- * 仍然必须是**确定性**的:同一对话的多轮请求要用同一个 ID,上游的会话路由和
- * prompt cache 都吃这个值。所以用哈希而不是随机数 —— 换节点重试也保持不变。
+ *   降序编码、时间在 3 年前 ~ 2 年后      -> 过门槛(200,或上游供应商 429)
+ *   升序编码(解出来接近 1970)            -> 403 FreeTierError
+ *   sha256 直接切出的 hex(同样接近 1970) -> 403 FreeTierError
+ *
+ * 所以 hex 段改成「固定锚点减去哈希派生的偏移(不超过 180 天)」再按降序编码,
+ * 不读系统时钟:同一对话的多轮请求、换节点重试都必须是同一个 ID —— 上游的会话
+ * 路由和 prompt cache 都吃这个值。后 14 位 alnum 仍由哈希派生。
  */
 const SESSION_ALNUM = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 const SESSION_ID_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const SESSION_ANCHOR_MS = Date.UTC(2026, 0, 1);
+const SESSION_SPREAD_MS = 180 * 86_400_000;
+const ID_TIME_MASK = (1n << 48n) - 1n;
 function stableSessionId(signal) {
   const digest = crypto.createHash('sha256').update(`ses\0${signal}`).digest();
-  const byteAt = (i) => digest[i % digest.length];
-  let hex = '';
-  for (let i = 0; i < 12; i++) hex += (byteAt(i) % 16).toString(16);
+  const timestamp = SESSION_ANCHOR_MS - (digest.readUIntBE(0, 6) % SESSION_SPREAD_MS);
+  // 计数器固定 1:官方每毫秒从 1 起数。实测同一时间戳下 counter=1 过门槛,
+  // 255 / 1469 / 2048 一律 403 —— 时间字段的低 12 位不能拿来装哈希熵。
+  const time = ~((BigInt(timestamp) << 12n) + 1n) & ID_TIME_MASK;
   let alnum = '';
-  for (let i = 0; i < 14; i++) alnum += SESSION_ALNUM[byteAt(12 + i) % 62];
-  return `ses_${hex}${alnum}`;
+  for (let i = 0; i < 14; i++) alnum += SESSION_ALNUM[digest[8 + i] % 62];
+  return `ses_${time.toString(16).padStart(12, '0')}${alnum}`;
 }
 
 let lastRequestTimestamp = 0;

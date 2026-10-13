@@ -312,6 +312,10 @@ openai-compatibility:
 
 `/v1/responses` 这条腿不受此修正影响：上游对免费层的 Responses 入口在 `/zen/v1/responses` 和 `/inference/openai/v1/responses` 上一律回 403 `FreeTierError`，与身份头无关。
 
+**会话 ID 的时间字段（2026-10-13）。** 当天起，免费模型对网关几乎一律回 403 `FreeTierError`（`OpenCode's free tier can only be used from within OpenCode`），只有 `jev-1.13-free` 和 `longcat-2.5-preview-free` 的探针还是绿的。面板探针随之大面积变灰，真实调用换满 6 个节点后报 `No usable upstream node`。拿官方 `v1.19.0` 正式发行二进制抓包，在同一隔离出口上单变量消融：上游开始把 `ses_` 后那 12 位 hex 按官方 `Identifier.descending` 解码，**降序编码且毫秒内计数器为 1** 才放行；网关原先直接从 sha256 切出这 12 位，升序编码、或计数器取 255/1469/2048 也同样 403。时间本身不卡：3 年前到 2 年后的时间戳都能过。修正后的合成会话 ID 用固定锚点（2026-01-01）减去由哈希得出、不超过 180 天的偏移，再按降序编码，计数器固定为 1；后 14 位仍由哈希派生。所以同一对话、换节点重试拿到的仍是同一个 ID，也不读系统时钟。客户端自带的合法 `ses_` 原样透传，不受影响。
+
+同一出口、同一请求体上，修正后 `big-pickle`、`step-5-preview-free`、`mimo-v2.6-flash-free`、`cat-jam-free` 的探针都拿到回答。`ling-3.1-flash-free` 这段时间频繁回 429 `Endpoint is unavailable.`，官方 CLI 交错对照的比例相同（各 6 次：官方 2 次 200，网关 1~2 次 200）。官方 CLI 能成功只是因为它自己会重试，这是供应商侧容量问题，和身份无关。出站路径和 UA 都没改：官方 1.19.0 改走 `/inference/v1/chat/completions`、带 `Authorization: Bearer public`，但这两项消融后都不影响结果。
+
 这也不等于确认 `exo-free` 当前可用。2026-10-08 的隔离出口实测中，官方 CLI `1.18.35` 也收到 `Upstream request failed: Endpoint is unavailable.`；完整官方请求回放到 `/zen/v1/chat/completions` 和 `/inference/openai/v1/chat/completions` 均返回 503。新 inference 服务的准入与 provider 实际配置未在所查公开源码中提供，不能仅凭这条错误认定「限定客户端」，也不能把失败伪写成能力记录。
 
 **登录。** 没登录时任何页面都会被送到 `/login`,填 `PANEL_USER` / `PANEL_PASS`。这是面板自己的一页,不是浏览器那个凭据弹框 —— 弹框是 401 响应里的 `WWW-Authenticate` 头带出来的,样式不可控、密码错了给不出自己的提示、想退出只能关浏览器。现在服务端一律不发这个头,所以浏览器不再弹框。

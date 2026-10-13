@@ -752,6 +752,28 @@ await t('身份头:User-Agent 用我们的,其余缺的补默认、客户端给�
   assert.equal(h['x-title'], undefined, '没合理默认值的就别凭空造');
 });
 
+await t('合成的会话 ID 按官方降序时间戳编码，解出合理时间且对同一对话稳定', () => {
+  // 2026-10-13 起上游对 12 位 hex 有方向要求:官方 Identifier.descending 形状能过,
+  // 升序编码和直接切哈希一律 403 FreeTierError。时间字段和官方一样截断到 48 位,
+  // 解码只能还原 ts mod 2^36,所以按模比较:合成值必须落在锚点前 180 天内。
+  const mask = (1n << 48n) - 1n;
+  const window = 2 ** 36;
+  const decode = (id) => Number((~BigInt(`0x${id.slice(4, 16)}`) & mask) >> 12n);
+  const anchor = Date.UTC(2026, 0, 1) % window;
+  const seeds = [{ body: { messages: [{ role: 'user', content: 'Reply exactly PONG.' }] } },
+    { headers: { 'x-opencode-session-id': 'probe-session:ling-3.1-flash-free' } },
+    { headers: { 'x-claude-code-session-id': '6f1c2b8e-0d1a-4c7e-9a43-2f5b7c1d9e01' } }];
+  for (const inbound of seeds) {
+    const first = identityHeaders(inbound, () => 'unused')['x-opencode-session'];
+    assert.match(first, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    const behind = ((anchor - decode(first)) % window + window) % window;
+    assert.ok(behind <= 180 * 86_400_000, `${first} 不在锚点前 180 天内(差 ${behind}ms)`);
+    // 低 12 位是官方的毫秒内计数器:实测只有 1 能过,装进哈希熵(255/1469/2048)一律 403
+    assert.equal(~BigInt(`0x${first.slice(4, 16)}`) & mask & 0xfffn, 1n, `${first} 计数器必须是 1`);
+    assert.equal(identityHeaders(inbound, () => 'unused')['x-opencode-session'], first, '同一对话必须稳定');
+  }
+});
+
 await t('请求 ID 可按官方六字节时间和计数器解码，同毫秒生成也不重复', () => {
   const originalNow = Date.now;
   const now = 1791440000123;
