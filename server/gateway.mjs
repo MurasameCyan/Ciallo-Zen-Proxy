@@ -1953,6 +1953,7 @@ export class Gateway {
       // 而那段等待恰恰是用户真正在等的东西。
       const t0 = Date.now();
       let firstByte = 0;
+      let sink = null;
       const finish = (fn) => { if (!settled) { settled = true; fn(); } };
 
       /**
@@ -1980,7 +1981,6 @@ export class Gateway {
         // started=true 之后任何失败都只能就地收尾,换节点重试的机会没了,
         // 而客户端拿到的是一条永远不吐帧的空流。所以等第一个 chunk 到手、
         // 确认它真是 SSE 之后再发头 —— 在那之前 reject 都是安全可重试的。
-        let sink = null;
 
         // 这份缓冲只用来抓 usage,但解码同样要有状态:半个多字节字符会让
         // JSON.parse 抛在下面那个 catch 里,表现为偶发丢一次 usage 记账。
@@ -2103,9 +2103,9 @@ export class Gateway {
       r.on('error', (e) => finish(() => {
         stopHeartbeat();
         if (started) {
-          // 头已经发了,只能就地收尾。这里不能 reject 回重试循环。
+          // TLS 错误可能先落在请求上;和响应错误一样走方言收尾,不能裸关 socket。
           this.logger('error', `[stream] 传输中断: ${e.message}`);
-          try { res.end(); } catch {}
+          sink.fail(e.message);
           return resolve({ ok: false, usage, ttfb: firstByte, started });
         }
         reject({ status: 0, body: e.message, notStarted: true });

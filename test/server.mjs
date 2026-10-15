@@ -1505,6 +1505,65 @@ await t('v2 exo-free 不启用旧的后端钉选', async () => {
   }
 });
 
+await t('TLS 断流走请求或响应错误时均补齐 Anthropic 收尾,不重试或记成成功', async () => {
+  const originalRequest = https.request;
+  const tlsError = new Error('decryption failed or bad record mac');
+  try {
+    for (const firstError of ['request', 'response']) {
+      let calls = 0;
+      https.request = (options, callback) => {
+        calls++;
+        const request = new EventEmitter();
+        request.setTimeout = () => request;
+        request.destroy = () => request;
+        request.end = () => {
+          const response = new EventEmitter();
+          response.statusCode = 200;
+          response.headers = {};
+          response.setTimeout = () => response;
+          callback(response);
+          for (const delta of [{ reasoning_content: '先想一想' }, { content: '只收到半句' }]) {
+            response.emit('data', Buffer.from(`data: ${JSON.stringify({ choices: [{ delta }] })}\n\n`));
+          }
+          // TLS 错误可能先落在 ClientRequest,随后 IncomingMessage 再报 aborted。
+          if (firstError === 'request') request.emit('error', tlsError);
+          response.emit('error', new Error('aborted'));
+          if (firstError === 'response') request.emit('error', tlsError);
+          response.emit('end');
+        };
+        return request;
+      };
+      const g = new Gateway(load(), () => {});
+      g.usage = new UsageTracker(path.join(TMP, `tls-stream-${firstError}.json`), () => {});
+      const res = fakeRes();
+      const body = { model: 'deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'hi' }] };
+      await g.attempt(res, body, ['A', 'B'], 'A', true, ANTHROPIC, Date.now() + 60_000);
+
+      const events = res.body.split('\n').filter((line) => line.startsWith('data: '))
+        .map((line) => JSON.parse(line.slice(6)));
+      assert.equal(events[0].type, 'message_start');
+      assert.equal(events.at(-1).type, 'message_stop', `${firstError}: 不能直接关 socket 留下残缺信封`);
+      assert.equal(events.filter((e) => e.type === 'message_stop').length, 1, '后续错误/结束事件不能重复收尾');
+      const errors = events.filter((e) => e.type === 'error');
+      assert.equal(errors.length, 1, '必须明确报错,不能把断流伪装成正常结束');
+      assert.equal(errors[0].error.message, firstError === 'request' ? tlsError.message : 'aborted');
+      assert.deepEqual(events.filter((e) => e.type === 'content_block_start').map((e) => e.index),
+        events.filter((e) => e.type === 'content_block_stop').map((e) => e.index), '已打开的块都要关闭');
+      assert.equal(events.find((e) => e.delta?.type === 'text_delta').delta.text, '只收到半句');
+      assert.equal(res.writableEnded, true);
+      assert.equal(calls, 1, '响应已输出一半,不许换节点拼接两段回复');
+      const stats = g.usage.getStats();
+      assert.equal(stats.total.success, 0);
+      assert.equal(stats.total.fail, 1);
+      assert.equal(stats.byNode.A.upstreamError, 1);
+      assert.equal(stats.byNode.B, undefined);
+      assert.equal(g.availability.status([body.model])[body.model].status, 'unknown');
+    }
+  } finally {
+    https.request = originalRequest;
+  }
+});
+
 
 await t('Gateway 选点:新会话一律粘 lockedNode,已有会话粘原节点', async () => {
   const g = new Gateway(load(), () => {});

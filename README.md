@@ -282,7 +282,7 @@ openai-compatibility:
 
 **超时不再报成「节点全挂」。** 三处终态失败合到一个出口,说法由实际计数决定:有过超时就回 504 并说明试了几次,请求体到 1 MiB 以上时额外点明「大上下文 prefill 慢,不是节点故障」;全被限流回 429;真的一个节点都切不动才回 503 `all_nodes_unavailable`。原来那句 `Tried 6 nodes, all unavailable` 根本不看原因 —— 256K 的请求就能触发它,而那批节点是好的,照着这句话去查节点是白费功夫。
 
-**流开始后不重试。** 头一旦发出去,响应就定型了;这时候再换节点重发等于把两半响应拼给客户端。所以 `writeHead` 之后的任何失败都只做收尾 —— Anthropic 那边会补一个合法的 `error` + `message_stop`,客户端不会挂到超时。
+**流开始后不重试。** 头一旦发出去,响应就定型了;这时候再换节点重发等于把两半响应拼给客户端。所以 `writeHead` 之后的失败都经方言收尾,无论错误先从上游响应还是出站请求到达。Anthropic 会发送明确的 `error`,关闭未结束的内容块,再补齐 `message_delta` / `message_stop`;这一轮仍记失败,不会把半句回复伪装成成功。2026-10-15 用 OMP 的 `zen2api / deepseek-v4.1-flash-free` 排查到 TLS `decryption failed or bad record mac` 会先触发请求错误:旧路径直接关 socket,导致客户端只看到 `stream ended before message_stop`。修正后该路径保留原始传输错误并补齐协议收尾,但不掩盖或自动重试已经开始输出的断流。
 
 **工具调用参数增量。** 流式的 tool 参数用 `input_json_delta` 一段段发。参考实现里是在第一个分片就 start+stop,长参数会被截断。
 
