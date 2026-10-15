@@ -334,8 +334,8 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
 // ── Responses:非流式透传 + 字符串 input 补数组 + 嵌套 reasoning.effort ──
 // 上游原生支持 Responses(见 gateway 的 RESPONSES 方言),所以这条是「近乎透传」。
 {
-  // Responses 走的是另一条上游路径(/zen/v1/responses),不过闸,也是唯一还会
-  // 走 forward 非流式出站的方言 —— 这里两条都桩上,免得以后哪条改了实测不到
+  // Responses 走的是另一条上游路径(/inference/v1/responses),同样经过 v2 闸门。
+  // 这里两条都桩上,免得以后哪条改了实测不到。
   const savedFwd = gw.forward;
   const savedFwdStream = gw.forwardStream;
   let rsent = null;

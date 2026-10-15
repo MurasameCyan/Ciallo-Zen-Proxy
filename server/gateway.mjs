@@ -37,7 +37,7 @@ import {
 import { CALL_LOG_LIMIT, readUsage, UsageTracker } from './usage.mjs';
 import {
   OPENCODE_HOST, CHAT_PATH, MODELS_PATH, RESPONSES_PATH, OPENAI, ANTHROPIC, RESPONSES, SYSTEMONE,
-  gateChatBody, gateResponsesBody, responsesUpstreamDialect, chatToResponsesBody,
+  gateChatBody, gateResponsesBody, withToolAliases, responsesUpstreamDialect, chatToResponsesBody,
 } from './dialects.mjs';
 import { json, readUtf8Body } from './http-util.mjs';
 export { json } from './http-util.mjs';
@@ -365,22 +365,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 
 /**
- * 客户端可以自己带的那几个身份头。带了就透传,没带的按下面的默认值补。
- *
- * **UA 的写法是准入门槛,不是随便写的**。2026-09-19 实测,上游免费层要求:
- *
- *   - 首 token 必须是 `opencode/<version>`:`node` 和 `omp/1.0.0` 都吃 403,
- *     只有 `opencode/...` 放行(后续 token 不校验,CLI 那串 ai-sdk/bun 可省)
- *   - 版本不能低于 1.18.0:`opencode/1.0.0` 回 426 UpgradeRequired。
- *     原来这里是 `opencode-cli/1.0.0` —— 版本号解析出来是 1.0.0,正好踩中下限
- *
- * `x-opencode-project` 用 global 对齐真实 CLI(它默认就是这个值)。
+ * OpenCode v2 client identity. The free-tier gate accepts only the four-part
+ * UA shape with a major version of at least 2; downstream v1-shaped UAs are
+ * replaced rather than forwarded.
  */
 const IDENTITY_DEFAULTS = {
-  'User-Agent': 'opencode/1.18.35 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14',
+  'User-Agent': 'opencode/latest/2.0.29/cli',
   'x-opencode-client': 'cli',
   'x-opencode-project': 'global',
 };
+const OPENCODE_UA_RE = /^opencode\/[a-z0-9-]+\/(\d+)\.\d+\.\d+\/[a-z0-9-]+$/i;
+function validOpencodeUa(value) {
+  const match = OPENCODE_UA_RE.exec(String(value || '').trim());
+  return !!match && Number(match[1]) >= 2;
+}
 
 /**
  * 把一个值洗成 Node 肯发的头值。
@@ -446,46 +444,31 @@ function conversationSeed(body) {
 }
 
 /**
- * 稳定会话 ID。**形状不是随便定的**:上游免费层的准入门槛里有一条是
- * `x-opencode-session` 必须匹配 `ses_<12 位小写 hex><14 位 [0-9A-Za-z]>`
- * —— 2026-09-19 实测,不带这个头一律 403 `FreeTierError`。
- *
- * 2026-10-13 起门槛又多一条:那 12 位 hex 必须能按官方 `Identifier.descending`
- * 解出一个**合理的时间戳**(48 位按位取反后 >>12 得毫秒)。官方 1.19.0 抓包 +
- * 同节点单变量消融:
- *
- *   降序编码、时间在 3 年前 ~ 2 年后      -> 过门槛(200,或上游供应商 429)
- *   升序编码(解出来接近 1970)            -> 403 FreeTierError
- *   sha256 直接切出的 hex(同样接近 1970) -> 403 FreeTierError
- *
- * 所以 hex 段改成「固定锚点减去哈希派生的偏移(不超过 180 天)」再按降序编码,
- * 不读系统时钟:同一对话的多轮请求、换节点重试都必须是同一个 ID —— 上游的会话
- * 路由和 prompt cache 都吃这个值。后 14 位 alnum 仍由哈希派生。
+ * Stable v2 session ID. The prefix is `~(timeMs * 0x1000 + counter)` in the
+ * low 48 bits. Translated client session hints use only 36 time bits and keep
+ * counter 1; filling the counter from a digest is rejected by FreeTierError.
  */
 const SESSION_ALNUM = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 const SESSION_ID_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
-const SESSION_ANCHOR_MS = Date.UTC(2026, 0, 1);
-const SESSION_SPREAD_MS = 180 * 86_400_000;
-const ID_TIME_MASK = (1n << 48n) - 1n;
+const SESSION_PREFIX_MASK = (1n << 48n) - 1n;
+const SESSION_TIME_MASK = (1n << 36n) - 1n;
+function descendingTimeHex(time, counterValue) {
+  return (~(BigInt(time) * 0x1000n + BigInt(counterValue)) & SESSION_PREFIX_MASK)
+    .toString(16).padStart(12, '0');
+}
 function stableSessionId(signal) {
   const digest = crypto.createHash('sha256').update(`ses\0${signal}`).digest();
-  const timestamp = SESSION_ANCHOR_MS - (digest.readUIntBE(0, 6) % SESSION_SPREAD_MS);
-  // 计数器固定 1:官方每毫秒从 1 起数。实测同一时间戳下 counter=1 过门槛,
-  // 255 / 1469 / 2048 一律 403 —— 时间字段的低 12 位不能拿来装哈希熵。
-  const time = ~((BigInt(timestamp) << 12n) + 1n) & ID_TIME_MASK;
+  const time = BigInt(`0x${digest.subarray(0, 5).toString('hex')}`) & SESSION_TIME_MASK;
+  const prefix = descendingTimeHex(time, 1);
   let alnum = '';
-  for (let i = 0; i < 14; i++) alnum += SESSION_ALNUM[digest[8 + i] % 62];
-  return `ses_${time.toString(16).padStart(12, '0')}${alnum}`;
+  for (let i = 6; i < 20; i++) alnum += SESSION_ALNUM[digest[i] % 62];
+  return `ses_${prefix}${alnum}`;
 }
 
 let lastRequestTimestamp = 0;
 let requestCounter = 0;
 
-/**
- * 对齐 OpenCode v1.18.35 的 Identifier.create:6 字节时间/计数器 + 14 位 Base62。
- * 官方 x-opencode-request 是 user message ID;已有值由 identityHeaders 保留,
- * 网关仅在缺值及显式后端重抽时生成新值,普通网络重试继续使用原 ID。
- */
+/** Legacy private sampler for the backend-pin retry; v2 transport strips it. */
 function newRequestId() {
   const timestamp = Date.now();
   requestCounter = timestamp === lastRequestTimestamp ? requestCounter + 1 : 1;
@@ -498,15 +481,9 @@ function newRequestId() {
 }
 
 /**
- * 合成 OpenCode CLI 的身份头(实验开关,默认关)。
- *
- * 为什么值得试:上游的 prompt cache 很可能按会话/客户端身份分桶,而我们出站
- * 一直是裸 `User-Agent: node`。补上真实 CLI 的那组头之后能不能拿到缓存
- * usage,是这个开关唯一要观察的事 —— 它不改额度、也不改节点调度。
- *
- * request/session ID 必须在同一个客户端请求的多次节点重试之间保持不变:
- * 每次重试换一个 ID 的话,上游看到的就是几个互不相干的新会话,缓存必然不命中,
- * 这个实验也就白做了。所以在 handleChat 里构造一次,再传给每次尝试。
+ * 构造 OpenCode v2 的出站身份。session 必须在同一客户端请求的节点重试之间保持
+ * 不变,否则 prompt cache 和节点 affinity 都会丢。可选的 client/project 头由面板
+ * 开关控制; v2 必需的 UA、session、session-id、affinity 和通用 session-id 始终保留。
  */
 export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
   const h = {};
@@ -525,35 +502,32 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
 
   const out = { ...IDENTITY_DEFAULTS };
   for (const [name, dflt] of Object.entries(IDENTITY_DEFAULTS)) {
-    // User-Agent 不接受客户端透传。以前它是「客户端带就转发、没带才补默认」的
-    // 普通头,现在它是**准入门槛**:上游免费层要求首 token 是 opencode/<version>,
-    // 而真实客户端(claude-cli、codex…)永远会带自己的 UA,于是默认值从来轮不到
-    // 生效 —— 网关实测发出去的是 `claude-cli/1.0.0`,换来一个 403。
-    // 其余身份头(client/project)没有形状要求,照旧优先用客户端给的。
-    out[name] = name === 'User-Agent' ? dflt : (pick(name.toLowerCase()) || dflt);
+    if (name === 'User-Agent') {
+      const ua = pick('user-agent');
+      out[name] = validOpencodeUa(ua) ? ua : dflt;
+    } else {
+      out[name] = pick(name.toLowerCase()) || dflt;
+    }
   }
   const body = inbound?.body;
   // body 里的两个入口同样要洗 —— 它们不经入站头解析器,所以 CR/LF 和中文都能活着
-  // 走到这里(头那条路会先被 Node 的入站解析器 400 挡下)。洗完为空就当没给,
-  // 退回对话哈希/uuid,而不是拿个空串当 session。
+  // 走到这里。洗完为空就当没给,退回对话哈希/uuid,而不是拿个空串当 session。
   const explicitSession = pick('x-opencode-session-id', 'x-opencode-session', 'x-claude-code-session-id', 'x-session-id', 'conversation-id', 'x-session-affinity')
     || (typeof body?.conversation_id === 'string' ? headerSafe(body.conversation_id) : '')
     || (typeof body?.metadata?.session_id === 'string' ? headerSafe(body.metadata.session_id) : '');
   const seed = conversationSeed(body);
   const rawSession = explicitSession || (seed ? stableSessionId(seed) : uuid());
-  // 上游只接受固定形状的 session。客户端的 Claude/通用 session 通常是 UUID 或
-  // 自定义字符串,不能原样塞进 x-opencode-session;合法的 OpenCode ID 才透传,
-  // 其余按原值稳定哈希,既过门槛又保持同一对话跨请求/换节点不变。
+  // 上游只接受固定形状的 session。客户端的 Claude/通用 session 不能原样塞进
+  // x-opencode-session;合法的 OpenCode ID 才透传,其余按原值稳定哈希。
   const session = SESSION_ID_RE.test(rawSession) ? rawSession : stableSessionId(rawSession);
   out['x-opencode-session'] = session;
   out['x-opencode-session-id'] = session;
-  // 请求 ID 客户端给了就透传,没给就按 msg_ 形状造一个
-  out['x-opencode-request'] = pick('x-opencode-request') || newRequestId();
-  // 这两个没有合理的默认值,客户端没给就别凭空造
-  for (const n of ['x-session-id', 'x-title']) {
-    const v = pick(n);
-    if (v) out[n] = v;
-  }
+  out['x-session-affinity'] = session;
+  out['x-session-id'] = session;
+  // v2 明确拒绝 x-opencode-request;后端钉选的旧私有重抽值只在 reqOpts
+  // 进入 /inference/v1 时被剥掉,不让它污染免费层请求。
+  const title = pick('x-title');
+  if (title) out['x-title'] = title;
   return out;
 }
 
@@ -600,7 +574,7 @@ export class Gateway {
     this.metadata = new ModelMetadataStore({ file: MODELS_DEV_FILE, logger });
     this.metadataAttemptAt = 0;
     // opencode 官方能力目录(models.opencode.ai)。给原生协议(路由要它决定
-    // 打 /chat/completions 还是 /zen/v1/responses)和上下文上限的展示兜底。
+    // 打 /chat/completions 还是 /inference/v1/responses)和上下文上限的展示兜底。
     this.catalog = new OpencodeCatalog({ file: OPENCODE_CATALOG_FILE, logger });
     this.catalogAttemptAt = 0;
     this.catalogFetch = null;
@@ -1144,22 +1118,25 @@ export class Gateway {
           'invalid_request_error');
       }
     }
-    // 原生协议路由:muse-spark 1.2/1.3 这类模型的上游端点是 /zen/v1/responses,
-    // 打 chat 一律 500(实测)。客户端说 chat/anthropic 时,把上游那条腿换成
-    // Responses:body 翻成 Responses 形状发上去,回来的 response.* 事件由 sink 里的
-    // bridge 翻回 chat chunk —— validate/respond/collect 仍用客户端方言,对它透明。
-    // 客户端本来就说 Responses(codex 那类)的不动,它走原路。
+    // 原生协议路由:muse-spark 1.2/1.3 这类模型的上游端点是 /inference/v1/responses,
+    // 打 /inference/v1/chat/completions 一律 500(实测)。客户端说 chat/anthropic 时,
+    // 把上游那条腿换成 Responses:body 翻成 Responses 形状发上去,回来的 response.*
+    // 事件由 sink 里的 bridge 翻回 chat chunk —— validate/respond/collect 仍用客户端方言,
+    // 对它透明。客户端本来就说 Responses(codex 那类)的不动,它走原路。
     if (dialect !== RESPONSES && requestedModel && this.modelProtocol(requestedModel) === 'responses') {
       dialect = responsesUpstreamDialect(dialect);
     }
     const body = dialect.toUpstream(inbound, requestedModel ? this.modelMetadata(requestedModel) : null);
-    // 免费层准入:上游要求 stream:true 且 tools 里集齐五个核心工具名(见 dialects
-    // 的 gateChatBody / gateResponsesBody)。这一步必须紧跟在 toUpstream 之后 ——
-    // 它改的是**出站 body**,放在翻译之后才对得上形状。走 Responses 那条腿用扁平式
-    // tools(嵌套式回 400),chat 那条腿用嵌套式。客户端原生 Responses 和 System One
-    // 不过闸(body 由客户端负责;System One 塞了 stream/tools 反而 400)。
-    if (dialect.path === RESPONSES_PATH && dialect !== RESPONSES) gateResponsesBody(body);
-    else if (dialect.path === CHAT_PATH) gateChatBody(body);
+    // 免费层准入:上游要求 stream:true,并校验 OpenCode v2 的精确 read/shell 工具
+    // 定义。必须紧跟在 toUpstream 之后 —— 这一步改的是出站 body,且 Responses
+    // 与 chat 的工具形状不同。别名同时包住响应 sink,把客户端原名还回去。
+    if (dialect.path === RESPONSES_PATH) {
+      const gate = gateResponsesBody(body);
+      if (gate.aliases?.size) dialect = withToolAliases(dialect, gate.aliases);
+    } else if (dialect.path === CHAT_PATH) {
+      const gate = gateChatBody(body);
+      if (gate.aliases?.size) dialect = withToolAliases(dialect, gate.aliases);
+    }
 
     // 严格透传:客户端点哪个模型就发哪个,但只放行实时免费清单里的。
     // 以前这里无条件改写成一个固定模型 —— 客户端于是拿到的是另一个模型的回答,
@@ -1217,16 +1194,17 @@ export class Gateway {
     const effort = reasoningEffort(inbound, model);
     dialect.applyEffort(body, effort);
 
-    // 两种 OpenCode session 头与节点 affinity 共用同一个归一化会话。
-    // 即使完整身份头开关关闭,也必须保持这两个会话字段一致。
+    // v2 要求两种 x-opencode session 头同时存在;兼容开关只控制可选的
+    // client/project 等身份头,不控制会话和 affinity。
     const requestIdentity = identityHeaders({ headers: req.headers, body: inbound });
-    // UA 与稳定会话兼容不受实验开关控制;开关仍只管 client/project/request 等可选头。
     const identity = this.config.opencodeIdentityHeaders
       ? requestIdentity
       : {
           'User-Agent': requestIdentity['User-Agent'],
           'x-opencode-session': requestIdentity['x-opencode-session'],
           'x-opencode-session-id': requestIdentity['x-opencode-session-id'],
+          'x-session-affinity': requestIdentity['x-session-affinity'],
+          'x-session-id': requestIdentity['x-session-id'],
         };
     const affinityKey = this.affinity.key(requestIdentity['x-opencode-session'], model);
 
@@ -1492,7 +1470,7 @@ export class Gateway {
       if (!attemptRecorded) this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
       this.usage.record(body.model, null, false);
       this.logger('error', `[chat] HTTP ${status}: ${String(e?.body ?? e?.message ?? '').slice(0, 300)}`);
-      if (dialect === OPENAI || dialect === RESPONSES || dialect === SYSTEMONE) {
+      if (dialect.rawErrors) {
         let payload;
         try { payload = JSON.parse(e?.body); } catch { payload = { error: { message: `HTTP ${status}` } }; }
         return json(res, payload, status);
@@ -1790,27 +1768,28 @@ export class Gateway {
   // ── 出站 ──────────────────────────────────────────────
 
   /**
-   * 两个 forward 共用的请求选项。
-   *
-   * 不带 Authorization + User-Agent: node 是刻意的 —— zen 免费端点就认这个形态,
-   * 补上 Bearer 反而 401。额度按出口 IP 算,所以换 IP 才是有意义的动作。
-   *
-   * identity 非空时补上稳定 session;完整 identity 对象(实验开关开着)还会覆盖
-   * User-Agent 并补上 OpenCode 那组头。Authorization 始终不加入。
+   * Shared HTTPS options. v2 free inference uses the official public bearer,
+   * four-part UA, paired OpenCode session headers, and no v1 request ID.
+   * `/zen/v1/models` and System One keep their legacy transport shape.
    */
   reqOpts(bodyStr, { accept, timeout, identity = null, path = CHAT_PATH, agent = this.agent, signal = undefined }) {
+    const v2Inference = path.startsWith('/inference/v1/');
+    const forwarded = identity ? { ...identity } : {};
+    if (v2Inference) delete forwarded['x-opencode-request'];
+    const headers = {
+      'Content-Type': 'application/json',
+      Accept: accept,
+      'User-Agent': 'node',
+      ...forwarded,
+      'Content-Length': Buffer.byteLength(bodyStr),
+    };
+    if (v2Inference) headers.Authorization = 'Bearer public';
     return {
       host: OPENCODE_HOST,
       port: 443,
       path,
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: accept,
-        'User-Agent': 'node',
-        ...identity,
-        'Content-Length': Buffer.byteLength(bodyStr),
-      },
+      headers,
       agent,     // ← 真正经 mihomo 出站的地方(子 lane 传自己的 agent,走独立出口)
       timeout,
       signal,    // 客户端断开时由 attempt 触发,把在飞的上游请求一起断掉
@@ -1954,7 +1933,9 @@ export class Gateway {
       const bodyStr = JSON.stringify({ ...body, stream: true });
       const ttfb = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
       // 每次出站现读开关;仅影响尚未开始的响应,不打断在飞的流。
-      const pin = this.config.pinClaudeBackend !== false
+      // v2 strips x-opencode-request, so legacy response-id pinning cannot change
+      // the upstream sample and would retry the same backend until it falsely fails.
+      const pin = this.config.pinClaudeBackend !== false && !dialect.path.startsWith('/inference/v1/')
         ? PINNED_BACKENDS[String(body.model ?? '').trim()] : null;
 
       // 头一旦发出去,这个请求就不能重试了 —— 换节点重发等于把两半响应拼给

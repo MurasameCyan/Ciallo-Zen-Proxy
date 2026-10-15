@@ -302,23 +302,17 @@ openai-compatibility:
 | 节点池 | 从上往下就是网关接下来会用的顺序:没被限流过的按实测延迟排前,最近限流过的(即便已解冻)让到可用段末尾,免得它凭低延迟又插回队首、把后面还没轮到的节点一直压着。每行带延迟数字,当前节点标出来,冷却中的显示剩余秒数,测不通的划掉垫在最底下。冷却按出口地址算,所以同一台机器下的所有节点名会一起变成冷却态(见「冷却记在出口地址上」) |
 | 调用日志 | 默认折叠,标题那行写着最近多少条、Token、平均首字、平均耗时,以及累计的限流 / 超时 / 错误。展开后**每条成功的上游调用一行**:时刻、节点、模型、思考强度、首字、耗时、Token(入 / 出 / 推理) |
 
-**exo-free 后端锁定。** 模型名后的纯开关默认开启，点击立即保存，不用点「保存并应用」，重启后保留。开启时按实测响应 ID 前缀识别后端：只接受 `msg_`，遇到 `resp_` 就在同一节点换 `x-opencode-request` 重抽，保持 session 不变；最多重抽八次，仍未匹配或无法确认身份时返回 502，不悄悄放行其它后端。关闭后接受上游的随机后端。锁定可能增加等待和出站次数；开关对后续出站生效，不中断已经开始的响应。支持 Tab 聚焦、空格切换，保存失败会拨回原状态。
+**exo-free 后端锁定。** 实时免费清单当前不含 `exo-free`。旧的后端识别与重抽逻辑仍保留兼容，但 OpenCode v2 的 `/inference/v1` 请求不会发送已被上游拒绝的 `x-opencode-request`，所以它不为新入口伪造旧 v1 身份。
 
-**OpenCode 客户端身份兼容。** 已按官方 `v1.18.35` 的[请求构造](https://github.com/anomalyco/opencode/blob/53d1eabb61e21162157817bf677da0a4ad3332e3/packages/opencode/src/session/llm/request.ts#L177-L206)与[消息 ID 生成](https://github.com/anomalyco/opencode/blob/53d1eabb61e21162157817bf677da0a4ad3332e3/packages/opencode/src/id/id.ts#L16-L69)对齐，并用正式发行二进制抓包核对：
+**OpenCode v2 免费层兼容（2026-10-14）。** 上游把免费 Chat/Responses 推理从 `/zen/v1` 搬到 `/inference/v1`：分别走 `/inference/v1/chat/completions`、`/inference/v1/responses`；本项目的 Anthropic `/v1/messages` 仍按客户端方言翻成这两条上游腿，`/zen/v1/models` 仍是模型清单入口。
 
-- `x-opencode-session-id` 优先于旧会话头；清洗、归一化后，与 `x-opencode-session` 始终使用同一个值。关闭完整身份头开关也保留这两个会话字段，普通重试和后端重抽都不改变会话。
-- 网关生成的请求 ID 为 `msg_` + 12 位小写 hex（6 字节时间/计数器）+ 14 位 Base62。客户端已有的 request ID 保留，仅在缺失或显式后端重抽时生成新值。能力与可用性探针复用同一身份构造，并按模型隔离稳定会话。
-- UA 使用本次正式版抓包中的版本组合；不额外覆盖客户端的提示词、工具定义或输出预算，也不因这次兼容调整切换上游入口。
+- 出站 UA 默认为 `opencode/latest/2.0.29/cli`。只有完整的 `opencode/<channel>/<major>.<minor>.<patch>/<client>` 且 major ≥ 2 的下游 UA 才转发，旧 v1 UA 会被替换。
+- 免费推理发送 `Authorization: Bearer public`、`x-opencode-session`、`x-opencode-session-id`、`x-session-affinity`、`x-session-id`；不发送 `x-opencode-request`。身份开关仍只控制可选的 client/project 头。
+- 合成 session 的 12 位 hex 使用官方降序编码 `~(timeMs * 0x1000 + 1)`；从客户端会话提示派生时只取 36 位时间字段，避免把哈希熵塞进毫秒内计数器而触发 `FreeTierError`。
+- 免费请求必须带 OpenCode v2 的精确 `read` 与 `shell` 工具定义。网关不再发送旧的五工具 stub；缺少的定义按 CLI 原文补上，并在 system/instructions 中标记为 placeholder，避免模型真的调用网关没有实现的工具。
+- 客户端自己的工具原样保留。若客户端正好把不同 schema 的工具命名为 `read` 或 `shell`，出站临时改成 `read_client` / `shell_client`（重名递增），历史调用和响应再恢复原名；`Read`、`Bash` 等大小写不同的名字不改。
 
-这组修正让 `ling-3.1-flash-free` 恢复可用。2026-10-08 在同一个隔离出口、同一份请求体上对照：发布版身份头（缺 `x-opencode-session-id`、旧 UA、旧 request ID 形状）回 429 `Endpoint is unavailable.`，修正后回 200 并拿到回答。随后经本网关走真实上游，Chat 与 Anthropic 两种协议、流式与非流式四种组合，加上可用性/能力探针共用的那条出站路径，全部 200；出站入口仍是 `/inference/openai/v1/chat/completions`，客户端的 `legacy` 会话头不会顶掉规范会话头。
-
-`/v1/responses` 这条腿不受此修正影响：上游对免费层的 Responses 入口在 `/zen/v1/responses` 和 `/inference/openai/v1/responses` 上一律回 403 `FreeTierError`，与身份头无关。
-
-**会话 ID 的时间字段（2026-10-13）。** 当天起，免费模型对网关几乎一律回 403 `FreeTierError`（`OpenCode's free tier can only be used from within OpenCode`），只有 `jev-1.13-free` 和 `longcat-2.5-preview-free` 的探针还是绿的。面板探针随之大面积变灰，真实调用换满 6 个节点后报 `No usable upstream node`。拿官方 `v1.19.0` 正式发行二进制抓包，在同一隔离出口上单变量消融：上游开始把 `ses_` 后那 12 位 hex 按官方 `Identifier.descending` 解码，**降序编码且毫秒内计数器为 1** 才放行；网关原先直接从 sha256 切出这 12 位，升序编码、或计数器取 255/1469/2048 也同样 403。时间本身不卡：3 年前到 2 年后的时间戳都能过。修正后的合成会话 ID 用固定锚点（2026-01-01）减去由哈希得出、不超过 180 天的偏移，再按降序编码，计数器固定为 1；后 14 位仍由哈希派生。所以同一对话、换节点重试拿到的仍是同一个 ID，也不读系统时钟。客户端自带的合法 `ses_` 原样透传，不受影响。
-
-同一出口、同一请求体上，修正后 `big-pickle`、`step-5-preview-free`、`mimo-v2.6-flash-free`、`cat-jam-free` 的探针都拿到回答。`ling-3.1-flash-free` 这段时间频繁回 429 `Endpoint is unavailable.`，官方 CLI 交错对照的比例相同（各 6 次：官方 2 次 200，网关 1~2 次 200）。官方 CLI 能成功只是因为它自己会重试，这是供应商侧容量问题，和身份无关。出站路径和 UA 都没改：官方 1.19.0 改走 `/inference/v1/chat/completions`、带 `Authorization: Bearer public`，但这两项消融后都不影响结果。
-
-这也不等于确认 `exo-free` 当前可用。2026-10-08 的隔离出口实测中，官方 CLI `1.18.35` 也收到 `Upstream request failed: Endpoint is unavailable.`；完整官方请求回放到 `/zen/v1/chat/completions` 和 `/inference/openai/v1/chat/completions` 均返回 503。新 inference 服务的准入与 provider 实际配置未在所查公开源码中提供，不能仅凭这条错误认定「限定客户端」，也不能把失败伪写成能力记录。
+这几项是免费层准入形状，不是普通协议转换。客户端非流式请求仍由网关收上游流后拼回 JSON；Chat、Responses、Anthropic 三种入口共用同一套 v2 身份与工具处理。上游返回真实配额/供应商错误时，网关仍按错误原文分类，不把 `200` 外壳或 `403 FreeTierError` 误记成成功。
 
 **登录。** 没登录时任何页面都会被送到 `/login`,填 `PANEL_USER` / `PANEL_PASS`。这是面板自己的一页,不是浏览器那个凭据弹框 —— 弹框是 401 响应里的 `WWW-Authenticate` 头带出来的,样式不可控、密码错了给不出自己的提示、想退出只能关浏览器。现在服务端一律不发这个头,所以浏览器不再弹框。
 

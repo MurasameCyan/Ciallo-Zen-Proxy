@@ -23,11 +23,11 @@ export function isModelUnavailableError(status, body) {
 /**
  * 免费层准入门(403 FreeTierError:「can only be used from within OpenCode」)。
  *
- * 上游要求 cli UA、形状正确的 session 和集齐五个核心工具名(见
- * identityHeaders / gateChatBody / gateResponsesBody)。客户端带来的 UUID 或自定义
- * session 不能直接拿来当上游 session；identityHeaders 会保留合法的 OpenCode 形状，
- * 其余按原值稳定哈希后再发。剩下的 403 仍可能是上游按出口/时间窗做的间歇性抽检，
- * 所以它该被当成可重试(换出口重发)，而不是 terminal 直接甩给客户端。
+ * v2 上游要求 inference/v1 路径、完整的四段 cli UA、配对的 session 头，以及
+ * 精确的 `read` / `shell` 工具定义(见 identityHeaders / gate*Body)。客户端带来的
+ * UUID 或自定义 session 不能直接拿来当上游 session;identityHeaders 会保留合法的
+ * OpenCode 形状,其余按原值稳定哈希后再发。剩下的 403 仍可能是上游按出口/时间窗
+ * 做的间歇性抽检,所以它该被当成可重试(换出口重发),而不是 terminal 直接甩给客户端。
  *
  * 若把这类 403 当 terminal，会让用户在一次抽检上原地失败，隔壁节点明明能过。
  * 若 session 形状非法，则所有节点都会稳定拒绝；归一化逻辑在身份头构造处处理。

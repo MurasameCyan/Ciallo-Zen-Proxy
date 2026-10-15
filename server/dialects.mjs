@@ -9,24 +9,22 @@
 import {
   anthropicToOpenAI, openAIToAnthropic, anthropicError, errTypeFor, AnthropicStream,
 } from './anthropic.mjs';
+import { applyFingerprintTools, aliasSseSink } from './opencode-fingerprint.mjs';
 import { json } from './http-util.mjs';
 
 export const OPENCODE_HOST = 'opencode.ai';
-// 免费层入口在 2026-09-18~19 之间搬到了 /inference/openai/v1/*:老路径
-// /zen/v1/chat/completions 现在对免费模型一律 403 FreeTierError,新路径在
-// 同样的头 + body 形状下回 200。实测见容器内对照(/inference/openai/v1/
-// chat/completions 200 vs /zen/v1/chat/completions 403)。
-export const CHAT_PATH = '/inference/openai/v1/chat/completions';
-// 上游原生支持 Responses API,走这条透传而不是翻译成 chat 再转回来(实测见
-// zen-responses-native)。方言各自带上游 path,轮换逻辑不用知道自己在服务哪个。
-// 新入口下的 responses 目前回 503 Endpoint is unavailable,所以仍指向老路径,
-// 等它恢复再切。
-export const RESPONSES_PATH = '/zen/v1/responses';
-// TypeSafe System One(jev 系分类器)的原生入口。和上面两条不是一类:非流式、
-// 一问一答,body 原样透传。2026-10-06 实测 jev-1.13-free 打这里 200(cost "0"),
-// 打 /chat/completions 回 400 ModelProtocolUnsupported、打 /zen/v1/chat/completions 500。
+// OpenCode v2 free-tier traffic moved to /inference/v1/* on 2026-10-14.
+// /zen/v1 remains the public model catalog and no-auth legacy paid surface, but
+// free inference there now returns FreeTierError.
+export const CHAT_PATH = '/inference/v1/chat/completions';
+// Native Responses models use the same v2 inference service.
+export const RESPONSES_PATH = '/inference/v1/responses';
+// TypeSafe System One (jev 系分类器) remains a separate non-streaming endpoint.
 export const SYSTEMONE_PATH = '/zen/v1/systemone';
 export const MODELS_PATH = '/zen/v1/models';
+const isObject = (value) => value && typeof value === 'object' && !Array.isArray(value);
+
+
 
 
 /**
@@ -165,107 +163,32 @@ export function assembleFromAnthropicEvents(sseText, model = '') {
 }
 
 /**
- * 免费层准入的 body 条件。**这是门槛,不是优化。**
- *
- * 2026-09-19 容器内实测(/inference/openai/v1/chat/completions,不带任何凭证):
- *   stream:false + 无 tools / 5 tools   -> 403 FreeTierError
- *   stream:true  + 无 tools             -> 403
- *   stream:true  + 5 个核心工具名        -> **200 OK**
- *
- * 两个条件,缺一不可:
- *   1. body 里 stream 必须是 true
- *   2. tools 里必须**集齐 OpenCode 那五个核心工具名**:
- *      bash / edit / glob / grep / read
- *
- * 第 2 条容易搞错,这里记下实测过程:先按「总数 ≥5 且其中 ≥2 个核心名」实现,
- * 结果 403。逐项消融才看清真正的规则 —— 核心名**必须五个都在**:
- *
- *   5 个核心名              -> 200
- *   3 核心 + 2 个通用名      -> 403
- *   3 核心 + 2 个任意真实词   -> 403
- *   5 核心 + 5 个任意词      -> 200   ← 多余的工具名无害
- *
- * 所以是「五个核心名齐了就行」,多出来的工具不影响。注意别被旧资料带偏:
- * oh-my-pi #12306 里那份 bisection 说的是 /zen/v1 那条老路的规则(5 个核心名中
- * 有 2 个即可),对新端点不成立。
- *
- * 注入的 stub 只求名字对得上:实测 schema 和 description 完全不被校验(用
- * "x" 和一句废话都能过)。所以 stub 只是个占位,模型看不到有意义的描述,
- * 也就不会去调它。客户端自带的工具原样保留在前面。
- */
-const GATE_CORE_TOOLS = ['bash', 'edit', 'glob', 'grep', 'read'];
-
-const isObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
-
-/** 从一条 tool 定义里取名字,兼容 OpenAI 的嵌套式和 Responses 的扁平式 */
-function toolName(tool) {
-  if (!isObject(tool)) return '';
-  if (typeof tool.name === 'string') return tool.name;
-  if (isObject(tool.function) && typeof tool.function.name === 'string') return tool.function.name;
-  return '';
-}
-
-const gatedTool = (name) => ({
-  type: 'function',
-  function: {
-    name,
-    description: 'Tool available for this session.',
-    parameters: { type: 'object', properties: {}, required: [] },
-  },
-});
-
-/**
- * 把出站 body 补齐到能过免费层的形状。返回 {forcedStream, injected},
- * 调用方据此决定响应怎么回(forcedStream 且客户端要非流式 → 得缓冲后拼回 JSON)。
+ * 免费层准入。v2 /inference/v1 要求 stream:true,并且 tools 中带有 OpenCode
+ * 自己的 `read` 与 `shell` 定义；定义必须和 CLI 的 description/parameters 一致。
+ * applyFingerprintTools 还处理客户端工具与这两个保留名冲突时的别名。
  */
 export function gateChatBody(body) {
   const forcedStream = body.stream !== true;
   if (forcedStream) body.stream = true;
-
-  const tools = Array.isArray(body.tools) ? body.tools : [];
-  const present = new Set(tools.map(toolName));
-
-  let injected = 0;
-  for (const name of GATE_CORE_TOOLS) {
-    if (present.has(name)) continue;
-    tools.push(gatedTool(name));
-    present.add(name);
-    injected++;
-  }
-  if (injected) body.tools = tools;
-  return { forcedStream, injected };
+  const aliases = applyFingerprintTools(body, false);
+  return { forcedStream, aliases };
 }
 
-/** 门禁工具的 Responses 扁平式。/zen/v1/responses 只认这种(嵌套式回 400,实测)*/
-const gatedResponsesTool = (name) => ({
-  type: 'function',
-  name,
-  description: 'Tool available for this session.',
-  parameters: { type: 'object', properties: {}, required: [] },
-  strict: false,
-});
-
-/**
- * Responses body 的免费层准入。和 gateChatBody 同一道门槛(stream:true + 集齐
- * 五个核心工具名),差别只有 tools 的形状:Responses 用扁平式 {type,name,...},
- * 嵌套式 {type,function:{name}} 会被上游判成 400 invalid_request_error(实测)。
- */
+/** Responses tools 使用扁平式 {type,name,description,parameters}。 */
 export function gateResponsesBody(body) {
   const forcedStream = body.stream !== true;
   if (forcedStream) body.stream = true;
+  const aliases = applyFingerprintTools(body, true);
+  return { forcedStream, aliases };
+}
 
-  const tools = Array.isArray(body.tools) ? body.tools : [];
-  const present = new Set(tools.map(toolName));
-
-  let injected = 0;
-  for (const name of GATE_CORE_TOOLS) {
-    if (present.has(name)) continue;
-    tools.push(gatedResponsesTool(name));
-    present.add(name);
-    injected++;
-  }
-  if (injected || tools.length) body.tools = tools;
-  return { forcedStream, injected };
+/** Restore request-local aliases before any client-specific sink translates output. */
+export function withToolAliases(dialect, aliases) {
+  if (!aliases?.size) return dialect;
+  return {
+    ...dialect,
+    sink: (res, model) => aliasSseSink(dialect.sink(res, model), aliases),
+  };
 }
 
 /** chat 的 tool 定义(嵌套式)→ Responses 的扁平式 */
@@ -302,9 +225,9 @@ function chatContentToResponses(content, textType) {
 /**
  * chat body → Responses body。
  *
- * 为什么需要:muse-spark 1.2/1.3 这类模型的原生端点是 /zen/v1/responses,打
- * /chat/completions 一律 500(实测)。但客户端(Claude Code / OpenAI SDK)发来的
- * 是 chat/messages 形状,经 dialect.toUpstream 归一成 chat body 之后,这里再翻成
+ * 为什么需要:muse-spark 1.2/1.3 这类模型的原生端点是 /inference/v1/responses,打
+ * /inference/v1/chat/completions 一律 500(实测)。但客户端(Claude Code / OpenAI SDK)
+ * 发来的是 chat/messages 形状,经 dialect.toUpstream 归一成 chat body 之后,这里再翻成
  * Responses 形状发上去。回来的 response.* 事件由 ResponsesToChatStream 翻回 chat
  * chunk,于是对客户端和对下游 sink 都还是 chat —— 整条 Responses 腿是透明的。
  *
@@ -354,6 +277,17 @@ export function chatToResponsesBody(chatBody) {
   if (Array.isArray(src.tools) && src.tools.length) {
     const tools = src.tools.map(chatToolToResponses).filter(Boolean);
     if (tools.length) out.tools = tools;
+  }
+  const choice = src.tool_choice;
+  if (typeof choice === 'string') {
+    out.tool_choice = choice;
+  } else if (isObject(choice) && typeof choice.type === 'string') {
+    if (choice.type === 'function') {
+      const fn = isObject(choice.function) ? choice.function : choice;
+      if (typeof fn.name === 'string' && fn.name) out.tool_choice = { type: 'function', name: fn.name };
+    } else {
+      out.tool_choice = { ...choice };
+    }
   }
   // 上限字段改名;Responses 用 max_output_tokens。有个硬下限:实测 Responses 端点
   // 要求 `max_output_tokens >= 16`(muse-spark 报「The number must be >= 16」),
@@ -466,6 +400,7 @@ function downgradeOpenAIAttachments(body, meta, textType) {
  */
 export const OPENAI = {
   name: 'openai',
+  rawErrors: true,
   path: CHAT_PATH,
   /** 客户端选哪个模型就用哪个 —— handleChat 已经拿实时免费清单挡过一道了 */
   toUpstream: (body, meta) => downgradeOpenAIAttachments(body, meta, 'text'),
@@ -513,6 +448,7 @@ export const ANTHROPIC = {
  */
 export const RESPONSES = {
   name: 'responses',
+  rawErrors: true,
   path: RESPONSES_PATH,
   // OpenAI SDK 允许 input 是字符串,但上游只认数组(纯字符串 → 400 Empty input
   // messages),所以先补成数组;明确的纯文本模型再把附件换成 input_text 占位。
@@ -555,6 +491,7 @@ export const RESPONSES = {
  */
 export const SYSTEMONE = {
   name: 'systemone',
+  rawErrors: true,
   path: SYSTEMONE_PATH,
   unary: true,
   toUpstream: (body) => {
@@ -654,7 +591,7 @@ function anthropicSink(res, model) {
  * Responses 事件流 → chat.completion.chunk 事件流的**在线**翻译器。
  *
  * 用途:muse-spark 这类原生 Responses 模型,被 chat/anthropic 客户端点到时,
- * 上游那条腿走 /zen/v1/responses(见 chatToResponsesBody),吐回来的是 response.*
+ * 上游那条腿走 /inference/v1/responses(见 chatToResponsesBody),吐回来的是 response.*
  * 事件。这个类边收边翻成 chat chunk,喂给客户端方言原本的 sink —— 于是 OPENAI
  * 客户端拿到标准 chat 流,ANTHROPIC 客户端由它的 sink 再翻成 Messages 事件,
  * 两条路都不用知道上游其实是 Responses。收尾拼装也照旧:缓冲里落的是翻译后的
@@ -852,7 +789,7 @@ export function bridgeResponsesToChat(inner, model) {
  * 只覆盖上游那条腿相关的三件事,其余(validate/respond/collect/fail)全用客户端
  * 方言的 —— 因为 sink 这一层已经把 Responses 翻回了 chat chunk,缓冲里落的东西
  * 和客户端方言原本期待的完全一致,collect/respond 不用改。
- *   path       → /zen/v1/responses
+ *   path       → /inference/v1/responses
  *   toUpstream → 先按客户端方言归一成 chat body,再翻成 Responses body
  *   applyEffort→ 嵌套 reasoning.effort(Responses 的写法)
  *   sink       → bridge 包住客户端方言原本的 sink

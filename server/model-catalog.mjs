@@ -5,8 +5,8 @@
  *
  *   1. 原生协议。目录不写 `protocol` 字段,但 provider 的 `npm` 唯一决定它:
  *        @ai-sdk/openai              → responses(muse-spark 1.2/1.3 就是这种,
- *                                       打 /chat/completions 一律 500,只有
- *                                       /zen/v1/responses 才 200 —— 实测见对照)
+ *                                       打 /inference/v1/chat/completions 一律 500,只有
+ *                                       /inference/v1/responses 才 200 —— 实测见对照)
  *        @ai-sdk/openai-compatible   → chat(big-pickle / nemotron / deepseek 等)
  *        @ai-sdk/anthropic           → messages(付费的 claude 系,免费清单里没有)
  *      模型条目自己也可能带 provider.npm 覆盖 provider 默认值,取值时先看模型级。

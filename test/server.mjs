@@ -14,6 +14,7 @@
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -38,6 +39,7 @@ const {
   StreamKeepAlive, SSE_HEARTBEAT_MS, MODELS_TTL_MS, DEAD_NODE_REVIVE_MS,
   sniffBackendId, backendMismatch,
 } = await import('../server/gateway.mjs');
+const { chatToResponsesBody, withToolAliases } = await import('../server/dialects.mjs');
 const { buildMihomoYaml, load, genApiKey, MIXED_PORT, CTRL_PORT } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
 const { connectTunnel } = await import('../server/proxy.mjs');
@@ -741,69 +743,50 @@ await t('calls 坏成对象/字符串时退回空数组,不让面板拿着它去
 
 // ── OpenCode 身份头 ─────────────────────────────────────
 
-await t('身份头:User-Agent 用我们的,其余缺的补默认、客户端给了的优先', () => {
+await t('身份头:v2 UA 与身份字段按官方形状输出', () => {
   const h = identityHeaders({ headers: { 'x-opencode-project': 'my-proj' } }, () => 'uuid-1');
-  // UA 刻意不接受客户端透传:上游免费层要求首 token 是 opencode/<version>
-  // (低于 1.18.0 回 426),而真实客户端永远会带自己的 UA。这条断言的意义就是
-  // 挡住「把它改回透传」—— 那会让所有请求吃 403,而且很难查。
-  assert.match(h['User-Agent'], /^opencode\/\d+\.\d+\.\d+/);
+  assert.equal(h['User-Agent'], 'opencode/latest/2.0.29/cli');
   assert.equal(h['x-opencode-client'], 'cli');
   assert.equal(h['x-opencode-project'], 'my-proj', '客户端值优先');
   assert.match(h['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  assert.equal(h['x-opencode-session-id'], h['x-opencode-session']);
+  assert.equal(h['x-session-affinity'], h['x-opencode-session']);
+  assert.equal(h['x-session-id'], h['x-opencode-session']);
+  assert.equal(h['x-opencode-request'], undefined, 'v2 明确拒绝旧 request ID');
   assert.equal(h['x-title'], undefined, '没合理默认值的就别凭空造');
 });
 
-await t('合成的会话 ID 按官方降序时间戳编码，解出合理时间且对同一对话稳定', () => {
-  // 2026-10-13 起上游对 12 位 hex 有方向要求:官方 Identifier.descending 形状能过,
-  // 升序编码和直接切哈希一律 403 FreeTierError。时间字段和官方一样截断到 48 位,
-  // 解码只能还原 ts mod 2^36,所以按模比较:合成值必须落在锚点前 180 天内。
+await t('合成的会话 ID 使用官方降序编码且计数器固定为 1', () => {
   const mask = (1n << 48n) - 1n;
-  const window = 2 ** 36;
-  const decode = (id) => Number((~BigInt(`0x${id.slice(4, 16)}`) & mask) >> 12n);
-  const anchor = Date.UTC(2026, 0, 1) % window;
   const seeds = [{ body: { messages: [{ role: 'user', content: 'Reply exactly PONG.' }] } },
     { headers: { 'x-opencode-session-id': 'probe-session:ling-3.1-flash-free' } },
     { headers: { 'x-claude-code-session-id': '6f1c2b8e-0d1a-4c7e-9a43-2f5b7c1d9e01' } }];
   for (const inbound of seeds) {
     const first = identityHeaders(inbound, () => 'unused')['x-opencode-session'];
     assert.match(first, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
-    const behind = ((anchor - decode(first)) % window + window) % window;
-    assert.ok(behind <= 180 * 86_400_000, `${first} 不在锚点前 180 天内(差 ${behind}ms)`);
-    // 低 12 位是官方的毫秒内计数器:实测只有 1 能过,装进哈希熵(255/1469/2048)一律 403
-    assert.equal(~BigInt(`0x${first.slice(4, 16)}`) & mask & 0xfffn, 1n, `${first} 计数器必须是 1`);
+    const decoded = ~BigInt(`0x${first.slice(4, 16)}`) & mask;
+    assert.equal(decoded & 0xfffn, 1n, `${first} 的降序前缀解码低位必须为 1`);
     assert.equal(identityHeaders(inbound, () => 'unused')['x-opencode-session'], first, '同一对话必须稳定');
   }
 });
 
-await t('请求 ID 可按官方六字节时间和计数器解码，同毫秒生成也不重复', () => {
-  const originalNow = Date.now;
-  const now = 1791440000123;
-  let ids;
-  try {
-    Date.now = () => now;
-    ids = [identityHeaders({}), identityHeaders({})].map(h => h['x-opencode-request']);
-  } finally {
-    Date.now = originalNow;
-  }
-  for (const id of ids) assert.match(id, /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
-  const encoded = ids.map(id => BigInt(`0x${id.slice(4, 16)}`));
-  assert.equal(encoded[0] >> 12n, BigInt(now) & 0xfffffffffn);
-  assert.equal(encoded[1], encoded[0] + 1n);
-  assert.notEqual(ids[0], ids[1]);
+await t('身份头:v2 不生成也不转发被上游拒绝的 x-opencode-request', () => {
+  const h = identityHeaders({ headers: { 'x-opencode-request': 'msg_0123456789abcdef0123456789' } });
+  assert.equal(h['x-opencode-request'], undefined);
 });
 
-await t('身份头:UA 版本不低于上游下限(低于 1.18.0 会被 426 挡回)', () => {
+await t('身份头:UA 必须是 major >= 2 的四段 OpenCode 形状', () => {
   const h = identityHeaders({ headers: {} }, () => 'u');
-  const m = /^opencode\/(\d+)\.(\d+)\.(\d+)/.exec(h['User-Agent']);
-  assert.ok(m, `UA 首 token 必须是 opencode/<version>,实际 ${h['User-Agent']}`);
-  const [, major, minor] = m.map(Number);
-  assert.ok(major > 1 || (major === 1 && minor >= 18), `版本 ${major}.${minor} 低于上游要求 1.18`);
+  assert.match(h['User-Agent'], /^opencode\/[a-z0-9-]+\/\d+\.\d+\.\d+\/[a-z0-9-]+$/i);
+  const m = /^opencode\/[a-z0-9-]+\/(\d+)\./i.exec(h['User-Agent']);
+  assert.ok(Number(m[1]) >= 2);
 });
 
-await t('身份头:客户端自带的 UA 不会被透传(带了自己的 UA 也一样)', () => {
-  const h = identityHeaders({ headers: { 'user-agent': 'claude-cli/2.0.0' } }, () => 'u');
-  assert.match(h['User-Agent'], /^opencode\//, '客户端 UA 必须被替换掉');
-  assert.ok(!h['User-Agent'].includes('claude-cli'), '不能把客户端 UA 混进来');
+await t('身份头:只转发完整的 v2 客户端 UA', () => {
+  const v1 = identityHeaders({ headers: { 'user-agent': 'opencode/1.18.35' } }, () => 'u');
+  assert.equal(v1['User-Agent'], 'opencode/latest/2.0.29/cli');
+  const v2 = identityHeaders({ headers: { 'user-agent': 'opencode/latest/2.0.29/cli' } }, () => 'u');
+  assert.equal(v2['User-Agent'], 'opencode/latest/2.0.29/cli');
 });
 
 await t('身份头:读入站头大小写不敏感', () => {
@@ -868,7 +851,7 @@ await t('OpenCode session-id 优先于旧头，两种出站会话头始终一致
   }
 });
 
-await t('能力探针按模型隔离会话，每次探测使用独立的合法消息 ID', () => {
+await t('能力探针按模型隔离会话，并发送完整 v2 会话头', () => {
   const gateway = new Gateway(load(), () => {});
   const first = gateway.identity('exo-free');
   const next = gateway.identity('exo-free');
@@ -877,9 +860,10 @@ await t('能力探针按模型隔离会话，每次探测使用独立的合法�
   assert.notEqual(first['x-opencode-session'], other['x-opencode-session']);
   for (const h of [first, next, other]) {
     assert.equal(h['x-opencode-session-id'], h['x-opencode-session']);
-    assert.match(h['x-opencode-request'], /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    assert.equal(h['x-session-affinity'], h['x-opencode-session']);
+    assert.equal(h['x-session-id'], h['x-opencode-session']);
+    assert.equal(h['x-opencode-request'], undefined);
   }
-  assert.notEqual(first['x-opencode-request'], next['x-opencode-request']);
 });
 
 await t('身份头:所有显式 session 来源都归一成稳定的上游格式', () => {
@@ -933,8 +917,7 @@ await t('身份头:没有显式 session 时按第一条 user 内容生成稳定 
   assert.equal(first['x-opencode-session'], grown['x-opencode-session'],
     '对话增长后第一条 user 不变,session 就必须不变');
   assert.notEqual(first['x-opencode-session'], other['x-opencode-session']);
-  assert.notEqual(first['x-opencode-request'], grown['x-opencode-request'],
-    '同一对话的两轮请求 ID 不同(它按请求生成,不像 session 按对话稳定)');
+  assert.equal(first['x-opencode-request'], undefined, 'v2 不再生成请求 ID');
 });
 
 await t('身份头的值必须洗掉 Node 不认的字符 —— 否则一个畸形 body 字段能烧掉整轮重试', () => {
@@ -1035,10 +1018,12 @@ await t('完整身份头开关关闭时,UA 与稳定 session 仍必须发(它们
   const req = Readable.from([JSON.stringify(body)]);
   req.headers = {};
   await g.handleChat(req, fakeRes(), OPENAI);
-  // 这两条 2026-09-19 起是上游免费层的准入条件,不再受实验开关控制:
-  // 关了开关就不发的话,每个请求都会吃 403 FreeTierError。
+  // v2 的四段 UA 与三组会话字段是免费层请求形状,不受实验开关控制。
   assert.match(sent?.['x-opencode-session'] || '', /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
-  assert.match(sent?.['User-Agent'] || '', /^opencode\/\d+\.\d+\.\d+/);
+  assert.match(sent?.['User-Agent'] || '', /^opencode\/[a-z0-9-]+\/\d+\.\d+\.\d+\/[a-z0-9-]+$/i);
+  assert.equal(sent?.['x-opencode-session-id'], sent?.['x-opencode-session']);
+  assert.equal(sent?.['x-session-affinity'], sent?.['x-opencode-session']);
+  assert.equal(sent?.['x-session-id'], sent?.['x-opencode-session']);
   assert.equal(sent?.['x-opencode-client'], undefined, '可选的那几个仍受开关控制');
   assert.equal(sent?.['x-opencode-project'], undefined, '可选的那几个仍受开关控制');
 });
@@ -1063,7 +1048,7 @@ await t('文本模型附件降级接入真实 Messages 请求流,未知模态仍
     })]);
     req.headers = {};
     await g.handleMessages(req, fakeRes());
-    return sent.messages[0].content;
+    return sent.messages.find((message) => message.role === 'user').content;
   };
 
   assert.equal(await run({ inputModalities: ['text'] }), '[image attached]\n[document attached]\n解释附件');
@@ -1093,7 +1078,7 @@ await t('请求体跨 UTF-8 分片时保留中文,不把多字节字符替换成
   req.headers = {};
   await g.handleChat(req, fakeRes(), OPENAI);
 
-  assert.equal(sent.messages[0].content, '它有检查清单',
+  assert.equal(sent.messages.find((message) => message.role === 'user').content, '它有检查清单',
     '跨 chunk 的 UTF-8 字符必须原样进入上游 body');
 });
 
@@ -1454,19 +1439,72 @@ await t('lane:子 lane 请求成功后 release,主 lane 不受影响', async () 
   assert.equal(g.lanes.children().length, 1, '子 lane 仍存活,等待空闲回收');
 });
 
-await t('reqOpts:不带身份头时 UA 是 node(models.dev 等公开端点);带身份头时被覆盖成可信 UA', () => {
+await t('reqOpts:v2 inference 使用 public bearer,并剥掉旧 request ID', () => {
   const g = new Gateway(load(), () => {});
   const off = g.reqOpts('{}', { accept: '*/*', timeout: 1000 });
+  assert.equal(off.path, '/inference/v1/chat/completions');
+  assert.equal(RESPONSES.path, '/inference/v1/responses');
   assert.equal(off.headers['User-Agent'], 'node');
   assert.equal(off.headers['x-opencode-client'], undefined);
-  assert.equal(off.headers.Authorization, undefined, '免费端点认的就是「不带 Bearer」这个形态');
+  assert.equal(off.headers.Authorization, 'Bearer public');
 
-  const on = g.reqOpts('{}', { accept: '*/*', timeout: 1000, identity: identityHeaders({ headers: {} }) });
-  // 免费层要求 UA 首 token 是 opencode/<version>,身份头必须盖掉默认的 node
-  assert.match(on.headers['User-Agent'], /^opencode\/\d+\.\d+\.\d+/);
+  const on = g.reqOpts('{}', {
+    accept: '*/*',
+    timeout: 1000,
+    identity: { ...identityHeaders({ headers: {} }), 'x-opencode-request': 'msg_old' },
+  });
+  assert.equal(on.headers['User-Agent'], 'opencode/latest/2.0.29/cli');
   assert.equal(on.headers['x-opencode-client'], 'cli');
+  assert.equal(on.headers['x-session-affinity'], on.headers['x-opencode-session']);
+  assert.equal(on.headers['x-session-id'], on.headers['x-opencode-session']);
+  assert.equal(on.headers['x-opencode-request'], undefined);
+  assert.equal(on.headers.Authorization, 'Bearer public');
   assert.equal(on.headers['Content-Length'], 2, 'Content-Length 排在身份头后面,不能被盖掉');
 });
+await t('Chat 转 Responses 保留并扁平化 tool_choice', () => {
+  const forced = chatToResponsesBody({
+    model: 'muse-spark-1.3-contributor-free',
+    messages: [{ role: 'user', content: 'hi' }],
+    tool_choice: { type: 'function', function: { name: 'read' } },
+  });
+  assert.deepEqual(forced.tool_choice, { type: 'function', name: 'read' });
+
+  const required = chatToResponsesBody({
+    model: 'muse-spark-1.3-contributor-free',
+    messages: [{ role: 'user', content: 'hi' }],
+    tool_choice: 'required',
+  });
+  assert.equal(required.tool_choice, 'required');
+});
+
+await t('v2 exo-free 不启用旧的后端钉选', async () => {
+  const originalRequest = https.request;
+  try {
+    https.request = (options, callback) => {
+      const request = new EventEmitter();
+      request.setTimeout = () => request;
+      request.destroy = () => request;
+      request.end = () => {
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.headers = {};
+        response.setTimeout = () => response;
+        callback(response);
+        response.emit('data', Buffer.from('data: {"id":"resp_gpt","object":"chat.completion.chunk","choices":[]}' + '\n\n'));
+        response.emit('end');
+      };
+      return request;
+    };
+    const g = new Gateway(load(), () => {});
+    g.config.pinClaudeBackend = true;
+    const res = fakeRes();
+    await g.forwardStream(res, { model: 'exo-free', messages: [] }, OPENAI, 10_000, null, {});
+    assert.equal(res.code, 200, 'v2 请求不应因 resp_ 首帧触发旧后端锁定失败');
+  } finally {
+    https.request = originalRequest;
+  }
+});
+
 
 await t('Gateway 选点:新会话一律粘 lockedNode,已有会话粘原节点', async () => {
   const g = new Gateway(load(), () => {});
@@ -1541,6 +1579,18 @@ function retryGateway(file, script) {
 }
 
 const BODY = { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'hi' }] };
+await t('工具别名不能改变 OpenAI 上游错误透传', async () => {
+  const upstream = { error: { message: 'bad tool', type: 'invalid_request_error', code: 'tool_schema', param: 'tools' } };
+  const g = retryGateway('sm-alias-error.json', () => {
+    throw { status: 400, body: JSON.stringify(upstream) };
+  });
+  const dialect = withToolAliases(OPENAI, new Map([['read_client', 'read']]));
+  const res = fakeRes();
+  await g.attempt(res, { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'hi' }] },
+    ['A'], 'A', false, dialect, Date.now() + 60_000);
+  assert.deepEqual(JSON.parse(res.body), upstream);
+});
+
 
 await t('客户端断开:在飞的上游请求被 abort,而且不再换节点重发', async () => {
   // 少了这条,取消一个长推理请求会变成:res 已销毁而上游还在读,sink 往死
