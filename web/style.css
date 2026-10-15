@@ -604,15 +604,17 @@ input[readonly] { color: var(--fg-2); }
 
 .copyrow { display: flex; gap: 7px; }
 .copyrow input { flex: 1; min-width: 0; }
-/* 接入那行:四颗按钮平分一排。窄侧栏(340px)一排放不下四颗 12px 的按钮,
-   所以允许换行 —— 换成两行两颗,而不是把文字挤成省略号。flex-basis 给
-   一个够放「Anthropic 地址」的下限,免得换行后两颗宽度不一样。 */
-.copyrow.btns { flex-wrap: wrap; }
-.copyrow.btns .btn { flex: 1 1 96px; min-width: 0; white-space: nowrap; }
-/* 复制 Key / 重置 Key 两颗做小，给地址按钮腾空间 */
+/* 接入卡片的四颗操作按钮始终同排。紧凑字号和内边距让窄侧栏容纳完整文案；
+   地址按钮可伸缩,复制/重置 Key 保留较小宽度。 */
+.copyrow.btns { flex-wrap: nowrap; gap: 5px; }
+.copyrow.btns .btn { flex: 1 1 96px; min-width: 0; padding: 6px 4px; font-size: 11px; white-space: nowrap; }
 .copyrow.btns .btn:nth-child(3),
 .copyrow.btns .btn:nth-child(4) { flex: 0 1 auto; }
 
+@media (max-width: 400px) {
+  .copyrow.btns { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: stretch; }
+  .copyrow.btns .btn { flex: initial; padding: 5px 2px; font-size: 10px; line-height: 1.2; text-align: center; white-space: normal; }
+}
 .err { color: var(--rose); font-size: 12px; margin-bottom: 10px; }
 
 /* 复用 .chk(日志那个「自动滚动」),只把它拉成整行并把状态标签顶到右端。
