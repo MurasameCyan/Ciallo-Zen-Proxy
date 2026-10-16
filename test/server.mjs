@@ -3572,6 +3572,10 @@ await t('带对凭据能读到配置和状态', async () => {
   assert.match(s.buildUrl, /^https:\/\/github\.com\/.+\/commit\/a{7}$/);
   assert.match(s.repoUrl, /^https:\/\/github\.com\//);
   assert.equal(s.trackRef, 'beta');
+  // OpenCode UA 版本也搭这趟车。面板那个展示位只读这一处,字段没了不报错,
+  // 只是永远显示破折号 —— 所以钉住它。这里没缓存文件,拿到的必然是默认版本。
+  assert.equal(s.opencodeVersion.version, '2.0.29', '没有缓存时用已验证的默认版本');
+  assert.equal(s.opencodeVersion.userAgent, 'opencode/latest/2.0.29/cli');
 });
 
 await t('/v1/* 认 Bearer 而不是 Basic', async () => {
