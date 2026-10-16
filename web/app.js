@@ -462,16 +462,13 @@ async function refresh() {
     renderPills(); renderStats(); renderNodes(); renderCallLog();
     renderConn(); renderModels(); renderBuild();
 
-    // 表单不在用户编辑时才回填,否则打字会被覆盖
+    // 表单不在用户编辑时才回填,否则打字会被轮询覆盖
     if (document.activeElement !== $('f-sub')) $('f-sub').value = S.cfg.subscriptionUrl || '';
-    // 开关同理:用户刚点完还没提交时别被轮询拨回去
-    const idt = $('f-identity');
-    if (document.activeElement !== idt) idt.checked = S.cfg.opencodeIdentityHeaders === true;
     const persist = $('f-persist');
     if (document.activeElement !== persist) persist.checked = S.cfg.persistUsage === true;
     const hours = $('f-sub-hours');
     if (document.activeElement !== hours) hours.value = S.cfg.subscriptionUpdateHours || 0;
-    syncIdentityTag();
+    renderOpenCodeUa();
   } catch (e) {
     setPill($('pill-node'), 'down', '连接不上后端');
   }
@@ -520,9 +517,10 @@ async function run(btn, label, fn) {
   }
 }
 
-/** checkbox 旁边那个「关闭 / 开启」标签。颜色靠 CSS 的 :checked,这里只管文字 */
-function syncIdentityTag() {
-  $('f-identity-state').textContent = $('f-identity').checked ? '开启' : '关闭';
+/** 面板只展示当前同步到的 OpenCode UA 版本,不再提供可关闭的开关。 */
+function renderOpenCodeUa() {
+  const version = S.status?.opencodeVersion?.version;
+  if (/^\d+\.\d+\.\d+$/.test(String(version || ''))) $('f-identity-version').textContent = version;
 }
 
 function wire() {
@@ -648,17 +646,13 @@ function wire() {
     }
     err.hidden = true;
 
-    // 订阅地址 + 请求头开关 + 自动更新周期一起提交。端口不在这张表里 —— 服务端本来也不接受
-    // 改端口(容器对外端口由 compose 的 ports 定),发过去只会被忽略。
-    // 身份头单独切的时候订阅地址没变,服务端那边一步内核操作都不会做。
+    // 订阅地址和自动更新周期提交。OpenCode UA 始终由网关发送,不再作为配置项提交。
     run($('btn-save'), '保存', async () => {
       const r = await api('/config', {
         method: 'POST',
         body: JSON.stringify(configPayload({
           savedUrl: S.cfg.subscriptionUrl || '',
           url,
-          savedIdentity: S.cfg.opencodeIdentityHeaders === true,
-          identity: $('f-identity').checked,
           savedUpdateHours: S.cfg.subscriptionUpdateHours || 0,
           updateHours: hours,
         })),
@@ -671,8 +665,6 @@ function wire() {
     });
   };
 
-  // 勾了就立刻改标签文字,不等「保存并应用」—— 但真正生效还是在提交之后
-  $('f-identity').onchange = syncIdentityTag;
 
   // 统计持久化开关独立于配置表:它和订阅/内核无关,点一下立即生效,
   // 不用等「保存并应用」。单独 POST 到 /api/config 只带这一个字段。

@@ -393,6 +393,10 @@ async function handleApi(req, res, path) {
         ? { ...DEMO_CAPS, 'glm-5-air-free': { maxOutputTokens: 65536, reasoningTop: 'high', reasoningEfforts: null } }
         : DEMO_CAPS,
       metadata: DEMO_META,
+      opencodeVersion: {
+        version: '2.0.31', userAgent: 'opencode/latest/2.0.31/cli',
+        updatedAt: Date.now(), stale: false,
+      },
       modelAvailability: DEMO_AVAILABILITY,
       pinnableBackends: { 'exo-free': 'Claude' },
       pinClaudeBackend: state.cfg.pinClaudeBackend,

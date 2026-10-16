@@ -405,23 +405,23 @@ t('hasNewer 只在两个 hash 都有且不同时才亮', () => {
   assert.equal(hasNewer('c31f0a8', ''), false, '本地 hash 未知时新旧无从判断');
 });
 
-t('配置提交:只改开关或周期时省略订阅,主动保存时保留订阅以强制刷新', () => {
+t('配置提交:只改周期时省略订阅,主动保存时保留订阅以强制刷新', () => {
   assert.deepEqual(configPayload({
     savedUrl: 'https://sub.example/a', url: 'https://sub.example/a',
-    savedIdentity: false, identity: true, savedUpdateHours: 0, updateHours: 0,
-  }), { opencodeIdentityHeaders: true, subscriptionUpdateHours: 0 });
+    savedUpdateHours: 0, updateHours: 0,
+  }), { subscriptionUrl: 'https://sub.example/a', subscriptionUpdateHours: 0 });
   assert.deepEqual(configPayload({
     savedUrl: 'https://sub.example/a', url: 'https://sub.example/a',
-    savedIdentity: false, identity: false, savedUpdateHours: 0, updateHours: 6,
-  }), { opencodeIdentityHeaders: false, subscriptionUpdateHours: 6 });
+    savedUpdateHours: 0, updateHours: 6,
+  }), { subscriptionUpdateHours: 6 });
   assert.deepEqual(configPayload({
     savedUrl: 'https://sub.example/a', url: 'https://sub.example/b',
-    savedIdentity: false, identity: false, savedUpdateHours: 0, updateHours: 0,
-  }), { subscriptionUrl: 'https://sub.example/b', opencodeIdentityHeaders: false, subscriptionUpdateHours: 0 });
+    savedUpdateHours: 0, updateHours: 0,
+  }), { subscriptionUrl: 'https://sub.example/b', subscriptionUpdateHours: 0 });
   assert.deepEqual(configPayload({
     savedUrl: 'https://sub.example/a', url: 'https://sub.example/a',
-    savedIdentity: false, identity: false, savedUpdateHours: 0, updateHours: 0,
-  }), { subscriptionUrl: 'https://sub.example/a', opencodeIdentityHeaders: false, subscriptionUpdateHours: 0 });
+    savedUpdateHours: 0, updateHours: 0,
+  }), { subscriptionUrl: 'https://sub.example/a', subscriptionUpdateHours: 0 });
 });
 
 t('自动更新小时数只接受 0 或正整数', () => {
@@ -803,30 +803,19 @@ t('请求总数与成功率并排两列,数值字号按半格重算', () => {
   assert.match(app, /\$\('s-rate'\)\.textContent = fmtPercent\(rate\)/, '数值不该再带标签文字');
 });
 
-t('OpenCode 请求头开启状态使用绿色标签', () => {
+t('OpenCode UA 固定启用并显示同步版本', () => {
   const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
   const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
   const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-  const label = html.match(/<label\b[^>]*for="f-identity"[^>]*>([\s\S]*?)<\/label>/)?.[1] || '';
-  const checked = css.match(/\.chk\.toggle input:checked ~ \.tag\s*\{([^}]*)\}/)?.[1] || '';
+  const row = html.match(/<div class="field ua-status"[\s\S]*?<\/div>/)?.[0] || '';
 
-  assert.match(label, /<span>OpenCode 请求头<\/span>/);
-  assert.doesNotMatch(label, /OpenCode 身份头/);
-  assert.match(app, /checked\s*\?\s*'开启'\s*:\s*'关闭'/);
-  assert.doesNotMatch(app, /checked\s*\?\s*'实验中'/);
-  assert.match(checked, /color:\s*var\(--mint-dim\)/);
-  assert.match(checked, /border-color:[^;]*var\(--mint\)/);
-  assert.ok(!html.includes('实验:出站补一组 OpenCode CLI 的身份头'), '指定说明文本应移除');
-});
-
-t('OpenCode 请求头开关排在「保存并应用」下方', () => {
-  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  const form = html.match(/<form\b[^>]*id="cfg-form"[^>]*>([\s\S]*?)<\/form>/)?.[1] || '';
-  const save = form.indexOf('id="btn-save"');
-  const idt = form.indexOf('for="f-identity"');
-
-  assert.ok(save >= 0 && idt >= 0, '开关和保存按钮都应在配置表单内');
-  assert.ok(idt > save, '开关应位于保存按钮之后');
+  assert.match(row, /<span>OpenCode UA<\/span>/);
+  assert.match(row, /id="f-identity-version">2\.0\.31<\/em>/);
+  assert.doesNotMatch(row, /checkbox|f-identity(?!-version)/);
+  assert.match(css, /\.ua-status\s*\{[\s\S]*?display:\s*flex/);
+  assert.match(css, /\.ua-status \.tag\s*\{[\s\S]*?var\(--mint-dim\)/);
+  assert.match(app, /opencodeVersion\?\.version/);
+  assert.match(app, /f-identity-version/);
 });
 
 t('配置卡提供小时制自动更新订阅输入', () => {

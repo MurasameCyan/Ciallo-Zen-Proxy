@@ -617,24 +617,19 @@ input[readonly] { color: var(--fg-2); }
 }
 .err { color: var(--rose); font-size: 12px; margin-bottom: 10px; }
 
-/* 复用 .chk(日志那个「自动滚动」),只把它拉成整行并把状态标签顶到右端。
-   标签文字比 checkbox 本身醒目:实验开关关着是常态,开着才需要被看见。 */
-.chk.toggle { display: flex; width: 100%; font-size: 13px; color: var(--fg); }
-.chk.toggle .tag {
+/* OpenCode v2 的 UA 是网关准入要求,面板只展示当前版本,不提供关闭入口。 */
+.ua-status {
+  display: flex; align-items: center; width: 100%;
+  font-size: 13px; color: var(--fg);
+}
+.ua-status .tag {
   margin-left: auto; font-style: normal;
   font-family: var(--mono); font-size: 11px;
   padding: 2px 8px; border-radius: 999px;
-  border: 1px solid var(--line-2); color: var(--fg-2);
-}
-.chk.toggle input:checked ~ .tag {
+  border: 1px solid color-mix(in oklab, var(--mint) 45%, var(--line-2));
   color: var(--mint-dim);
-  border-color: color-mix(in oklab, var(--mint) 45%, var(--line-2));
 }
-/* 开关下面那句说明:.hint 默认没上边距,和 label 贴太紧 */
-.chk.toggle + .hint { margin-top: 6px; }
-
-/* 开关排在「保存并应用」下方。按钮是行内级、没有下外边距,不给它加一道
-   上边距的话开关会贴在按钮上;下边距归零,让卡里那排按钮的 13px 说话。 */
+/* 固定 UA 状态排在「保存并应用」下方。 */
 .btn.wide + .field { margin: 13px 0 0; }
 
 /* 两列定宽栅格,不再按内容宽度流式排。原来那版是 flex-wrap:名字长短不一,

@@ -306,6 +306,7 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
         modelCapabilities: gateway.modelCapabilities(),
         modelsDev: gateway.modelMetadataStatus(),
         catalog: gateway.catalogStatus?.() || null,
+        opencodeVersion: gateway.clientVersion?.status() || null,
         metadata: gateway.modelMetadataMap(),
         // 哪些模型可以钉后端,以及钉选现在开没开。面板据此只在这几个胶囊旁边
         // 画开关 —— 清单是服务端的常量(见 gateway 的 PINNED_BACKENDS),
@@ -753,6 +754,8 @@ async function main() {
     server.listen(cfg.port, '0.0.0.0', resolve);
   });
   log('ok', `[gateway] 监听 0.0.0.0:${cfg.port}`);
+  // Refresh independently of requests, without holding up startup or inference.
+  gateway.clientVersion.start();
   // 开机立刻拉一次清单。不 await:拉取要几秒,这期间面板和 /v1 都该能用
   // —— 没拉到之前用的是 FREE_MODELS 兜底,退化成旧行为而不是失败。
   // 之后每天一次,由下面 modelsSync 那个定时器负责(见 createModelsSync)。
@@ -828,6 +831,7 @@ async function main() {
     subscriptionUpdater.stop();
     modelsSync.stop();
     deadNodeReviver.stop();
+    gateway.clientVersion.stop();
     gateway.stopAvailabilityScheduler?.();
     clearInterval(laneReaper);
     server.close();

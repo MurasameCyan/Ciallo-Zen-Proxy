@@ -366,15 +366,11 @@ export function updateHours(value) {
 }
 
 export function configPayload({
-  savedUrl = '', url = '', savedIdentity = false, identity = false,
-  savedUpdateHours = 0, updateHours: hours = 0,
+  savedUrl = '', url = '', savedUpdateHours = 0, updateHours: hours = 0,
 } = {}) {
-  const out = {
-    opencodeIdentityHeaders: identity === true,
-    subscriptionUpdateHours: hours,
-  };
-  // 只改开关或周期时不碰订阅；否则点击「保存并应用」仍保持原有的强制刷新语义。
-  if (url !== savedUrl || (identity === savedIdentity && hours === savedUpdateHours)) out.subscriptionUrl = url;
+  const out = { subscriptionUpdateHours: hours };
+  // 只改周期时不碰订阅；点击保存且订阅未变时仍发送地址以强制刷新。
+  if (url !== savedUrl || hours === savedUpdateHours) out.subscriptionUrl = url;
   return out;
 }
 

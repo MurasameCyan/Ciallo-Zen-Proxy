@@ -26,6 +26,7 @@ import { ModelMetadataStore, MODELS_DEV_TTL_MS, metadataFree, isSystemOneModel }
 import { OpencodeCatalog, CATALOG_TTL_MS } from './model-catalog.mjs';
 import { ModelAvailability, MODEL_AVAILABILITY_TTL_MS } from './model-availability.mjs';
 import { safeEqual } from './auth.mjs';
+import { OpencodeVersionStore, DEFAULT_CLIENT_VERSION, validClientVersion, compareClientVersions } from './opencode-version.mjs';
 import {
   classifyUpstreamError, upstreamErrorMessage, isErrorShapedOk, embeddedStatus,
 } from './upstream-errors.mjs';
@@ -365,20 +366,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 
 /**
- * OpenCode v2 client identity. The free-tier gate accepts only the four-part
- * UA shape with a major version of at least 2; downstream v1-shaped UAs are
- * replaced rather than forwarded.
+ * OpenCode v2 client identity. Preserve the verified four-part UA shape;
+ * stale downstream clients must not override the synchronized release version.
  */
 const IDENTITY_DEFAULTS = {
-  'User-Agent': 'opencode/latest/2.0.29/cli',
   'x-opencode-client': 'cli',
   'x-opencode-project': 'global',
 };
-const OPENCODE_UA_RE = /^opencode\/[a-z0-9-]+\/(\d+)\.\d+\.\d+\/[a-z0-9-]+$/i;
-function validOpencodeUa(value) {
-  const match = OPENCODE_UA_RE.exec(String(value || '').trim());
-  return !!match && Number(match[1]) >= 2;
-}
+const OPENCODE_UA_RE = /^opencode\/([a-z0-9-]+)\/(\d+\.\d+\.\d+)\/([a-z0-9-]+)$/i;
 
 /**
  * 把一个值洗成 Node 肯发的头值。
@@ -485,7 +480,7 @@ function newRequestId() {
  * 不变,否则 prompt cache 和节点 affinity 都会丢。可选的 client/project 头由面板
  * 开关控制; v2 必需的 UA、session、session-id、affinity 和通用 session-id 始终保留。
  */
-export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
+export function identityHeaders(inbound, uuid = () => crypto.randomUUID(), version = DEFAULT_CLIENT_VERSION) {
   const h = {};
   for (const [k, v] of Object.entries(inbound?.headers || {})) h[k.toLowerCase()] = v;
   // 洗在 pick 里而不是最后统一扫一遍:这样「洗完变空」自然走到 `|| dflt` 那条路,
@@ -500,14 +495,20 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
     return '';
   };
 
-  const out = { ...IDENTITY_DEFAULTS };
+  if (!validClientVersion(version)) version = DEFAULT_CLIENT_VERSION;
+  const ua = pick('user-agent');
+  const match = OPENCODE_UA_RE.exec(ua);
+  const userAgent = match && validClientVersion(match[2])
+    ? compareClientVersions(match[2], version) >= 0
+      ? ua
+      : `opencode/${match[1]}/${version}/${match[3]}`
+    : `opencode/latest/${version}/cli`;
+  const out = {
+    'User-Agent': userAgent,
+    ...IDENTITY_DEFAULTS,
+  };
   for (const [name, dflt] of Object.entries(IDENTITY_DEFAULTS)) {
-    if (name === 'User-Agent') {
-      const ua = pick('user-agent');
-      out[name] = validOpencodeUa(ua) ? ua : dflt;
-    } else {
-      out[name] = pick(name.toLowerCase()) || dflt;
-    }
+    out[name] = pick(name.toLowerCase()) || dflt;
   }
   const body = inbound?.body;
   // body 里的两个入口同样要洗 —— 它们不经入站头解析器,所以 CR/LF 和中文都能活着
@@ -579,6 +580,7 @@ export class Gateway {
     this.catalogAttemptAt = 0;
     this.catalogFetch = null;
     this.metadataFetch = null;
+    this.clientVersion = new OpencodeVersionStore({ logger });
     // 免费模型可用性是独立于能力记录的短请求探针。结果只在内存里留存:
     // 重启后重新确认,避免把旧 IP/旧上游状态当成当天事实。
     //
@@ -597,7 +599,7 @@ export class Gateway {
     // 探针复用客户端身份构造,但按模型隔离稳定会话,避免不同模型互相踩限流。
     this.identity = (model) => identityHeaders({
       headers: { 'x-opencode-session-id': stableSessionId(`probe-session:${model}`) },
-    });
+    }, undefined, this.clientVersion.version);
     this.availability = new ModelAvailability({
       post: (body) => this.probeRequest(body),
       logger,
@@ -606,15 +608,16 @@ export class Gateway {
     // 用缓冲出口把流收成一份完整响应 —— 探测要的是「成没成 / 错误原文是什么」,
     // 不需要流式。2026-09-19 实测:不走准入的探测一律 403,会把能用的模型
     // 全判成不可用(那是假警报,比对上游的真实错误更难发现)。
-    this.probeOnce = (body) => {
+    this.probeOnce = (body, identity = null) => {
       const model = typeof body.model === 'string' ? body.model.trim() : '';
+      identity ||= this.identity(model);
       // System One(jev 分类器)没有 messages/max_tokens 这回事:可用性探针换成它
       // 自己的最小形状(一个 noul 问题,几百 token、cost 0),走它自己的入口,
       // 一问一答不收流。失败照样以 {status, body} reject,分类器照读。能力探测
       // 不会走到这里 —— probeCapabilities 已经把这类模型排除了。
       if (this.modelProtocol(model) === 'systemone') {
         const probe = { model, state: 'ping', questions: { ok: { type: 'noul', instructions: 'Is this a ping?' } } };
-        return this.forward(probe, Infinity, this.identity(model), SYSTEMONE.path);
+        return this.forward(probe, Infinity, identity, SYSTEMONE.path);
       }
       // 原生 Responses 模型(muse-spark 那类):探测也得走对端点,否则打 chat 一律
       // 500/503,会把能用的模型判成不可用/探不到能力 —— 面板灰点与真实请求相反。
@@ -624,11 +627,11 @@ export class Gateway {
       if (this.modelProtocol(model) === 'responses') {
         const probe = chatToResponsesBody(body);
         gateResponsesBody(probe);
-        return this.forwardBuffered({ write() {} }, probe, responsesUpstreamDialect(OPENAI), Infinity, this.identity(model));
+        return this.forwardBuffered({ write() {} }, probe, responsesUpstreamDialect(OPENAI), Infinity, identity);
       }
       const probe = { ...body };
       gateChatBody(probe);
-      return this.forwardBuffered({ write() {} }, probe, OPENAI, Infinity, this.identity(model));
+      return this.forwardBuffered({ write() {} }, probe, OPENAI, Infinity, identity);
     };
     /**
      * 探测的出站。单发不够:探针和真实请求共用同一个出口,而出口有两类
@@ -657,11 +660,12 @@ export class Gateway {
       const group = providerGroup(model);
       const tried = new Set();
       let last = null;
+      const identity = this.identity(model);
       for (let attempt = 0; attempt < PROBE_NODE_TRIES; attempt++) {
         const cur = await this.getCurrentNode().catch(() => null);
         if (cur) tried.add(cur);
         try {
-          return await this.probeOnce(body);
+          return await this.probeOnce(body, identity);
         } catch (e) {
           last = e;
           const kind = classifyUpstreamError(e?.status, e?.body);
@@ -1196,7 +1200,7 @@ export class Gateway {
 
     // v2 要求两种 x-opencode session 头同时存在;兼容开关只控制可选的
     // client/project 等身份头,不控制会话和 affinity。
-    const requestIdentity = identityHeaders({ headers: req.headers, body: inbound });
+    const requestIdentity = identityHeaders({ headers: req.headers, body: inbound }, undefined, this.clientVersion.version);
     const identity = this.config.opencodeIdentityHeaders
       ? requestIdentity
       : {

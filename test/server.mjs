@@ -745,7 +745,6 @@ await t('calls 坏成对象/字符串时退回空数组,不让面板拿着它去
 
 await t('身份头:v2 UA 与身份字段按官方形状输出', () => {
   const h = identityHeaders({ headers: { 'x-opencode-project': 'my-proj' } }, () => 'uuid-1');
-  assert.equal(h['User-Agent'], 'opencode/latest/2.0.29/cli');
   assert.equal(h['x-opencode-client'], 'cli');
   assert.equal(h['x-opencode-project'], 'my-proj', '客户端值优先');
   assert.match(h['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
@@ -782,11 +781,24 @@ await t('身份头:UA 必须是 major >= 2 的四段 OpenCode 形状', () => {
   assert.ok(Number(m[1]) >= 2);
 });
 
-await t('身份头:只转发完整的 v2 客户端 UA', () => {
-  const v1 = identityHeaders({ headers: { 'user-agent': 'opencode/1.18.35' } }, () => 'u');
-  assert.equal(v1['User-Agent'], 'opencode/latest/2.0.29/cli');
-  const v2 = identityHeaders({ headers: { 'user-agent': 'opencode/latest/2.0.29/cli' } }, () => 'u');
-  assert.equal(v2['User-Agent'], 'opencode/latest/2.0.29/cli');
+await t('旧客户端 UA 不能覆盖同步版本,更新的完整 UA 保留且会话不变', () => {
+  const session = 'ses_0123456789abcdef0123456789';
+  const build = (ua) => identityHeaders({ headers: {
+    'user-agent': ua, 'x-opencode-session-id': session, 'x-opencode-project': 'keep-project',
+  } }, () => 'unused', '2.0.31');
+  for (const [ua, expected] of [
+    ['opencode/1.19.3', 'opencode/latest/2.0.31/cli'],
+    ['opencode/latest/2.0.29/cli', 'opencode/latest/2.0.31/cli'],
+    ['opencode/latest/2.0.9/cli', 'opencode/latest/2.0.31/cli'],
+    ['opencode/dev/2.0.30/desktop', 'opencode/dev/2.0.31/desktop'],
+    ['other-client', 'opencode/latest/2.0.31/cli'],
+  ]) {
+    const h = build(ua);
+    assert.equal(h['User-Agent'], expected);
+    assert.equal(h['x-opencode-session-id'], session);
+    assert.equal(h['x-opencode-project'], 'keep-project');
+  }
+  assert.equal(build('opencode/dev/2.0.100/desktop')['User-Agent'], 'opencode/dev/2.0.100/desktop');
 });
 
 await t('身份头:读入站头大小写不敏感', () => {
@@ -1453,7 +1465,6 @@ await t('reqOpts:v2 inference 使用 public bearer,并剥掉旧 request ID', () 
     timeout: 1000,
     identity: { ...identityHeaders({ headers: {} }), 'x-opencode-request': 'msg_old' },
   });
-  assert.equal(on.headers['User-Agent'], 'opencode/latest/2.0.29/cli');
   assert.equal(on.headers['x-opencode-client'], 'cli');
   assert.equal(on.headers['x-session-affinity'], on.headers['x-opencode-session']);
   assert.equal(on.headers['x-session-id'], on.headers['x-opencode-session']);
@@ -2686,6 +2697,27 @@ await t('探测撞上 terminal 原文时原样抛出,不换节点重发', async 
     (e) => e.status === 400 && /131072/.test(e.body), '原文必须原样抛给调用方');
   assert.equal(calls, 1, '校验器已经说话了,一次就够');
   assert.equal(switched, 0);
+});
+
+await t('探测跨节点重试复用同一份版本身份', async () => {
+  const g = new Gateway(load(), () => {});
+  g.clientVersion.version = '2.0.29';
+  g.cur = 'A';
+  g.getCurrentNode = async () => g.cur;
+  g.getAllNodes = async () => ['A', 'B'];
+  g.rankNodes = (nodes) => nodes;
+  g.switchNode = async (node) => { g.cur = node; return true; };
+  const seen = [];
+  g.forwardBuffered = async (...args) => {
+    seen.push(args[4]['User-Agent']);
+    if (seen.length === 1) {
+      g.clientVersion.version = '2.0.31';
+      throw { status: 503, body: 'upstream overloaded' };
+    }
+    return { choices: [{ message: { content: 'pong' } }] };
+  };
+  await g.probeRequest({ model: 'big-pickle', messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 });
+  assert.deepEqual(seen, ['opencode/latest/2.0.29/cli', 'opencode/latest/2.0.29/cli']);
 });
 
 await t('探测重试有界,且没有别的出口可换时抛原错', async () => {

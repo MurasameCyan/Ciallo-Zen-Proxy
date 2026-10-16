@@ -17,9 +17,7 @@
 
 ---
 
-## 拉起来
-
-不需要自己 build,镜像 GitHub Actions 已经推到 GHCR(amd64 + arm64)。
+## 如何用
 
 ```bash
 curl -O https://raw.githubusercontent.com/MurasameCyan/Ciallo-Zen-Proxy/beta/docker-compose.yml
@@ -297,7 +295,7 @@ openai-compatibility:
 | 页头 | 只有身份和版本:构建 hash + 「检查更新」+ 仓库入口 + 「退出登录」 |
 | 概览 | 一张卡里 2×2 四格:左上 Token 消耗(输入·输出·推理·缓存读·缓存写)、右上 模型统计(各模型 token 用量)、左下 客户端请求总数(成功·失败·成功率)、右下 运行时长(最后请求) |
 | 接入 | 一排四颗按钮(「OpenAI 地址」/「Anthropic 地址」/「复制 Key」/「重置 Key」)，下面是可用模型；长名字可横向滚动，`exo-free[1M]` 后紧邻一个无文字的 Claude 后端锁定开关 |
-| 配置 | 订阅地址（右端一个节点状态灯）+ 自动更新订阅周期 + 「保存并应用」+ OpenCode 请求头开关，以及「重启内核」「同步模型」「补探能力」「清零统计」「手动重置」 |
+| 配置 | 订阅地址（右端一个节点状态灯）+ 自动更新订阅周期 + 「保存并应用」+ 固定显示当前 OpenCode UA 版本，以及「重启内核」「同步模型」「补探能力」「清零统计」「手动重置」 |
 | 运行日志 | 内核和网关的实时日志 |
 | 节点池 | 从上往下就是网关接下来会用的顺序:没被限流过的按实测延迟排前,最近限流过的(即便已解冻)让到可用段末尾,免得它凭低延迟又插回队首、把后面还没轮到的节点一直压着。每行带延迟数字,当前节点标出来,冷却中的显示剩余秒数,测不通的划掉垫在最底下。冷却按出口地址算,所以同一台机器下的所有节点名会一起变成冷却态(见「冷却记在出口地址上」) |
 | 调用日志 | 默认折叠,标题那行写着最近多少条、Token、平均首字、平均耗时,以及累计的限流 / 超时 / 错误。展开后**每条成功的上游调用一行**:时刻、节点、模型、思考强度、首字、耗时、Token(入 / 出 / 推理) |
@@ -306,11 +304,13 @@ openai-compatibility:
 
 **OpenCode v2 免费层兼容（2026-10-14）。** 上游把免费 Chat/Responses 推理从 `/zen/v1` 搬到 `/inference/v1`：分别走 `/inference/v1/chat/completions`、`/inference/v1/responses`；本项目的 Anthropic `/v1/messages` 仍按客户端方言翻成这两条上游腿，`/zen/v1/models` 仍是模型清单入口。
 
-- 出站 UA 默认为 `opencode/latest/2.0.29/cli`。只有完整的 `opencode/<channel>/<major>.<minor>.<patch>/<client>` 且 major ≥ 2 的下游 UA 才转发，旧 v1 UA 会被替换。
-- 免费推理发送 `Authorization: Bearer public`、`x-opencode-session`、`x-opencode-session-id`、`x-session-affinity`、`x-session-id`；不发送 `x-opencode-request`。身份开关仍只控制可选的 client/project 头。
+- 出站 UA 保持已实测的 `opencode/latest/<发行版本>/cli` 形状，版本号从[官方 CLI 发行接口](https://opencode.ai/update/api/latest/cli/npm)同步，不使用 GitHub 的 v1 release tag。完整四段、major ≥ 2 且不旧于同步版本的下游 UA 仍可转发；旧客户端不能把网关拉回旧版本。
+- 免费推理发送 `Authorization: Bearer public`、`x-opencode-session`、`x-opencode-session-id`、`x-session-affinity`、`x-session-id`；不发送 `x-opencode-request`。UA 与会话头始终发送，旧 `opencodeIdentityHeaders` API 字段只控制可选的 client/project 头。
 - 合成 session 的 12 位 hex 使用官方降序编码 `~(timeMs * 0x1000 + 1)`；从客户端会话提示派生时只取 36 位时间字段，避免把哈希熵塞进毫秒内计数器而触发 `FreeTierError`。
 - 免费请求必须带 OpenCode v2 的精确 `read` 与 `shell` 工具定义。网关不再发送旧的五工具 stub；缺少的定义按 CLI 原文补上，并在 system/instructions 中标记为 placeholder，避免模型真的调用网关没有实现的工具。
 - 客户端自己的工具原样保留。若客户端正好把不同 schema 的工具命名为 `read` 或 `shell`，出站临时改成 `read_client` / `shell_client`（重名递增），历史调用和响应再恢复原名；`Read`、`Bash` 等大小写不同的名字不改。
+- 版本成功记录原子写入 `/data/opencode-version.json`，启动先读缓存，到期后后台同步，之后每 24 小时检查一次，不依赖面板轮询或客户端请求。网络失败、非法元数据或版本倒退都保留最近成功值；完全没有有效缓存时使用已验证的 `2.0.29`。真实请求与可用性、能力探针共用当前版本，单次请求跨节点重试时身份不变；身份头开关不影响版本同步。`/api/status` 的 `opencodeVersion` 与 `[opencode-version]` 日志提供版本、检查时间和最近错误。
+- 2026-10-16 在 API 容器内以官方发行二进制 `2.0.31` 抓取 UA，并用更新后的隔离网关验证：入站 `2.0.1` 被升级为 `2.0.31`，`/v1/messages` 返回 HTTP 200 和完整 `PONG`。自动同步只更新版本数字；若上游将来更改 UA 形状、会话规则或工具校验，仍需升级网关代码，不能靠更换版本数字解决。
 
 这几项是免费层准入形状，不是普通协议转换。客户端非流式请求仍由网关收上游流后拼回 JSON；Chat、Responses、Anthropic 三种入口共用同一套 v2 身份与工具处理。上游返回真实配额/供应商错误时，网关仍按错误原文分类，不把 `200` 外壳或 `403 FreeTierError` 误记成成功。
 
@@ -332,7 +332,7 @@ API Key 屏幕上永远是掩码,只有「重置」和「复制」两个动作 �
 
 **多 lane 并发分摊。** 平时单出口、一个节点用到 429 才换,行为和以前一样。当主 lane 已有请求在跑、又有新请求进来时,网关会按需拉起一个**子 lane**:独立 mihomo 进程、独立端口、绑定另一个没被占用的节点,让并发请求走不同的出口 IP,而不是挤在同一个节点上互相拖慢。子 lane 不自己拉订阅、不维护冷却 —— 节点表和 429/封域冷却状态全部复用主 lane 的那一份,主 lane 一标记节点冷却,子 lane 立刻一起看不到它。已经拉起来的子 lane 会被后续请求接着用;空闲满 5 分钟才自动关掉、释放端口,退出时全部回收,所以硬件开销只在真正并发时才存在。(早先这里有个 bug:`acquire` 里少了「先看有没有空闲子 lane」这一步,于是子 lane 是一次性的 —— 创建它的那个请求用完就空转到被回收,后面的并发全挤回主 lane,稳态并发实际上还是 1,把 `ZEN_MAX_CHILD_LANES` 调大也没有任何效果。)一条 lane 同时只接一个请求:一条 lane = 一个 mihomo 进程 = 一个出口 IP,塞两个并发进去等于两个请求共用一个出口,白占一条 lane。注意多 lane 意味着多个出口 IP 同时消耗额度:想要「先榨干一个 IP 再开第二个」,保持低并发即可,子 lane 只在并发挤压时才出现。
 
-**完整 OpenCode 请求头。** 开关排在「保存并应用」下方,但仍是这张表的一部分 —— 和订阅地址、更新周期一起提交才生效。默认关闭时也会发送可信的 `User-Agent` 和合法格式的稳定 `x-opencode-session`，开启后才透传客户端给出的 OpenCode request/session/project/client 等其它请求头,缺失的 request ID 为当前客户端请求补默认值。客户端带来的 UUID 或自定义 session 会先稳定哈希成上游要求的格式。只改这个开关不会刷新订阅、测速、重启 mihomo、重写 mihomo 配置或重排自动更新时间。
+**OpenCode UA。** 面板固定显示当前同步版本，不提供关闭开关。网关始终发送可信的 `User-Agent` 和合法格式的稳定 `x-opencode-session`；版本从官方 CLI 发行接口每日同步，网络失败时保留最近成功值或已验证的默认版本。客户端带来的 UUID 或自定义 session 会先稳定哈希成上游要求的格式。
 
 **「模型统计」和「调用日志」不是一个口径。** 概览右上那格按模型累计**客户端请求**用掉的 token,用和左上角一样的 K/M/B 紧凑写法(悬停看精确值),按用量降序,没有用量的不列(列一行 0 只是占位)。它和左上角「Token 消耗」是同一次记账累加出来的,各行加起来就是那个总数。调用日志那张表是**上游调用**的逐条时间线,只留最近 200 条;模型统计是累计值,被日志挤掉的早期调用只在这里还留着。排序键是用量而不是成功次数 —— 一个跑了一堆短问答的模型会压过真正吃掉大头的那个,回答不了「token 都花在哪」。
 
