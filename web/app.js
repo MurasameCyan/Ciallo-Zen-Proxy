@@ -9,7 +9,7 @@ import {
   LOG_LEVELS, fmtCount, fmtTokens, fmtUptime, fmtClock,
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
   pushLog, maskKey, endpointBase, anthropicBase, rankBreakdown, COOLDOWN_MS,
-  fmtDelay, delayGrade, fmtAgo, hasNewer, callLog, nodeStats, configPayload, updateHours,
+  fmtDelay, delayGrade, hasNewer, callLog, nodeStats, configPayload, updateHours,
   modelLabel, modelState, modelTooltip, backendPin,
 } from './core.js';
 
@@ -20,7 +20,7 @@ const POLL_MS = 2000;
 const S = {
   cfg: {}, status: {}, usage: null,
   nodes: [], cooldowns: [], current: '', locked: '',
-  delay: {}, excluded: [], testedAt: null, testing: false,
+  delay: {}, excluded: [],
   egress: { byNode: {}, measured: 0, distinct: 0, measuring: false },
   logs: [], filter: 'all', follow: true,
   pinSaving: false, pinRevision: 0,
@@ -159,8 +159,9 @@ function renderNodes() {
   $('nodes-empty').hidden = rows.length > 0;
   const total = S.nodes.length + S.excluded.length;
   const probe = S.egress;
-  $('nodes-tested').textContent = (S.testing ? '测延迟中…' : fmtAgo(S.testedAt))
-    + (probe.measuring ? ' · 出口探测中…' : ` · 出口 ${probe.measured}/${total} 已测 · ${probe.distinct} 个 IP`);
+  const progress = $('nodes-progress');
+  progress.hidden = total === 0;
+  progress.textContent = `进度 ${probe.measured}/${total}`;
 
   // 全量重建。节点数是几十条量级,重建比 diff 简单且看不出差别。
   // ponytail: 上限约几百条;再多要改成按 name 复用 <li>。
@@ -498,8 +499,6 @@ async function refresh() {
     S.locked = pool?.locked || '';
     S.delay = pool?.delay || {};
     S.excluded = pool?.excluded || [];
-    S.testedAt = pool?.testedAt || null;
-    S.testing = pool?.testing === true;
     S.egress = pool?.egress || { byNode: {}, measured: 0, distinct: 0, measuring: false };
     // 服务端给秒,进来立刻折算成本地截止点,之后本地走秒不用等下次轮询
     S.cooldowns = (pool?.cooldowns || []).map((c) => ({ ...c, deadline: cooldownDeadline(c.remain) }));
@@ -614,12 +613,23 @@ function wire() {
     return `探到 ${got} 个${miss ? `,${miss} 个没探到(看运行日志)` : ''}`;
   });
 
-  $('btn-speed').onclick = (e) => run(e.target, '测延迟', async () => {
-    const r = await api('/nodes/test', { method: 'POST' });
-    if (!r?.tested) return '';
-    const f = r.fastest ? `最快 ${r.fastest.node} ${fmtDelay(r.fastest.delay)}` : '没有可用节点';
-    return `${r.alive}/${r.tested} 可用,${f}`;
-  });
+  // 保留按钮内的进度节点，异步测量期间继续由轮询更新。
+  $('btn-speed').onclick = async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    try {
+      const r = await api('/nodes/test', { method: 'POST' });
+      const fastest = r?.fastest ? `最快 ${r.fastest.node} ${fmtDelay(r.fastest.delay)}` : '没有可用节点';
+      toast(r?.tested ? `测节点/出口完成,${r.alive}/${r.tested} 可用,${fastest}` : '测节点/出口完成', 'ok');
+    } catch (err) {
+      toast(`测节点/出口失败:${err.message}`, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+      refresh();
+    }
+  };
 
   // 清零要二次确认:统计是累计值,清了拿不回来(重启也不会回来,它落盘了)
   $('btn-zero').onclick = (e) => {

@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import {
   COOLDOWN_MS, MAX_LOG, fmtTokens, fmtUptime, fmtClock, successRate, fmtPercent,
   cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, anthropicBase, rankBreakdown,
-  fmtDelay, delayGrade, fmtAgo, hasNewer, cacheRate, nodeStats, callLog, configPayload, updateHours,
+  fmtDelay, delayGrade, hasNewer, cacheRate, nodeStats, callLog, configPayload, updateHours,
   modelLabel, modelState, modelTooltip,
 } from '../web/core.js';
 
@@ -171,15 +171,6 @@ t('delayGrade 分三档,无数据不给档', () => {
   assert.equal(delayGrade(999), 'mid');
   assert.equal(delayGrade(1000), 'slow');
   assert.equal(delayGrade(null), '');
-});
-
-t('fmtAgo:没测过时说出来,不显示「0 秒前」', () => {
-  const now = 1_000_000;
-  assert.equal(fmtAgo(null, now), '还没测过');
-  assert.equal(fmtAgo(0, now), '还没测过');
-  assert.equal(fmtAgo(now - 5_000, now), '5 秒前测');
-  assert.equal(fmtAgo(now - 125_000, now), '2 分钟前测');
-  assert.equal(fmtAgo(now - 7200_000, now), '2 小时前测');
 });
 
 // ── 日志缓冲 ────────────────────────────────────────────

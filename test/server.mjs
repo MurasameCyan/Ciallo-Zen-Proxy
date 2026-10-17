@@ -1402,27 +1402,41 @@ await t('lane:_spawnChildLane 选节点排除主 lane 当前节点,落到不同�
   }
 });
 
-await t('lane:attempt 的 resolveChildName 在子表里没有时退回自己的第一个', async () => {
-  const g = new Gateway(load(), () => {});
-  const lane = { inst: {}, nodes: ['X|0%|Succeed', 'Y|0%|Succeed'] };
-  const switched = [];
-  g._childSwitch = async (inst, name) => { switched.push(name); return true; };
-  // 直接拿闭包逻辑:通过 attempt 的 doSwitch 验证。构造子 lane 场景,请求名 Z 不在子表里
+await t('lane:子 lane 用自己的候选完成重试并复用实际成功节点', async () => {
+  const mainNodes = ['A|main', 'B|main'];
+  const own = ['A|child', 'B|child'];
+  const body = { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'hi' }] };
+  const group = providerGroup(body.model);
+  const g = retryGateway('sm-child-own-retry.json', (_i, node) => {
+    if (node === own[0]) throw { status: 0, body: 'Client network socket disconnected before secure TLS connection was established' };
+    return { choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 2 } };
+  });
+  const lane = { id: 1, node: own[0], nodes: own, inst: {}, active: 1, lastUsed: 0 };
+  g.cur = own[0];
+  g.lockedNode = mainNodes[0];
+  g.lanes.main.active = 1;
+  g.lanes._children.set(lane.id, lane);
+  g.switchNode = async () => assert.fail('子 lane 重试不得切换主 selector');
+  g.saveLastNode = () => assert.fail('子 lane 成功不得改写主节点记录');
+  g._childSwitch = async (_inst, name) => { g.cur = name; return true; };
   const res = fakeRes();
-  const body = { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'x' }] };
-  const nodes = ['Z|0%|Succeed', 'X|0%|Succeed'];
-  let doSwitchSeen = null;
-  // 复用 attempt 内部逻辑:这里直接验证 resolveChildName 的核心行为
-  // (attempt 是完整状态机,不好单独拆,用等价断言模拟)
-  const resolveChildName = (node) => (lane && lane.nodes && lane.nodes.includes(node))
-    ? node
-    : (lane && lane.nodes && lane.nodes.length ? lane.nodes[0] : node);
-  doSwitchSeen = await g._childSwitch(lane.inst, resolveChildName('Z|0%|Succeed'));
-  assert.equal(doSwitchSeen, true);
-  assert.equal(switched[0], 'X|0%|Succeed', '子表里没有 Z 就退到第一个 X');
-  // 名字在表里时直切
-  await g._childSwitch(lane.inst, resolveChildName('X|0%|Succeed'));
-  assert.equal(switched[1], 'X|0%|Succeed');
+  await g.attempt(res, body, mainNodes, own[0], false, OPENAI,
+    Date.now() + 60_000, null, '', 'child-retry-session', lane);
+
+  assert.equal(res.code, 200, '主子节点名字不同也必须换到可用子节点并完成请求');
+  assert.equal(JSON.parse(res.body).choices[0].message.content, 'ok');
+  assert.deepEqual(g.tries, own, '已封域的子节点不能因为主表名字不同而被反复请求');
+  assert.equal(g.cooldown.isCooling(own[0], group), true);
+  assert.equal(g.lockedNode, mainNodes[0]);
+  assert.equal(lane.node, own[1], '后续分配必须使用实际成功的子节点');
+  assert.equal(lane.active, 0);
+  const reused = await g.acquireLane({ nodes: mainNodes, mainNode: mainNodes[0],
+    available: node => !g.cooldown.isCooling(node, group) });
+  assert.equal(reused, lane, '成功子节点的空闲 lane 应可复用，而不是仍挂在旧冷却节点上');
+  g.lanes.release(reused);
+  const stats = g.usage.getStats();
+  assert.equal(stats.byNode[own[0]].timeout, 1);
+  assert.equal(stats.byNode[own[1]].success, 1);
 });
 
 await t('lane:子 lane 请求成功后 release,主 lane 不受影响', async () => {

@@ -285,16 +285,6 @@ export function delayGrade(ms) {
   return 'slow';
 }
 
-/** 「上次测延迟」显示成相对时间;它是手动/事件触发的,绝对时刻没意义 */
-export function fmtAgo(ts, now = Date.now()) {
-  const t = Number(ts);
-  if (!t) return '还没测过';
-  const s = Math.max(0, Math.round((now - t) / 1000));
-  if (s < 60) return `${s} 秒前测`;
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟前测`;
-  return `${Math.floor(s / 3600)} 小时前测`;
-}
-
 /** 追加日志并裁到上限。用 splice 而非 shift:一次灌入多条也能裁干净 */
 export function pushLog(buf, line, max = MAX_LOG) {
   buf.push(line);

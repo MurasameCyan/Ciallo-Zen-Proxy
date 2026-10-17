@@ -504,9 +504,12 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .badge.cool { color: var(--amber); border-color: color-mix(in oklab, var(--amber) 40%, transparent); }
 .badge.dead { color: var(--rose); border-color: color-mix(in oklab, var(--rose) 40%, transparent); }
 
-/* 卡头右侧的「N 秒前测 + 测延迟」。baseline 对齐会让按钮比文字低半行 */
-.node-tools { display: flex; align-items: center; gap: 8px; margin-left: auto; }
-.node-tools .hint { margin-left: 0; }
+.node-head { align-items: center; flex-wrap: nowrap; }
+.node-test {
+  display: inline-flex; flex-direction: column; align-items: center; gap: 2px;
+  margin-left: auto; flex-shrink: 0; white-space: nowrap;
+}
+.node-test-progress { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--fg-2); }
 
 .empty { color: var(--fg-2); font-size: 13px; padding: 14px 2px; }
 

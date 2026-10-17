@@ -217,14 +217,12 @@
 
   <!-- ── 节点池 ─────────────────────────────────────────── -->
   <section class="card fill" aria-labelledby="h-nodes">
-    <div class="card-head">
+    <div class="card-head node-head">
       <h2 id="h-nodes">节点池</h2>
-      <!-- 这列只有 340px,长句会折行把卡头顶高、和日志卡的头对不齐。
-           所以「按延迟排序」这类说明放进 ul 的 aria-label,不占一行。 -->
-      <div class="node-tools">
-        <span class="hint" id="nodes-tested">还没测过</span>
-        <button type="button" class="btn tiny" id="btn-speed">测节点/出口</button>
-      </div>
+      <button type="button" class="btn tiny node-test" id="btn-speed">
+        <span>测节点/出口</span>
+        <span class="node-test-progress" id="nodes-progress" hidden></span>
+      </button>
     </div>
     <ul class="nodes" id="nodes" aria-live="polite"
         aria-label="节点池,按实测延迟排序,从上往下就是网关接下来会用的顺序"></ul>
