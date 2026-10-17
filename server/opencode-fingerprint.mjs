@@ -1,3 +1,5 @@
+import { SseFrames } from './sse.mjs';
+
 /**
  * OpenCode v2 free-tier fingerprint.
  *
@@ -264,37 +266,44 @@ export function restoreToolNames(payload, map) {
 }
 
 /**
- * Wrap a dialect sink with a small stateful SSE line transformer. It preserves
- * comments and event lines, while restoring aliases in JSON data frames before
- * the dialect-specific sink sees them.
+ * Wrap a dialect sink with a stateful complete-frame SSE transformer. Preserve
+ * non-data fields and frame boundaries, restoring aliases once per JSON event
+ * before the dialect-specific sink sees it.
  */
 export function aliasSseSink(inner, map) {
   if (!map?.size) return inner;
-  let buffer = '';
+  const frames = new SseFrames();
   const decoder = new TextDecoder();
-  const writeLine = (line) => {
-    const match = /^([^:]*data:\s*)(.*)$/.exec(line);
-    if (!match || !match[2] || match[2] === '[DONE]') {
-      inner.write(`${line}\n`);
-      return;
+  const writeFrame = (frame) => {
+    const lines = frame.split(/(\r\n|\r|\n)/);
+    const indices = [];
+    const data = [];
+    for (let i = 0; i < lines.length; i += 2) {
+      if (!lines[i].startsWith('data:')) continue;
+      indices.push(i);
+      data.push(lines[i].slice(5).replace(/^ /, ''));
     }
-    try {
-      inner.write(`${match[1]}${JSON.stringify(restoreToolNames(JSON.parse(match[2]), map))}\n`);
-    } catch {
-      inner.write(`${line}\n`);
+    if (!data.length || data.join('\n').trim() === '[DONE]') return inner.write(frame);
+    let payload;
+    try { payload = JSON.parse(data.join('\n')); } catch { return inner.write(frame); }
+    const first = indices[0];
+    const prefix = lines[first].startsWith('data: ') ? 'data: ' : 'data:';
+    lines[first] = `${prefix}${JSON.stringify(restoreToolNames(payload, map))}`;
+    for (const index of indices.slice(1)) {
+      lines[index] = '';
+      lines[index + 1] = '';
     }
+    inner.write(lines.join(''));
   };
   return {
     write(chunk) {
-      buffer += decoder.decode(Buffer.isBuffer(chunk) || chunk instanceof Uint8Array ? chunk : Buffer.from(String(chunk)), { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const line of lines) writeLine(line.replace(/\r$/, ''));
+      const text = decoder.decode(Buffer.isBuffer(chunk) || chunk instanceof Uint8Array ? chunk : Buffer.from(String(chunk)), { stream: true });
+      for (const frame of frames.feed(text)) writeFrame(frame);
     },
     end() {
-      buffer += decoder.decode();
-      if (buffer) writeLine(buffer.replace(/\r$/, ''));
-      inner.end();
+      for (const frame of frames.feed(decoder.decode(), true)) writeFrame(frame);
+      if (frames.pending) inner.write(frames.pending);
+      return inner.end();
     },
     fail(message) {
       inner.fail?.(message);

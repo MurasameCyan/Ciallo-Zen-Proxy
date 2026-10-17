@@ -76,6 +76,28 @@ t('tool_result 的 content 是 block 数组时也能取到文本', () => {
   assert.equal(r.messages[0].content, 'out');
 });
 
+t('多模态 tool_result 的图片文档和文字保序,并行结果先配齐再追加 user 附件', () => {
+  const r = anthropicToOpenAI({ messages: [{ role: 'user', content: [
+    { type: 'tool_result', tool_use_id: 'a', content: [
+      { type: 'text', text: '前' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AQID' } },
+      { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'BAUG' }, title: 'a.pdf' },
+      { type: 'text', text: '后' },
+    ] },
+    { type: 'tool_result', tool_use_id: 'b', content: 'second' },
+    { type: 'text', text: '继续' },
+  ] }] });
+  assert.deepEqual(r.messages.map((m) => m.role), ['tool', 'tool', 'user']);
+  assert.deepEqual(r.messages.slice(0, 2).map((m) => [m.tool_call_id, m.content]), [['a', '前\n后'], ['b', 'second']]);
+  assert.deepEqual(r.messages[2].content, [
+    { type: 'text', text: '前' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+    { type: 'file', file: { file_data: 'data:application/pdf;base64,BAUG', filename: 'a.pdf' } },
+    { type: 'text', text: '后' },
+    { type: 'text', text: '继续' },
+  ]);
+});
+
 t('assistant 的 tool_use 变成 tool_calls,arguments 是 JSON 字符串', () => {
   const r = anthropicToOpenAI({
     messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'read', input: { path: '/a' } }] }],
@@ -806,6 +828,18 @@ t('flattenText 各种输入都不抛', () => {
   assert.equal(flattenText(null), '');
   assert.equal(flattenText(undefined), '');
   assert.equal(flattenText(123), '');
+});
+
+t('连续 user tool_result 消息先配齐所有结果,再按顺序追加图片上下文', () => {
+  const r = anthropicToOpenAI({ messages: ['a', 'b'].map((id) => ({ role: 'user', content: [{
+    type: 'tool_result', tool_use_id: id, content: [
+      { type: 'text', text: id },
+      { type: 'image', source: { type: 'url', url: `https://example.com/${id}.png` } },
+    ],
+  }] })) });
+  assert.deepEqual(r.messages.map((message) => message.role), ['tool', 'tool', 'user', 'user']);
+  assert.deepEqual(r.messages.slice(0, 2).map((message) => message.tool_call_id), ['a', 'b']);
+  assert.deepEqual(r.messages.slice(2).map((message) => message.content[1].image_url.url), ['https://example.com/a.png', 'https://example.com/b.png']);
 });
 
 console.log(`\nanthropic.mjs: 全部通过 (${n} 组)\n`);

@@ -338,6 +338,8 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   // 这里两条都桩上,免得以后哪条改了实测不到。
   const savedFwd = gw.forward;
   const savedFwdStream = gw.forwardStream;
+  const savedProtocol = gw.modelProtocol;
+  gw.modelProtocol = () => 'responses';
   let rsent = null;
   const RESP = {
     object: 'response', model: 'm',
@@ -379,11 +381,14 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   gw.forward = savedFwd;
   gw.forwardStream = savedFwdStream;
   gw.forwardBuffered = savedBuffered;
+  gw.modelProtocol = savedProtocol;
 }
 
 // ── Responses 流式:response.* 原样透传,收尾漏出的 chat 杂块吞掉 ──
 {
   const saved = gw.forwardStream;
+  const savedProtocol = gw.modelProtocol;
+  gw.modelProtocol = () => 'responses';
   gw.forwardStream = async (res, body, dialect) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
     const sink = dialect.sink(res, body.model);
@@ -412,6 +417,7 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   body.includes('[DONE]') ? ok('Responses 流式:[DONE] 原样透传') : no('Responses 流式 [DONE] 丢了');
 
   gw.forwardStream = saved;
+  gw.modelProtocol = savedProtocol;
 }
 
 await new Promise((r) => app.close(r));

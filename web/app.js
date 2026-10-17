@@ -21,6 +21,7 @@ const S = {
   cfg: {}, status: {}, usage: null,
   nodes: [], cooldowns: [], current: '', locked: '',
   delay: {}, excluded: [], testedAt: null, testing: false,
+  egress: { byNode: {}, measured: 0, distinct: 0, measuring: false },
   logs: [], filter: 'all', follow: true,
   pinSaving: false, pinRevision: 0,
   // 检查更新查到的远端 hash。记 hash 而不是布尔:更新完镜像重启后 status 里的
@@ -68,11 +69,14 @@ function renderPills() {
 
   // 只数还在轮换表里的冷却:已经被剔除的节点显示的是「不可用」,
   // 再从可用数里扣一次就成了双重扣减(分子会比实际少)
-  const cooling = S.cooldowns.filter((c) => remainMs(c.deadline) > 0 && S.nodes.includes(c.node)).length;
+  const cooling = new Set();
+  for (const c of S.cooldowns) {
+    if (remainMs(c.deadline) > 0 && S.nodes.includes(c.node)) cooling.add(c.node);
+  }
   // 分母算上被剔除的:订阅里有 17 个就该显示 /17,少掉的那几个正是要看见的信息
   const total = S.nodes.length + S.excluded.length;
-  setPill($('pill-node'), cooling ? 'cool' : total ? 'up' : '',
-    total ? `节点 ${S.nodes.length - cooling}/${total} 可用` : '无节点');
+  setPill($('pill-node'), cooling.size ? 'cool' : total ? 'up' : '',
+    total ? `节点 ${S.nodes.length - cooling.size}/${total} 可用` : '无节点');
 }
 
 function renderStats() {
@@ -153,7 +157,10 @@ function renderNodes() {
   const rows = nodeRows({ ...S, now: Date.now() });
   const ul = $('nodes');
   $('nodes-empty').hidden = rows.length > 0;
-  $('nodes-tested').textContent = S.testing ? '测延迟中…' : fmtAgo(S.testedAt);
+  const total = S.nodes.length + S.excluded.length;
+  const probe = S.egress;
+  $('nodes-tested').textContent = (S.testing ? '测延迟中…' : fmtAgo(S.testedAt))
+    + (probe.measuring ? ' · 出口探测中…' : ` · 出口 ${probe.measured}/${total} 已测 · ${probe.distinct} 个 IP`);
 
   // 全量重建。节点数是几十条量级,重建比 diff 简单且看不出差别。
   // ponytail: 上限约几百条;再多要改成按 name 复用 <li>。
@@ -178,6 +185,7 @@ function renderNodes() {
     const ms = document.createElement('span');
     ms.className = `ms ${delayGrade(n.latency)}`;
     ms.textContent = fmtDelay(n.latency);
+    ms.title = 'Zen 站点延迟;站点可达不代表模型可用';
 
     const st = document.createElement('span');
     st.className = 'st';
@@ -186,12 +194,29 @@ function renderNodes() {
     } else if (n.state === 'active') {
       st.append(tag('badge on', '在用'));
     } else if (n.state === 'cooling') {
-      st.append(tag('badge cool', `冷却 ${Math.ceil(n.remain / 1000)}s`));
+      const policy = n.cooldown;
+      const reason = policy?.blocked ? '拒连' : policy?.reason === 'rejected' ? '暂避'
+        : policy?.reason === '5xx' ? '上游错误' : '限流';
+      st.append(tag('badge cool', `${reason} ${Math.ceil(n.remain / 1000)}s`));
+      st.title = `${policy?.group || 'default'} 供应商组 · ${reason}`
+        + (policy?.egress ? ` · 出口 ${policy.egress}` : '');
     } else {
       st.append(tag('badge', '待用'));
     }
 
     li.append(idx, nm, ms, st);
+    const fact = probe.byNode[n.name];
+    if (fact) {
+      const detail = tag('route', `中立 ${fact.neutral?.ms > 0 ? fmtDelay(fact.neutral.ms) : '—'} · 出口 ${fact.exitIp || '未知'}`);
+      detail.title = `独立定向测量 ${fmtClock(fact.at)};Zen ${fact.zen?.status ?? fact.zen?.error ?? '未知'};中立 ${fact.neutral?.status ?? fact.neutral?.error ?? '未知'}`;
+      li.append(detail);
+    }
+    if (n.cooldown) {
+      const policy = n.cooldown;
+      const cause = policy.blocked ? '连接被拒绝' : policy.reason === 'rejected' ? '可重试上游拒绝或超时'
+        : policy.reason === '5xx' ? '上游 5xx' : 'HTTP 429 限流';
+      li.append(tag('route', `${policy.group || 'default'} · ${cause}`));
+    }
     return li;
   }));
 }
@@ -212,68 +237,87 @@ function num(cls, label, value) {
   return s;
 }
 
-/**
- * 调用日志卡。数据来自 usage.calls —— **每条成功的上游调用**一行,最近的在最前。
- *
- * 和按节点聚合的做法刻意不同:聚合桶里一个节点只留得下「最近一次用的模型和
- * 强度」,同一个节点连着跑十次不同档位就只剩最后一次。排查「客户端设了 max
- * 却变成 high」要的正是被覆盖掉的那几次(见 core.js 的 callLog)。
- */
+/** 调用日志:最终请求结果独立于可展开的真实尝试链。 */
 function renderCallLog() {
-  const { rows, tokens, ttfb, duration } = callLog(S.usage?.calls);
-  // 失败那三个数只有按节点聚合的桶里有(逐条记录只收成功的)。带上「累计」二字:
-  // 它们是开机至今的总数,和前面那段「最近 N 条」不是同一个窗口,不标出来会被当成
-  // 这 N 条里的失败数去减
+  const { rows, tokens, ttfb, duration } = callLog(S.usage?.calls, S.usage?.requests);
   const { totals } = nodeStats(S.usage?.byNode);
   $('nstat-empty').hidden = rows.length > 0;
   $('nstat-sum').textContent = rows.length
     ? `最近 ${fmtCount(rows.length)} 条 · Token ${fmtTokens(tokens)}`
-      + ` · 平均首字 ${fmtDelay(ttfb)} · 平均耗时 ${fmtDelay(duration)}`
+      + ` · 成功平均首字 ${fmtDelay(ttfb)} · 成功平均耗时 ${fmtDelay(duration)}`
       + ` · 累计限流 ${fmtCount(totals.rateLimited)} · 超时 ${fmtCount(totals.timeout)}`
       + ` · 错误 ${fmtCount(totals.upstreamError)}`
-      // 取消只在真发生过时才显示,免得给常见情况添噪音
       + (totals.clientCanceled ? ` · 取消 ${fmtCount(totals.clientCanceled)}` : '')
-    : '每条成功的上游调用记一行,失败的尝试只进运行日志。';
+    : '请求结果和上游尝试会保留在这里,包括失败与取消。';
 
-  // 列表现在是自己的滚动容器(限高 + 藏起来的滚动条),而 replaceChildren 会把
-  // 内容清空一瞬间,scrollTop 被夹回 0 —— 不存回来的话每 2 秒轮询一次就把人
-  // 弹回顶部,翻旧记录根本翻不动
+  const labels = { success: '成功', rateLimited: '限流', timeout: '超时', upstreamError: '上游错误',
+    clientCanceled: '客户端取消', backendMismatch: '后端不匹配', error: '失败', fail: '失败', pending: '结果待定' };
+  const result = (outcome, status) => tag(`trace-result ${outcome === 'success' ? 'ok' : outcome === 'pending' ? 'pending' : 'failed'}`,
+    `${labels[outcome] || outcome || '未知结果'}${status != null ? ` · HTTP ${status}` : ''}`);
+  const tokenText = (r) => `Token ${fmtTokens(r.total)} · 入 ${fmtTokens(r.in)}`
+    + ` · 出 ${fmtTokens(r.out)} · 推理 ${fmtTokens(r.reasoning)}`;
   const ul = $('nstats');
   const top = ul.scrollTop;
-  ul.replaceChildren(...rows.map((r) => {
-    const li = document.createElement('li');
-    li.className = 'nstat';
+  const focused = document.activeElement?.closest('#nstats .trace-summary');
+  const existing = new Map([...ul.children].map((li) => [li.dataset.traceKey, li]));
 
-    // 时刻在最左:这张表是按时间倒序的,没有它就看不出两行差了多久。
-    // 和节点名拆成两个元素 —— 时刻要等宽数字才对得齐,节点名要能省略号截断
-    const at = tag('at', fmtClock(r.at));
-    const nm = tag('nm', r.node || '—');
-    nm.title = r.node;
-    const main = document.createElement('div');
-    main.className = 'nstat-main';
-    main.append(
-      at, nm,
-      // 模型和强度紧跟节点名 —— 排查透传时要的就是这两个数,必须挨着看才对得上。
-      // 强度 '—' = 没发这个字段(随上游默认),和显式发了 high 是两回事。
-      num('', '模型', r.model || '—'),
-      num('', '强度', r.effort || '—'),
-      num('', '首字', fmtDelay(r.ttfb)),
-      num('', '耗时', fmtDelay(r.ms)),
-    );
+  rows.forEach((r, index) => {
+    let li = existing.get(r.key);
+    if (li) existing.delete(r.key);
+    else {
+      li = document.createElement('li');
+      li.className = 'nstat';
+      li.dataset.traceKey = r.key;
+      const details = document.createElement('details');
+      details.className = 'trace-request';
+      const summary = document.createElement('summary');
+      summary.className = 'trace-summary';
+      const attempts = document.createElement('ol');
+      attempts.className = 'trace-attempts';
+      attempts.setAttribute('aria-label', '按发生顺序排列的上游尝试');
+      details.append(summary, attempts);
+      li.append(details);
+    }
+    // 保留 details/summary 节点本身:轮询不丢折叠状态,键盘焦点也不被重建夺走。
+    const summary = li.querySelector('.trace-summary');
+    const main = tag('nstat-main', '');
+    const name = tag('nm', r.node || '无上游尝试');
+    name.title = r.node;
+    main.append(tag('at', fmtClock(r.at)), name,
+      result(r.outcome, r.status), num('', '模型', r.model || '—'),
+      num('', '总耗时', fmtDelay(r.elapsed)));
+    const sub = tag('sub', `${r.requestId ? `请求 ${r.requestId}` : '历史记录 · 无请求关联'}`
+      + ` · 保留 ${fmtCount(r.attempts.length)} / ${fmtCount(r.attemptCount)} 次尝试 · ${tokenText(r)}`);
+    summary.replaceChildren(main, sub);
 
-    const sub = document.createElement('p');
-    sub.className = 'sub';
-    // Token 总数下来和分项同行:它就是入+出的和,拆在两行里对不起来。
-    // 主行少一个数之后,长节点名(机场那种带限速和流媒体标记的)不再把
-    // 模型和强度挤到折行。
-    // 推理 token 单列:它不计入 total(上游把它算在 completion 里),
-    // 但「这次到底想了多少」是判断强度有没有生效最直接的一个数
-    sub.textContent = `Token ${fmtTokens(r.total)} · 入 ${fmtTokens(r.in)}`
-      + ` · 出 ${fmtTokens(r.out)} · 推理 ${fmtTokens(r.reasoning)}`;
-
-    li.append(main, sub);
-    return li;
-  }));
+    li.querySelector('.trace-attempts').replaceChildren(...r.attempts.map((a) => {
+      const item = document.createElement('li');
+      const head = tag('nstat-main', '');
+      const node = tag('nm', a.node || '—');
+      node.title = a.node;
+      head.append(tag('at', a.attempt != null ? `#${a.attempt}` : '历史尝试'), node,
+        result(a.outcome, a.status), num('', '模型', a.model || '—'),
+        num('', '强度', a.effort || '—'), num('', '首字', fmtDelay(a.ttfb)),
+        num('', '耗时', fmtDelay(a.elapsed)));
+      item.append(head, tag('sub', tokenText(a)));
+      if (a.error) {
+        const error = document.createElement('p');
+        error.className = 'trace-error';
+        error.textContent = a.error;
+        item.append(error);
+      }
+      return item;
+    }));
+    if (!r.attempts.length) {
+      const missing = document.createElement('li');
+      missing.className = 'sub';
+      missing.textContent = r.attemptCount ? '尝试明细已移出最近记录窗口。' : '没有发出上游尝试。';
+      li.querySelector('.trace-attempts').append(missing);
+    }
+    if (ul.children[index] !== li) ul.insertBefore(li, ul.children[index] || null);
+  });
+  for (const li of existing.values()) li.remove();
+  if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
   ul.scrollTop = top;
 }
 
@@ -456,8 +500,9 @@ async function refresh() {
     S.excluded = pool?.excluded || [];
     S.testedAt = pool?.testedAt || null;
     S.testing = pool?.testing === true;
+    S.egress = pool?.egress || { byNode: {}, measured: 0, distinct: 0, measuring: false };
     // 服务端给秒,进来立刻折算成本地截止点,之后本地走秒不用等下次轮询
-    S.cooldowns = (pool?.cooldowns || []).map((c) => ({ node: c.node, deadline: cooldownDeadline(c.remain) }));
+    S.cooldowns = (pool?.cooldowns || []).map((c) => ({ ...c, deadline: cooldownDeadline(c.remain) }));
 
     renderPills(); renderStats(); renderNodes(); renderCallLog();
     renderConn(); renderModels(); renderBuild();

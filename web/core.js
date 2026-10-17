@@ -231,11 +231,12 @@ export function nodeRows({ nodes = [], cooldowns = [], current = '', locked = ''
     // 同一个节点可能有多条:按供应商组分开记,而且一条落地冷却会摊到它名下
     // 所有节点名上。取最长的那条 —— 这一格显示的是「还要多久能用」,
     // 直接 set 会变成最后一条覆盖前面的,可能报出一个偏短的时间。
-    if (ms > (cooling.get(c.node) || 0)) cooling.set(c.node, ms);
+    if (ms > (cooling.get(c.node)?.remain || 0)) cooling.set(c.node, { remain: ms, policy: c });
   }
 
   const mk = (name, i, dead) => {
-    const remain = cooling.get(name) || 0;
+    const policy = cooling.get(name);
+    const remain = policy?.remain || 0;
     const d = Number(delay?.[name]);
     // 冷却优先于 active:当前节点正被限流时它其实不可用,标成 active 是骗人
     const state = dead ? 'dead' : remain > 0 ? 'cooling' : name === current ? 'active' : 'idle';
@@ -243,6 +244,7 @@ export function nodeRows({ nodes = [], cooldowns = [], current = '', locked = ''
       name, i, remain, state,
       latency: dead ? null : Number.isFinite(d) && d > 0 ? d : null,
       locked: name === locked, ratio: remain / COOLDOWN_MS,
+      cooldown: policy?.policy || null,
     };
   };
 
@@ -442,44 +444,103 @@ export function nodeStats(byNode) {
 }
 
 /**
- * calls -> 可直接渲染的行 + 汇总。最近的排最前。
- *
- * 和 nodeStats 的区别就是这个模块存在的理由:那边按节点聚合,一个节点只留
- * 得下「最近一次用的模型和强度」;这边每条成功调用独立一行,同一个节点连着
- * 跑十次不同档位能看到十行。排查「客户端设了 max 却没生效」要的是后者 ——
- * 聚合值只告诉你最后一次是什么,看不出中间被谁改过。
- *
- * 只有成功的调用会进来(见 gateway.mjs 的 logCall),所以这里没有成功率。
+ * 请求结果和真实尝试分开展示。旧 calls 没有关联号时仍是独立历史成功行;
+ * 只有尝试、没有最终摘要的请求保持 pending,不能由最后一次尝试猜测结果。
  */
-export function callLog(calls) {
+export function callLog(calls, requests = []) {
   const rows = [];
+  const groups = new Map();
+  const summaries = new Map();
+  const sequence = new Map();
+  const legacyKeys = new Map();
   const acc = { ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0 };
+  const text = (value) => String(value ?? '').trim();
+  const ms = (value) => value != null && Number.isFinite(Number(value)) && Number(value) >= 0
+    ? Number(value) : null;
+  const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
   let tokens = 0;
+  let order = 0;
+  const group = (requestId) => {
+    if (!groups.has(requestId)) {
+      const row = { key: `request:${requestId}`, requestId, attempts: [] };
+      groups.set(requestId, row);
+      rows.push(row);
+    }
+    return groups.get(requestId);
+  };
   for (const c of Array.isArray(calls) ? calls : []) {
-    if (!c || typeof c !== 'object') continue;
-    const n = (k) => Number(c[k]) || 0;
-    const row = {
-      at: n('at'),
-      node: String(c.node ?? '').trim(),
-      model: String(c.model ?? '').trim(),
-      // '' 保留原样 —— 前端显示 '—',表示没发这个字段(随上游默认)
-      effort: String(c.effort ?? '').trim(),
-      in: n('in'), out: n('out'), reasoning: n('reasoning'),
-      // null 和 0 要分开:测不到首字节和「零延迟」不是一回事
-      ttfb: Number.isFinite(Number(c.ttfb)) && Number(c.ttfb) > 0 ? Number(c.ttfb) : null,
-      ms: Number.isFinite(Number(c.ms)) ? Number(c.ms) : null,
+    if (!c || typeof c !== 'object' || Array.isArray(c)) continue;
+    const attempt = {
+      at: number(c.at), node: text(c.node), model: text(c.model), effort: text(c.effort),
+      requestId: text(c.requestId) || null,
+      attempt: Number.isInteger(c.attempt) && c.attempt > 0 ? c.attempt : null,
+      outcome: text(c.outcome) || 'success',
+      status: Number.isInteger(c.status) ? c.status : null,
+      error: typeof c.error === 'string' ? c.error : '',
+      elapsed: ms(c.elapsed) ?? ms(c.ms),
+      in: number(c.in), out: number(c.out), reasoning: number(c.reasoning),
+      ttfb: ms(c.ttfb) > 0 ? ms(c.ttfb) : null,
+      ms: ms(c.ms),
     };
-    row.total = row.in + row.out;
-    tokens += row.total;
-    if (row.ttfb != null) { acc.ttfbMs += row.ttfb; acc.ttfbCount++; }
-    if (row.ms != null) { acc.durationMs += row.ms; acc.durationCount++; }
-    rows.push(row);
+    attempt.total = attempt.in + attempt.out;
+    tokens += attempt.total;
+    if (attempt.outcome === 'success') {
+      if (attempt.ttfb != null) { acc.ttfbMs += attempt.ttfb; acc.ttfbCount++; }
+      if (attempt.ms != null) { acc.durationMs += attempt.ms; acc.durationCount++; }
+    }
+    let row;
+    if (attempt.requestId) row = group(attempt.requestId);
+    else {
+      const identity = JSON.stringify([attempt.at, attempt.node, attempt.model, attempt.effort,
+        attempt.outcome, attempt.in, attempt.out, attempt.elapsed]);
+      const duplicate = legacyKeys.get(identity) ?? 0;
+      legacyKeys.set(identity, duplicate + 1);
+      row = { key: `legacy:${identity}:${duplicate}`, requestId: null, attempts: [] };
+      rows.push(row);
+    }
+    row.attempts.push(attempt);
+    sequence.set(row, order++);
   }
-  // 后端是 push 追加的,所以数组本身就是时间序;倒过来即可,不用比较排序。
-  // 同一毫秒内的两条也能保持真实先后 —— 按 at 排序反而会打乱
-  rows.reverse();
+  for (const request of Array.isArray(requests) ? requests : []) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || !text(request.requestId)) continue;
+    const row = group(text(request.requestId));
+    summaries.set(row, request);
+    sequence.set(row, order++);
+  }
+  for (const row of rows) {
+    row.attempts.sort((a, b) => a.attempt != null && b.attempt != null ? a.attempt - b.attempt : 0);
+    const last = row.attempts.at(-1);
+    const summary = summaries.get(row);
+    row.at = summary ? number(summary.at) : last?.at ?? 0;
+    row.node = last?.node ?? '';
+    row.model = summary ? text(summary.model) : last?.model ?? '';
+    row.effort = last?.effort ?? '';
+    row.outcome = summary ? text(summary.outcome) : row.requestId ? 'pending' : last.outcome;
+    row.status = summary ? (Number.isInteger(summary.status) ? summary.status : null)
+      : row.requestId ? null : last.status;
+    row.elapsed = summary ? ms(summary.elapsed) : row.requestId ? null : last.elapsed;
+    row.ttfb = last?.ttfb ?? null;
+    row.ms = last?.ms ?? null;
+    row.attemptCount = Math.max(row.attempts.length, ...row.attempts.map((a) => a.attempt ?? 0),
+      Number.isInteger(summary?.attempts) && summary.attempts >= 0 ? summary.attempts : 0);
+    row.in = row.attempts.reduce((sum, a) => sum + a.in, 0);
+    row.out = row.attempts.reduce((sum, a) => sum + a.out, 0);
+    row.reasoning = row.attempts.reduce((sum, a) => sum + a.reasoning, 0);
+    row.total = row.in + row.out;
+  }
+  // 各窗口内部仍按追加顺序倒排;合并时只比较两个窗口的当前头部,不重排历史行。
+  rows.sort((a, b) => sequence.get(b) - sequence.get(a));
+  const finished = rows.filter((row) => summaries.has(row));
+  const standalone = rows.filter((row) => !summaries.has(row));
+  const merged = [];
+  let i = 0, j = 0;
+  while (i < finished.length || j < standalone.length) {
+    if (j >= standalone.length || (i < finished.length && finished[i].at >= standalone[j].at)) {
+      merged.push(finished[i++]);
+    } else merged.push(standalone[j++]);
+  }
   return {
-    rows, tokens,
+    rows: merged, tokens,
     ttfb: avgMs(acc.ttfbMs, acc.ttfbCount),
     duration: avgMs(acc.durationMs, acc.durationCount),
   };

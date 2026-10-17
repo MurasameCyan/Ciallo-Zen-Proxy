@@ -142,15 +142,83 @@ export class NodeCooldown {
   /**
    * egressOf: 节点名 -> 落地地址。默认恒等,也就是退回「按节点名冷却」的老行为 ——
    * provider 文件还没拉下来时就是这样。
-   * namesOf: 落地地址 -> 用这个落地的所有节点名,只给 summary() 展开用(面板按节点名画)。
+   * identityOf: optional collision-free policy/exclusion key, separate from the public egress label.
+   * displayOf: policy key -> public label for get()/summary(); snapshots retain policy keys.
+   * namesOf: 落地地址 -> 当前关联节点名,只给 summary() 展开用。
+   * relatedEgressesOf: 未测节点 -> provider 历史出口,只参与查询,不参与标记/清理。
+   * onChange: 有效状态变更通知;磁盘存储由调用方负责。
    */
-  constructor({ egressOf = null, namesOf = null } = {}) {
+  constructor({ egressOf = null, identityOf = null, displayOf = null, namesOf = null, relatedEgressesOf = null, onChange = null } = {}) {
     this.cooldowns = new Map();   // key(egress,group) -> { until, retryAfter, egress, group }
     // 同 key -> 最近一次被限流的时刻。冷却过期会把上面那条删掉,但这条留着,
-    // rankNodes 靠它把刚解冻的节点排到可用节点最后(见 recentMark)。只有 clear/clearAll 清。
+    // rankNodes 靠它把刚解冻的节点排到可用节点最后。当前候选保留排序,退役出口按 collectHistory 回收。
     this.lastMarked = new Map();
     this.egressOf = egressOf || ((node) => node);
+    this.identityOf = identityOf || ((node) => this.egress(node));
+    this.displayOf = displayOf || ((identity) => identity);
+    this.rekeyIdentityOf = identityOf || ((identity) => identity);
     this.namesOf = namesOf || ((egress) => [egress]);
+    this.relatedEgressesOf = relatedEgressesOf || (() => []);
+    this.onChange = onChange || (() => {});
+  }
+
+  /** Plain state only: absolute deadlines never get recomputed on restore. */
+  snapshot() {
+    const now = Date.now();
+    return {
+      cooldowns: [...this.cooldowns.values()].filter((entry) => entry.until > now).map((entry) => ({
+        egress: entry.egress, group: entry.group, until: entry.until,
+        retryAfter: entry.retryAfter, blocked: entry.blocked, reason: entry.reason,
+      })),
+      lastMarked: [...this.lastMarked].map(([key, marked]) => {
+        const separator = key.indexOf('\u0000');
+        return { egress: key.slice(0, separator), group: key.slice(separator + 1), marked };
+      }),
+    };
+  }
+
+  restore({ cooldowns = [], lastMarked = [] } = {}) {
+    this.cooldowns.clear();
+    this.lastMarked.clear();
+    const valid = (value) => typeof value === 'string' && value.length > 0 && !value.includes('\u0000');
+    for (const entry of cooldowns) {
+      if (!entry || !valid(entry.egress) || !valid(entry.group) || !Number.isFinite(entry.until) || entry.until <= Date.now()) continue;
+      this.#setCooldown(`${entry.egress}\u0000${entry.group}`, {
+        egress: entry.egress, group: entry.group, until: entry.until,
+        retryAfter: Number.isFinite(entry.retryAfter) && entry.retryAfter > 0 ? entry.retryAfter : null,
+        ...(entry.blocked === true ? { blocked: true } : {}),
+        ...(['429', '5xx', 'blocked', 'rejected'].includes(entry.reason) ? { reason: entry.reason } : {}),
+      });
+    }
+    for (const entry of lastMarked) {
+      if (!entry || !valid(entry.egress) || !valid(entry.group) || !Number.isFinite(entry.marked) || entry.marked <= 0) continue;
+      const key = `${entry.egress}\u0000${entry.group}`;
+      this.lastMarked.set(key, Math.max(entry.marked, this.lastMarked.get(key) || 0));
+    }
+  }
+
+  /** Keep current/active ordering; retire unneeded history after at most a day. */
+  collectHistory(currentEgresses, { notify = true } = {}) {
+    const now = Date.now();
+    const retained = new Set(currentEgresses);
+    let changed = false;
+    for (const [key, entry] of this.cooldowns) {
+      if (entry.until > now) retained.add(entry.egress);
+      else { this.cooldowns.delete(key); changed = true; }
+    }
+    const oldest = now - 24 * 3600 * 1000;
+    for (const [key, marked] of this.lastMarked) {
+      const egress = key.slice(0, key.indexOf('\u0000'));
+      if (marked <= oldest && !retained.has(egress)) {
+        this.lastMarked.delete(key);
+        changed = true;
+      }
+    }
+    if (changed && notify) this.onChange();
+  }
+
+  #egresses(node, group = null) {
+    return new Set([this.identityOf(node), ...this.relatedEgressesOf(node, group)]);
   }
 
   /** 落地地址。解析不出来就用节点名本身,宁可少合并也不要误合并。 */
@@ -160,7 +228,40 @@ export class NodeCooldown {
 
   // 分隔符用 NUL:IPv6 落地地址里带冒号,再用 `${x}:${g}` 就没法切了。
   // 不过下面一律不切 key —— egress/group 存在 value 里。
-  #key(node, group = 'default') { return `${this.egress(node)}\u0000${group}`; }
+  #key(node, group = 'default') { return `${this.identityOf(node)}\u0000${group}`; }
+
+  /** Move keys directly, or resolve node names when identityOf was supplied. */
+  rekey(from, to, { preserveSource = false, identities = false, notify = true } = {}) {
+    if (!identities) { from = this.rekeyIdentityOf(from); to = this.rekeyIdentityOf(to); }
+    if (!from || !to || from === to) return 0;
+    const prefix = `${from}\u0000`;
+    let moved = 0;
+    let changed = false;
+    for (const [key, entry] of this.cooldowns) {
+      if (entry.egress !== from) continue;
+      const target = `${to}\u0000${entry.group}`;
+      const existing = this.cooldowns.get(target);
+      // Keep the complete policy of the longest deadline. On equal deadlines,
+      // prefer the explicit Retry-After rather than silently dropping it.
+      if (!existing || entry.until > existing.until ||
+          (entry.until === existing.until && (entry.retryAfter || 0) > (existing.retryAfter || 0))) {
+        this.cooldowns.set(target, { ...entry, egress: to });
+      }
+      if (!preserveSource) this.cooldowns.delete(key);
+      moved++;
+      changed = true;
+    }
+    // Ranking history outlives cooldown records; migrate it independently.
+    for (const [key, marked] of this.lastMarked) {
+      if (!key.startsWith(prefix)) continue;
+      const target = `${to}\u0000${key.slice(prefix.length)}`;
+      this.lastMarked.set(target, Math.max(marked, this.lastMarked.get(target) || 0));
+      if (!preserveSource) this.lastMarked.delete(key);
+      changed = true;
+    }
+    if (changed && notify) this.onChange();
+    return moved;
+  }
 
   /**
    * 防降级:并发请求会交错落标记,一个拿到 Retry-After: 3600 的 429、另一个拿到
@@ -172,7 +273,8 @@ export class NodeCooldown {
     const existing = this.cooldowns.get(key);
     const now = Date.now();
     // 已过期的旧条目不算数;仍在生效且更久的保留
-    if (existing && existing.until > now && existing.until >= entry.until) return;
+    if (existing && existing.until > now && (existing.until > entry.until ||
+        (existing.until === entry.until && (existing.retryAfter || 0) >= (entry.retryAfter || 0)))) return;
     this.cooldowns.set(key, entry);
   }
 
@@ -180,10 +282,11 @@ export class NodeCooldown {
     const ms = retryAfterSec != null && retryAfterSec > 0
       ? Math.min(retryAfterSec * 1000, 24 * 3600 * 1000)  // 上限一天,防止解析错误
       : COOLDOWN_MS;
-    const egress = this.egress(node);
+    const egress = this.identityOf(node);
     const key = this.#key(node, group);
     this.#setCooldown(key, { until: Date.now() + ms, retryAfter: retryAfterSec, egress, group });
     this.lastMarked.set(key, Date.now());
+    this.onChange();
   }
 
   /**
@@ -194,9 +297,10 @@ export class NodeCooldown {
     const key = this.#key(node, group);
     this.#setCooldown(key, {
       until: Date.now() + BLOCKED_COOLDOWN_MS, retryAfter: null, blocked: true,
-      egress: this.egress(node), group,
+      egress: this.identityOf(node), group,
     });
     this.lastMarked.set(key, Date.now());
+    this.onChange();
   }
 
   /**
@@ -213,22 +317,43 @@ export class NodeCooldown {
     // 并发请求可能交错落标记:不能让 5xx 的 60s 覆盖更强的 429
     // Retry-After 或机场封域冷却,否则会把 1h/30min 错缩成 60s。
     if (!existing || existing.until <= now || existing.until < until) {
-      this.cooldowns.set(key, { until, retryAfter: null, reason: '5xx', egress: this.egress(node), group });
+      this.cooldowns.set(key, { until, retryAfter: null, reason: '5xx', egress: this.identityOf(node), group });
     }
     this.lastMarked.set(key, now);
+    this.onChange();
+  }
+
+  /** Retryable non-5xx rejections are unavailable, not quota exhaustion. */
+  markRejected(node, group = 'default') {
+    const now = Date.now();
+    const key = this.#key(node, group);
+    this.#setCooldown(key, {
+      until: now + COOLDOWN_MS, retryAfter: null, reason: 'rejected',
+      egress: this.identityOf(node), group,
+    });
+    this.lastMarked.set(key, now);
+    this.onChange();
   }
 
   /** 返回仍在生效的节点冷却详情;过期项顺手清掉。 */
   get(node, group = 'default') {
-    const key = this.#key(node, group);
-    const c = this.cooldowns.get(key);
-    if (!c) return null;
-    const remain = c.until - Date.now();
-    if (remain <= 0) {
-      this.cooldowns.delete(key);
-      return null;
+    let longest = null;
+    let changed = false;
+    const now = Date.now();
+    for (const egress of this.#egresses(node, group)) {
+      const key = `${egress}\u0000${group}`;
+      const c = this.cooldowns.get(key);
+      if (!c) continue;
+      if (c.until <= now) {
+        this.cooldowns.delete(key);
+        changed = true;
+      } else if (!longest || c.until > longest.until ||
+          (c.until === longest.until && (c.retryAfter || 0) > (longest.retryAfter || 0))) {
+        longest = c;
+      }
     }
-    return { ...c, remain };
+    if (changed) this.onChange();
+    return longest ? { ...longest, egress: this.displayOf(longest.egress), remain: longest.until - now } : null;
   }
 
   isCooling(node, group = 'default') {
@@ -238,19 +363,22 @@ export class NodeCooldown {
   clear(node, group = null) {
     if (group === null) {
       // 清该落地所有分组(冷却记录和「最近限流时刻」一起清,恢复它的正常优先级)
-      const prefix = `${this.egress(node)}\u0000`;
+      const prefix = `${this.identityOf(node)}\u0000`;
       let n = 0;
+      let changed = false;
       for (const k of [...this.cooldowns.keys()]) {
-        if (k.startsWith(prefix)) { this.cooldowns.delete(k); n++; }
+        if (k.startsWith(prefix)) { this.cooldowns.delete(k); n++; changed = true; }
       }
       for (const k of [...this.lastMarked.keys()]) {
-        if (k.startsWith(prefix)) this.lastMarked.delete(k);
+        if (k.startsWith(prefix)) { this.lastMarked.delete(k); changed = true; }
       }
+      if (changed) this.onChange();
       return n;
     }
     const key = this.#key(node, group);
-    this.cooldowns.delete(key);
-    this.lastMarked.delete(key);
+    const removedCooldown = this.cooldowns.delete(key);
+    const removedMark = this.lastMarked.delete(key);
+    if (removedCooldown || removedMark) this.onChange();
     return 1;
   }
 
@@ -258,6 +386,7 @@ export class NodeCooldown {
     const n = this.cooldowns.size;
     this.cooldowns.clear();
     this.lastMarked.clear();
+    this.onChange();
     return n;
   }
 
@@ -267,27 +396,30 @@ export class NodeCooldown {
    * 一解冻就凭低延迟插回队首、又被打,后面的节点永远轮不到。成功(clear)后归零。
    */
   recentMark(node) {
-    const prefix = `${this.egress(node)}\u0000`;
+    const prefixes = [...this.#egresses(node)].map((egress) => `${egress}\u0000`);
     let ts = 0;
     for (const [k, t] of this.lastMarked) {
-      if (k.startsWith(prefix)) ts = Math.max(ts, t);
+      if (prefixes.some((prefix) => k.startsWith(prefix))) ts = Math.max(ts, t);
     }
     return ts;
   }
 
   /**
-   * exclude 里装的是节点名(调用方的 tried 集合)。这里要按落地地址排除:
-   * 超时那条分支只 tried.add 不打冷却标记,不换算的话 7 次重试可能全落在
-   * 同一台机器的 7 个不同名字上 —— 实测有一个 IP 挂了 51 个名字。
+   * exclude 里装的是节点名(调用方的 tried 集合)。这里按可能的落地地址排除:
+   * 超时不打冷却标记,未知别名与已试出口有交集就不能再试;
+   * 已实测的不同出口仍独立,不因同属一个 provider 被一起排除。
    */
   pickAvailable(nodes, group = 'default', exclude = null) {
     let banned = null;
     if (exclude?.size) {
       banned = new Set();
-      for (const n of exclude) banned.add(this.egress(n));
+      for (const n of exclude) {
+        for (const egress of this.#egresses(n, group)) banned.add(egress);
+      }
     }
     for (const n of nodes) {
-      if (banned?.has(this.egress(n))) continue;
+      if (banned && (banned.has(this.identityOf(n)) ||
+          this.relatedEgressesOf(n, group).some((egress) => banned.has(egress)))) continue;
       if (this.isCooling(n, group)) continue;
       return n;
     }
@@ -312,21 +444,35 @@ export class NodeCooldown {
    * 其实也在冷却」这件事显示出来 —— 以前面板只标被打中的那一个。
    */
   summary() {
-    const out = [];
-    for (const c of this.cooldowns.values()) {
-      const left = c.until - Date.now();
-      if (left <= 0) continue;
+    const rows = new Map();
+    const now = Date.now();
+    let changed = false;
+    for (const [key, c] of this.cooldowns) {
+      const left = c.until - now;
+      if (left <= 0) {
+        this.cooldowns.delete(key);
+        changed = true;
+        continue;
+      }
       const row = {
         group: c.group,
         remain: Math.ceil(left / 1000),
         retryAfter: c.retryAfter,
         blocked: c.blocked === true,
         reason: c.reason,
-        egress: c.egress,
+        egress: this.displayOf(c.egress),
       };
-      for (const node of this.namesOf(c.egress)) out.push({ node, ...row });
+      for (const node of this.namesOf(c.egress)) {
+        const key = `${node}\u0000${c.group}`;
+        const previous = rows.get(key);
+        if (!previous || c.until > previous.until ||
+            (c.until === previous.until && (c.retryAfter || 0) > (previous.row.retryAfter || 0))) {
+          rows.set(key, { until: c.until, row: { node, ...row } });
+        }
+      }
     }
-    return out;
+    if (changed) this.onChange();
+    return [...rows.values()].map(({ row }) => row);
   }
 }
 

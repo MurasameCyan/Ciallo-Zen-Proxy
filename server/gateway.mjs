@@ -16,7 +16,7 @@ import { MihomoAgent } from './proxy.mjs';
 import {
   LAST_NODE_FILE, USAGE_FILE, CAPS_FILE, MODELS_DEV_FILE, OPENCODE_CATALOG_FILE,
   MIXED_PORT, CTRL_PORT, POOL_NAME, lanePorts, laneDataDir, writeMihomoConfig,
-  loadProviderEgress,
+  loadProviderEgress, PROVIDER_FILE,
 } from './config.mjs';
 import { MihomoInstance } from './mihomo.mjs';
 import { LaneManager } from './lane.mjs';
@@ -35,12 +35,26 @@ import {
   providerGroup, NodeAffinity, NodeCooldown, ModelCooldown,
 } from './rotation.mjs';
 
-import { CALL_LOG_LIMIT, readUsage, UsageTracker } from './usage.mjs';
+import { CALL_LOG_LIMIT, readUsage, UsageTracker, sanitizeDiagnostic } from './usage.mjs';
 import {
   OPENCODE_HOST, CHAT_PATH, MODELS_PATH, RESPONSES_PATH, OPENAI, ANTHROPIC, RESPONSES, SYSTEMONE,
-  gateChatBody, gateResponsesBody, withToolAliases, responsesUpstreamDialect, chatToResponsesBody,
+  gateChatBody, gateResponsesBody, withToolAliases, responsesUpstreamDialect, chatUpstreamDialect, chatToResponsesBody,
 } from './dialects.mjs';
 import { json, readUtf8Body } from './http-util.mjs';
+import { SseFrames, inspectSseFrame } from './sse.mjs';
+import { EgressProbe } from './egress-probe.mjs';
+import { CooldownStateStore } from './cooldown-state.mjs';
+
+const REQUEST_TRACE = Symbol('requestTrace');
+
+function cleanDiagnostic(message, config) {
+  const secrets = [config.apiKey, config.subscriptionUrl];
+  if (config.subscriptionUrl) {
+    try { secrets.push(...new URL(config.subscriptionUrl).searchParams.values()); } catch {}
+  }
+  return sanitizeDiagnostic(message, secrets);
+}
+
 export { json } from './http-util.mjs';
 export { OPENAI, ANTHROPIC, RESPONSES, SYSTEMONE } from './dialects.mjs';
 
@@ -538,15 +552,33 @@ export class Gateway {
   constructor(cfg, logger) {
     this.config = cfg;          // { apiKey, port, ... },外部改了这里立即生效
     this.logger = logger;
-    // 冷却按「落地地址」而不是节点名记。免费额度是按出口 IP 计的,而机场里
-    // 几十个节点名常常指向同一台机器(实测 396 个名字只有 291 个落地,其中一个
-    // IP 独占 51 个名字)。按名字记就会出现:同一个 IP 被 429 之后,换个名字
-    // 继续撞它,一次请求 7 次重试全烧在同一台机器上。
-    // loadProviderEgress 自带 mtime 缓存,provider 文件没变就不重复解析。
+    // Measurements own a separate mihomo process; the persisted public identity
+    // history also protects unmeasured aliases after subscription renames.
+    this.egressProbe = new EgressProbe({ logger });
+    this.egressIdentities = new Map();
+    this.egressProviders = new Map();
+    this.egressAssociations = new Map();
+    this.egressInventory = loadProviderEgress();
+    this.egressMeasuring = null;
+    this.cooldownState = new CooldownStateStore({ logger });
+    const savedCooldowns = this.cooldownState.load();
+    for (const row of savedCooldowns?.associations || []) this.rememberEgress(row.node, row.provider, row.ip);
+    for (const row of savedCooldowns?.identities || []) {
+      this.egressIdentities.set(row.node, { provider: row.provider, ip: row.ip });
+      if (row.provider) this.egressProviders.set(row.node, row.provider);
+    }
     this.cooldown = new NodeCooldown({
-      egressOf: (node) => loadProviderEgress().get(node),
+      egressOf: (node) => this.egressIdentityOf(node),
+      identityOf: (node) => this.cooldownIdentityOf(node),
+      displayOf: (identity) => this.egressLabel(identity),
       namesOf: (egress) => this.nodesOfEgress(egress),
+      relatedEgressesOf: (node) => this.relatedEgressesOf(node),
+      onChange: () => this.saveCooldownState(),
     });
+    if (savedCooldowns) this.cooldown.restore(savedCooldowns);
+    // Restored history is checked at the first poll/selection, not kept forever.
+    this.egressHistoryCollectAt = savedCooldowns ? 0 : Infinity;
+    this.egressHistoryNodes = null;
     this.modelCooldown = new ModelCooldown();
     this.usage = new UsageTracker(USAGE_FILE, logger, cfg.persistUsage === true);
     this.agent = new MihomoAgent(MIXED_PORT);
@@ -662,7 +694,16 @@ export class Gateway {
       let last = null;
       const identity = this.identity(model);
       for (let attempt = 0; attempt < PROBE_NODE_TRIES; attempt++) {
-        const cur = await this.getCurrentNode().catch(() => null);
+        let cur = await this.getCurrentNode().catch(() => null);
+        // 上轮探测可能停在最后一个被拒绝的出口;新一轮也必须遵守共享冷却。
+        if (cur && this.cooldown.isCooling(cur, group)) {
+          const nodes = this.rankNodes(await this.getAllNodes());
+          const next = this.cooldown.pickAvailable(nodes, group, tried);
+          if (!next || !(await this.switchNode(next))) {
+            throw last || { status: 503, body: '{"error":{"message":"No usable upstream node","type":"all_nodes_unavailable"}}' };
+          }
+          cur = next;
+        }
         if (cur) tried.add(cur);
         try {
           return await this.probeOnce(body, identity);
@@ -684,6 +725,12 @@ export class Gateway {
           // 时长往往是几个小时(2026-10-13 实测 muse 回 retry-after: 20661)。不记的话,
           // 下一轮探测和真实请求都会再撞同一批耗尽的出口,探针就一直灰着。
           if (kind === 'rate_limited' && cur) this.cooldown.mark429(cur, group, e?.retryAfter ?? null);
+          if (kind === 'retryable' && cur) {
+            const status = Number(e?.status) || 0;
+            if (status >= 500 && status < 600) this.cooldown.mark5xx(cur, group);
+            else this.cooldown.markRejected(cur, group);
+            this.logger('warn', `[probe-retry] HTTP ${status} group="${group}" node=${JSON.stringify(cleanDiagnostic(cur, this.config))},尝试下一个出口`);
+          }
           if (attempt === PROBE_NODE_TRIES - 1) break;
           const nodes = this.rankNodes(await this.getAllNodes());
           const next = this.cooldown.pickAvailable(nodes, group, tried);
@@ -1088,7 +1135,56 @@ export class Gateway {
   }
 
   async handleChat(req, res, dialect = OPENAI) {
-    const reqStart = Date.now();
+    const trace = { requestId: crypto.randomUUID(), started: Date.now(), model: '', attempts: 0, outcome: 'error', canceled: false };
+    res[REQUEST_TRACE] = trace;
+    res.setHeader?.('X-Request-ID', trace.requestId);
+    // HTTP may emit finish after a failed socket write, then detach the socket.
+    const clientSocket = res.socket;
+    let handled = false, completed = false, recorded = false, flushed = false;
+    const finalize = () => {
+      if (!handled || !completed || recorded) return;
+      recorded = true;
+      res.off('finish', onFinish);
+      res.off('close', onClose);
+      if (trace.aggregate && !trace.canceled) {
+        const { model, usage, success } = trace.aggregate;
+        this.usage.record(model, usage, success);
+      }
+      this.usage.recordRequest({
+        requestId: trace.requestId, model: trace.model,
+        outcome: trace.canceled ? 'clientCanceled' : trace.outcome,
+        status: trace.canceled && !res.headersSent ? null : (Number(res.statusCode) || 500),
+        elapsed: Date.now() - trace.started, attempts: trace.attempts,
+      });
+      delete res[REQUEST_TRACE];
+    };
+    const onFinish = () => {
+      flushed = !clientSocket?.destroyed && !clientSocket?.errored;
+      if (!flushed) trace.canceled = true;
+      completed = true;
+      finalize();
+    };
+    const onClose = () => {
+      if (!flushed) trace.canceled = true;
+      completed = true;
+      finalize();
+    };
+    res.once('finish', onFinish);
+    res.once('close', onClose);
+    try {
+      return await this._handleChat(req, res, dialect);
+    } finally {
+      handled = true;
+      if (res.destroyed && !flushed) {
+        completed = true;
+        trace.canceled = true;
+      }
+      finalize();
+    }
+  }
+
+  async _handleChat(req, res, dialect) {
+    const reqStart = res[REQUEST_TRACE].started;
     const raw = await readUtf8Body(req, 8e6);
     if (raw === null) return dialect.fail(res, 413, 'Request too large', 'request_too_large');
     // 预算按体积算,但从请求进来的那一刻起算 —— 几 MB 的上传本身就要几秒到几十秒,
@@ -1096,6 +1192,11 @@ export class Gateway {
     const deadline = reqStart + budgetFor(Buffer.byteLength(raw, 'utf8'));
     let inbound;
     try { inbound = JSON.parse(raw); } catch { return dialect.fail(res, 400, 'Invalid JSON', 'invalid_request_error'); }
+    if (!inbound || typeof inbound !== 'object' || Array.isArray(inbound)) {
+      return dialect.fail(res, 400, 'JSON object required', 'invalid_request_error');
+    }
+    const requestedModel = typeof inbound.model === 'string' ? inbound.model.trim() : '';
+    res[REQUEST_TRACE].model = requestedModel;
 
     const bad = dialect.validate(inbound);
     if (bad) return dialect.fail(res, 400, bad, 'invalid_request_error');
@@ -1103,7 +1204,6 @@ export class Gateway {
     // 流式意图在三种方言里都是顶层 stream:true,转换后依然如此。只有 models.dev
     // 明确报告纯文本时才让方言降级附件;元数据缺失时 fail-open,保持原请求。
     const wantStream = inbound.stream === true;
-    const requestedModel = typeof inbound.model === 'string' ? inbound.model.trim() : '';
     // System One(jev 系)是分类器,不是对话:它要的是 state + 带类型的 questions,
     // 回的是每个问题的概率,和三种对话协议之间没有不靠猜的互译。所以两边串门一律
     // 出站前 400、指明该走哪个入口 —— 发上去只会换来 ModelProtocolUnsupported(chat
@@ -1122,13 +1222,14 @@ export class Gateway {
           'invalid_request_error');
       }
     }
-    // 原生协议路由:muse-spark 1.2/1.3 这类模型的上游端点是 /inference/v1/responses,
-    // 打 /inference/v1/chat/completions 一律 500(实测)。客户端说 chat/anthropic 时,
-    // 把上游那条腿换成 Responses:body 翻成 Responses 形状发上去,回来的 response.*
-    // 事件由 sink 里的 bridge 翻回 chat chunk —— validate/respond/collect 仍用客户端方言,
-    // 对它透明。客户端本来就说 Responses(codex 那类)的不动,它走原路。
-    if (dialect !== RESPONSES && requestedModel && this.modelProtocol(requestedModel) === 'responses') {
+    // Convert only the upstream leg; validation/collection still speak the client protocol.
+    const clientDialect = dialect;
+    if (requestedModel && this.modelProtocol(requestedModel) === 'responses' && dialect !== RESPONSES) {
       dialect = responsesUpstreamDialect(dialect);
+    } else if (requestedModel && this.modelProtocol(requestedModel) === 'chat' && dialect === RESPONSES) {
+      dialect = chatUpstreamDialect(dialect);
+      const unsupported = dialect.validate(inbound);
+      if (unsupported) return dialect.fail(res, 400, unsupported, 'invalid_request_error');
     }
     const body = dialect.toUpstream(inbound, requestedModel ? this.modelMetadata(requestedModel) : null);
     // 免费层准入:上游要求 stream:true,并校验 OpenCode v2 的精确 read/shell 工具
@@ -1174,12 +1275,14 @@ export class Gateway {
      * (见 handleModels);两处都没有上限就一个字不改,猜一个数会把本来能过的
      * 请求夹坏。上下文上限不参与:它和输出预算是两件事。
      */
-    if (dialect.path === RESPONSES_PATH && Number.isFinite(body.max_output_tokens) && body.max_output_tokens > 0) {
+    const outputField = dialect.path === RESPONSES_PATH ? 'max_output_tokens'
+      : clientDialect === RESPONSES ? 'max_completion_tokens' : null;
+    if (outputField && Number.isFinite(body[outputField]) && body[outputField] > 0) {
       const measured = this.caps.get(model)?.maxOut;
       const cap = Number.isFinite(measured) && measured > 0
         ? measured
         : this.modelMetadata(model)?.maxOutputTokens;
-      if (Number.isFinite(cap) && cap > 0 && cap < body.max_output_tokens) body.max_output_tokens = cap;
+      if (Number.isFinite(cap) && cap > 0 && cap < body[outputField]) body[outputField] = cap;
     }
 
     /**
@@ -1251,6 +1354,7 @@ export class Gateway {
       this.lanes.release(lane);
       lane = null;
     }
+    this.measureEgress([cur, ...nodes]).catch(() => {});
     return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort, affinityKey, lane);
   }
 
@@ -1259,7 +1363,7 @@ export class Gateway {
     return this.handleChat(req, res, ANTHROPIC);
   }
 
-  /** OpenAI Responses API 入口。上游原生支持,同一条路换个方言(近乎透传)。 */
+  /** OpenAI Responses 入口。按模型原生协议选择直通或 Chat 反向桥。 */
   async handleResponses(req, res) {
     return this.handleChat(req, res, RESPONSES);
   }
@@ -1303,15 +1407,14 @@ export class Gateway {
 
     cur = this.cooldown.pickAvailable(nodes, group);
     if (!cur) {
-      // 5xx/封域冷却不是用户限流:不能按 429 等待 60s,也不能把它伪报成
-      // all_nodes_429。此时入口直接回 503,让调用方按自己的策略重试。
+      // 上游拒绝/超时、5xx、封域都不是额度耗尽:直接回 503,不能等待或伪报 429。
       const cooling = nodes
         .map((node) => this.cooldown.get(node, group))
         .filter(Boolean);
       const allUpstreamFailure = cooling.length === nodes.length && cooling.every((c) =>
-        c.reason === '5xx' || c.blocked === true);
+        c.reason === '5xx' || c.reason === 'rejected' || c.blocked === true);
       if (allUpstreamFailure) {
-        this.logger('warn', `[cooldown] 所有节点都因上游 5xx/封域不可用,不等待 429 冷却`);
+        this.logger('warn', `[cooldown] 所有节点都因上游拒绝/超时、5xx 或封域不可用,不等待 429 冷却`);
         dialect.fail(res, 503, 'No usable upstream node', 'all_nodes_unavailable');
         return null;
       }
@@ -1368,7 +1471,22 @@ export class Gateway {
     const MAX_BACKEND_RETRY = 8;
     let backendRetry = 0;
     const left = () => deadline - Date.now();
-    const call = { model: body.model, effort };
+    const trace = res[REQUEST_TRACE] || { requestId: crypto.randomUUID(), attempts: 0, outcome: 'error' };
+    const call = { model: body.model, effort, requestId: trace.requestId };
+    const recordClient = (usage, success) => {
+      if (res[REQUEST_TRACE]) trace.aggregate = { model: body.model, usage, success };
+      else this.usage.record(body.model, usage, success);
+    };
+    let attemptStartedAt = 0;
+    const recordAttempt = (outcome, usage = null, timing = null, error = null) => {
+      const status = outcome === 'success' ? 200 : (Number(error?.status) || null);
+      const message = error ? (upstreamErrorMessage(error.body) || error.message || '') : '';
+      this.usage.recordAttempt(cur, outcome, usage, timing, {
+        ...call, attempt: trace.attempts, status, error: cleanDiagnostic(message, this.config),
+        elapsed: Date.now() - attemptStartedAt,
+      });
+      trace.outcome = outcome;
+    };
     const fails = { timeout: 0, rateLimited: 0 };
     const bind = (node) => { if (affinityKey) this.affinity.bind(affinityKey, node); };
     const unbind = (node) => { if (affinityKey) this.affinity.release(affinityKey, node); };
@@ -1421,8 +1539,9 @@ export class Gateway {
     const signal = aborter.signal;
     let clientGone = false;
     const onClientClose = () => {
-      if (res.writableEnded) return;   // 正常收尾也会触发 close,那不是取消
+      if (res.writableFinished) return;   // end() 之后仍可能在背压中被客户端取消
       clientGone = true;
+      trace.canceled = true;
       aborter.abort();
     };
     res.on('close', onClientClose);
@@ -1444,8 +1563,9 @@ export class Gateway {
      * forceTimeout 给「预算烧穿」用 —— 那本身就是超时,和试了几次无关。
      */
     const giveUp = (note, forceTimeout = false) => {
+      trace.outcome = forceTimeout || fails.timeout ? 'timeout' : fails.rateLimited ? 'rateLimited' : 'error';
       finishLane();
-      this.usage.record(body.model, null, false);
+      recordClient(null, false);
       // 只在失败路径上序列化:成功路径不该为一句错误文案付几 MiB 的代价
       const mib = JSON.stringify(body).length / 1048576;
       this.logger('error',
@@ -1459,11 +1579,11 @@ export class Gateway {
         // 只报这次请求真撞过的出口。以前这里挂的是全局 cooldown.summary():
         // 一次请求最多试 MAX_NODE_TRIES+1 个出口,却把全表几百条冷却甩给客户端,
         // 读起来像「所有节点都被限流了」,而实际上多数出口根本没碰过。
-        const egresses = new Set([...tried].map((n) => this.cooldown.egress(n)));
+        const egresses = new Set([...tried].map((n) => this.cooldown.identityOf(n)));
         return dialect.fail(res, 429,
           `Rate-limited on ${egresses.size} egress IP(s) after ${fails.rateLimited} attempt(s)`,
           'all_nodes_429',
-          { cooldown: this.cooldown.summary().filter((c) => egresses.has(c.egress)) });
+          { cooldown: this.cooldown.summary().filter((c) => tried.has(c.node) && c.group === providerGroup(body.model)) });
       }
       return dialect.fail(res, 503, 'No usable upstream node', 'all_nodes_unavailable');
     };
@@ -1471,9 +1591,10 @@ export class Gateway {
     const returnUpstreamError = (e, attemptRecorded = false) => {
       finishLane();
       const status = Number(e?.status) || 502;
-      if (!attemptRecorded) this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
-      this.usage.record(body.model, null, false);
-      this.logger('error', `[chat] HTTP ${status}: ${String(e?.body ?? e?.message ?? '').slice(0, 300)}`);
+      if (!attemptRecorded) recordAttempt('upstreamError', null, null, e);
+      trace.outcome = 'upstreamError';
+      recordClient(null, false);
+      this.logger('error', `[chat] HTTP ${status}: ${cleanDiagnostic(upstreamErrorMessage(e?.body) || e?.message || '', this.config)}`);
       if (dialect.rawErrors) {
         let payload;
         try { payload = JSON.parse(e?.body); } catch { payload = { error: { message: `HTTP ${status}` } }; }
@@ -1497,6 +1618,8 @@ export class Gateway {
         return giveUp(`预算烧穿,放弃(换过 ${switches} 个节点)`, true);
       }
       const t0 = Date.now();
+      attemptStartedAt = t0;
+      trace.attempts++;
       try {
         // 客户端要非流式就一律缓冲拼装:上游本来就只收 stream:true(见
         // gateChatBody),RESPONSES 那条不过闸但也同理 —— 与其逐个方言判断
@@ -1517,7 +1640,7 @@ export class Gateway {
           // 但这次尝试对节点来说是上游错误,对客户端来说是一次失败。
           if (result.ok) {
             // 子 lane 不更新全局 lockedNode:并发子请求不该把主 lane 的粘滞顶掉
-            if (!lane) {
+            if (!childLane) {
               this.lockedNode = cur;
               this.saveLastNode(cur);
             }
@@ -1542,11 +1665,12 @@ export class Gateway {
           const outcome = result.ok ? 'success' : (canceled ? 'clientCanceled' : 'upstreamError');
           // 只给成功那次记耗时:中断的那次总耗时量的是「断在第几秒」,
           // 不是这个节点跑完一次要多久,混进平均值里读不出任何东西
-          this.usage.recordAttempt(cur, outcome, result.usage,
-            result.ok ? { ttfb: result.ttfb, total: dt } : null, call);
+          recordAttempt(outcome, result.usage,
+            result.ok ? { ttfb: result.ttfb, total: dt } : null,
+            result.ok ? null : { status: result.status, message: result.error || (canceled ? 'Client canceled' : 'Upstream stream interrupted') });
           // 客户端取消不算模型失败:它没跑完不代表模型/上游有问题,
           // 记成 false 会把取消也算进「这个模型失败了几次」
-          if (!canceled) this.usage.record(body.model, result.usage, result.ok);
+          if (!canceled) recordClient(result.usage, result.ok);
           this.logger(result.ok ? 'ok' : (canceled ? 'warn' : 'error'),
             `[stream-${result.ok ? 'ok' : (canceled ? 'cancel' : 'cut')}] node="${cur}"${lane ? ` lane=${lane.id}` : ''} ${dt}ms effort=${effort || '默认'}`);
           finishLane();
@@ -1554,7 +1678,7 @@ export class Gateway {
           // 走下面的通用成功路径即可(它按 result 取值,而 result 就是那个对象)。
           if (!useBuffered) return;
         }
-        if (!lane) {
+        if (!childLane) {
           this.lockedNode = cur;
           this.saveLastNode(cur);
         }
@@ -1563,8 +1687,8 @@ export class Gateway {
         bind(cur);
         // 非流式(网关替客户端收流拼装)那条腿的同一件事:已确认成功才写状态。
         this.availability.markAvailable(body.model);
-        this.usage.recordAttempt(cur, 'success', result.usage, { ttfb: result._ttfb, total: dt }, call);
-        this.usage.record(body.model, result.usage, true);
+        recordAttempt('success', result.usage, { ttfb: result._ttfb, total: dt });
+        recordClient(result.usage, true);
         this.logger('ok', `[ok] node="${cur}"${lane ? ` lane=${lane.id}` : ''} ${dt}ms tokens=${result.usage?.total_tokens ?? '?'}`
           + ` effort=${effort || '默认'}`);
         finishLane();
@@ -1575,6 +1699,7 @@ export class Gateway {
         // abort 的形状和传输失败一样(status 0),不加这一条会被当成网络抖动,
         // 于是「取消」变成挨个节点重发、烧完额度才停。
         if (clientGone) {
+          recordAttempt('clientCanceled', null, null, e);
           finishLane();
           this.logger('warn', `[cancel] 客户端断开,已中断上游请求 node="${cur}"`);
           try { res.end(); } catch {}
@@ -1585,9 +1710,9 @@ export class Gateway {
         // 收尾由 forwardStream 里的 sink 负责(它才拿得到那个 sink),这里只记账。
         if (e.notStarted === false) {
           unbind(cur);
-          this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
-          this.usage.record(body.model, null, false);
-          this.logger('error', `[stream-mid] node="${cur}" 中断: ${e.body || e.message}`);
+          recordAttempt('upstreamError', null, null, e);
+          recordClient(null, false);
+          this.logger('error', `[stream-mid] node="${cur}" 中断: ${cleanDiagnostic(upstreamErrorMessage(e.body) || e.message || '', this.config)}`);
           try { res.end(); } catch {}
           finishLane();
           return;
@@ -1600,7 +1725,7 @@ export class Gateway {
         // (换 session 会把同一对话的 prompt cache 和节点粘滞一起丢掉)。
         if (e.backendPinFailed) return returnUpstreamError(e);
         if (e.backendMismatch) {
-          this.usage.recordAttempt(cur, 'backendMismatch', null, null, call);
+          recordAttempt('backendMismatch', null, null, e);
           if (++backendRetry > MAX_BACKEND_RETRY) {
             return returnUpstreamError({
               status: 502,
@@ -1620,7 +1745,7 @@ export class Gateway {
           const retryAfter = e.retryAfter ?? null;
           this.cooldown.mark429(cur, group, retryAfter);
           unbind(cur);
-          this.usage.recordAttempt(cur, 'rateLimited', null, null, call);
+          recordAttempt('rateLimited', null, null, e);
           fails.rateLimited++;
           const coolSec = retryAfter ?? Math.ceil(COOLDOWN_MS / 1000);
           this.logger('warn', `[429] node="${cur}" model="${body.model}" group="${group}" 限流,冷却 ${coolSec}s${retryAfter ? ' (Retry-After)' : ''}`);
@@ -1635,7 +1760,7 @@ export class Gateway {
             const s = this.cooldown.summary().filter((c) => c.group === group);
             // 等多久看剩余最短的那个,不是表里碰巧排第一的那个
             const soon = this.cooldown.soonest(nodes, group);
-            this.usage.record(body.model, null, false);
+            recordClient(null, false);
             this.logger('error', `[chat] 候选出口全在冷却或已试过: 本组冷却 ${s.length} 条,已试 ${tried.size} 个节点`);
             finishLane();
             return dialect.fail(res, 429,
@@ -1666,7 +1791,7 @@ export class Gateway {
 
         if (status === 0) {
           // 超时/连接失败:每次都是真发出去过的一次尝试,所以重试前先记一笔
-          this.usage.recordAttempt(cur, 'timeout', null, null, call);
+          recordAttempt('timeout', null, null, e);
           fails.timeout++;
 
           // 机场拒连(TLS 握手断/证书劫持/SNI 封锁)是确定性故障:
@@ -1727,13 +1852,14 @@ export class Gateway {
         }
 
         if (kind === 'retryable') {
-          this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
-          // 5xx 秒拒是坏出口的确定性特征:记一笔短冷却,让这一整批被上游爆满
-          // 拒掉的节点一段时间内排到队尾,而不是每来一个请求都优先挑到延迟
-          // 最低的这批(它们延迟最低,专挑坏的打)。
+          recordAttempt('upstreamError', null, null, e);
+          // 每种可重试上游拒绝都记短退避:下个客户端请求要越过已拒绝的前缀,
+          // 不能只靠本次 tried 集合,让低延迟坏出口在每轮重试时都插回队首。
           const group = providerGroup(body.model);
           const is5xx = status >= 500 && status < 600;
           if (is5xx) this.cooldown.mark5xx(cur, group);
+          else this.cooldown.markRejected(cur, group);
+          this.logger('warn', `[retry] HTTP ${status} group="${group}" node=${JSON.stringify(cleanDiagnostic(cur, this.config))},尝试下一个出口`);
           tried.add(cur);
           netRetry = 0;
           if (this.lockedNode === cur) this.lockedNode = null;
@@ -1891,11 +2017,12 @@ export class Gateway {
     const text = () => Buffer.concat(buffered.chunks).toString('utf8');
 
     return this.forwardStream(buffered, body, dialect, budget, identity, agent, signal).then((result) => {
-      // 首帧之前就失败了(比如上游直接给个错误壳子):一个字节都没发给客户端,
-      // 这时还能换节点,所以按可重试失败抛回去 —— 别拿空壳当回答。
-      if (!result.started) {
-        const err = new Error('上游在首帧之前失败');
-        err.status = 502;
+      // No client bytes have been committed by the buffering shim. A truncated
+      // stream may be retried, but its partial content can never become HTTP 200 JSON.
+      if (!result.ok || !result.started) {
+        const err = new Error(result.error || '上游响应未完整结束');
+        err.status = result.status || 502;
+        err.body = err.message;
         err.notStarted = true;
         throw err;
       }
@@ -1913,10 +2040,15 @@ export class Gateway {
         err.body = bodyText.slice(0, 300);
         throw err;
       }
-      // 形状刻意对齐 forward():解析好的对象 + 两个**不可枚举**的元数据字段。
-      // attempt 的成功路径、方言的 respond、usage 记账三处都按这个形状取值,
-      // 不一致就会出现「响应被包了一层 ok/parsed」这种事(踩过)。
-      Object.defineProperty(parsed, 'usage', { value: result.usage, enumerable: false });
+      // The Anthropic collector has no authoritative input/cache/reasoning usage.
+      // Restore it in its internal Chat shape; keep native public Responses usage.
+      if (result.usage && dialect.name?.startsWith(ANTHROPIC.name)) {
+        const usage = readUsage(result.usage);
+        parsed.usage = { ...result.usage, prompt_tokens: usage.promptTokens,
+          completion_tokens: usage.completionTokens, total_tokens: usage.totalTokens };
+      } else if (parsed.usage == null) {
+        Object.defineProperty(parsed, 'usage', { value: result.usage, enumerable: false });
+      }
       Object.defineProperty(parsed, '_ttfb', { value: result.ttfb, enumerable: false });
       return parsed;
     });
@@ -1936,188 +2068,161 @@ export class Gateway {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: true });
       const ttfb = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
-      // 每次出站现读开关;仅影响尚未开始的响应,不打断在飞的流。
-      // v2 strips x-opencode-request, so legacy response-id pinning cannot change
-      // the upstream sample and would retry the same backend until it falsely fails.
+      // v2 cannot pin a backend; keep the existing legacy-only policy.
       const pin = this.config.pinClaudeBackend !== false && !dialect.path.startsWith('/inference/v1/')
         ? PINNED_BACKENDS[String(body.model ?? '').trim()] : null;
-
-      // 头一旦发出去,这个请求就不能重试了 —— 换节点重发等于把两半响应拼给
-      // 客户端。所以所有失败路径都得先看这个标志:started 之前 reject 让上层
-      // 换节点,started 之后只能就地收尾。
-      //
-      // 特别是空闲超时:它触发的是 socket 的 timeout,ClientRequest 也会跟着
-      // emit 一次 'timeout'。不区分状态的话那条路会带着 notStarted:true 回到
-      // 重试循环里,而此时头早就发出去了。
-      let started = false;
-      let settled = false;
-      let usage = null;     // 提到这一层:r 的 error 回调也要把已收到的 usage 带出去
-      // 流式的「首字」量的是等到第一个 chunk 有多久,不是响应头到达的时刻:
-      // 推理模型 200 之后还要想几十秒才吐第一个字,量头等于把那段等待抹掉,
-      // 而那段等待恰恰是用户真正在等的东西。
       const t0 = Date.now();
-      let firstByte = 0;
-      let sink = null;
-      const finish = (fn) => { if (!settled) { settled = true; fn(); } };
+      let started = false, settled = false, terminal = false, pinVerified = !pin;
+      let usage = null, firstByte = 0, sink = null, keepAlive = null, firstTimer = null, r;
+      const frames = new SseFrames();
+      const decoder = new TextDecoder('utf-8', { fatal: true });
+      const pending = [];
+      let format = null, prefix = '', jsonBody = '';
+      let upstream;
 
-      /**
-       * 保活心跳。覆盖整条流,不是只活到首字节 —— 长任务的静默主要发生在中段
-       * (吐一段推理后停下来想、工具调用之间空转),而不是只在开头。网关到上游有 TCP
-       * keepalive 撑着,但网关到客户端中间还隔着宝塔 nginx(默认 proxy_read_timeout
-       * 60s)和客户端自己的空闲上限。详见 StreamKeepAlive。
-       */
-      let keepAlive = null;
-      const stopHeartbeat = () => { keepAlive?.stop(); keepAlive = null; };
+      const finish = (fn) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(firstTimer);
+        keepAlive?.stop();
+        fn();
+      };
+      const fail = (error) => {
+        if (settled) return;
+        const message = upstreamErrorMessage(error.body) || error.message || 'Upstream stream failed';
+        finish(() => {
+          if (!started) return reject({ ...error, notStarted: true });
+          this.logger('error', `[stream] 中断: ${cleanDiagnostic(message, this.config)}`);
+          sink.fail(message);
+          resolve({ ok: false, usage, ttfb: firstByte, started, status: error.status || 502, error: message });
+        });
+        r?.destroy();
+      };
+      const pinError = (message) => ({
+        status: 502, backendPinFailed: true,
+        body: JSON.stringify({ error: { type: 'backend_pin_failed', message } }),
+      });
+      const openStream = () => {
+        started = true;
+        firstByte = Date.now() - t0;
+        clearTimeout(firstTimer);
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no',
+        });
+        sink = dialect.sink(res, body.model);
+        // Only complete frames reach the sink, so its wire is always at a frame boundary.
+        keepAlive = new StreamKeepAlive((value) => res.write(value));
+        r.setTimeout(0);
+        upstream.setTimeout(STREAM_IDLE_MS, () => fail({ status: 0, body: 'stream idle timeout' }));
+        for (const frame of pending) sink.write(frame);
+        pending.length = 0;
+      };
+      const receive = (text, final = false) => {
+        if (settled) return;
+        if (format === null) {
+          prefix += text;
+          const first = prefix.trimStart()[0];
+          if (!first) return;
+          format = first === '{' || first === '[' ? 'json' : 'sse';
+          text = prefix;
+          prefix = '';
+        }
+        if (format === 'json') {
+          jsonBody += text;
+          let parsed;
+          try { parsed = JSON.parse(jsonBody); } catch { return; }
+          return fail(isErrorShapedOk(parsed)
+            ? { status: embeddedStatus(parsed), body: jsonBody, retryAfter: parseRetryAfter(upstream.headers['retry-after']) }
+            : { status: 502, body: 'Expected an upstream SSE response' });
+        }
+        for (const frame of frames.feed(text, final)) {
+          if (settled) break;
+          const fact = inspectSseFrame(frame);
+          if (fact.usage) usage = fact.usage;
+          if (fact.error) {
+            fail({ ...fact.error, retryAfter: parseRetryAfter(upstream.headers['retry-after']) });
+            break;
+          }
+          if (!pinVerified) {
+            const id = sniffBackendId(frame);
+            if (id) {
+              if (backendMismatch(body.model, id)) {
+                fail({ status: 0, body: `backend mismatch: id=${id}`, backendMismatch: true, backendId: id });
+                break;
+              }
+              if (!id.startsWith(pin.want)) {
+                fail(pinError('无法确认 Claude 后端：上游响应 id 缺失或无法识别。可在面板关闭后端锁定。'));
+                break;
+              }
+              pinVerified = true;
+            } else if (fact.output || fact.terminal) {
+              fail(pinError('无法确认 Claude 后端：上游在有效输出之前没有响应 id。'));
+              break;
+            }
+          }
+          terminal ||= fact.terminal;
+          if (started) sink.write(frame);
+          else {
+            pending.push(frame);
+            // A role, lifecycle, heartbeat or partial data line cannot commit HTTP 200.
+            if (pinVerified && (fact.output || fact.terminal)) openStream();
+          }
+        }
+      };
 
-      const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb, identity, path: dialect.path, agent, signal }), (resp) => {
+      // Socket inactivity is insufficient: a stream of neutral heartbeats must not
+      // postpone first business output forever. This timer is a wall-clock deadline.
+      firstTimer = setTimeout(() => fail({ status: 0, body: `stream first-output timeout after ${ttfb}ms` }), ttfb);
+      firstTimer.unref?.();
+      r = https.request(this.reqOpts(bodyStr, {
+        accept: 'text/event-stream', timeout: ttfb, identity, path: dialect.path, agent, signal,
+      }), (resp) => {
+        upstream = resp;
+        resp.on('error', (error) => fail({ status: 0, body: error.message }));
         if (resp.statusCode !== 200) {
-          // 还没 writeHead,可以安全重试:收完 body 让上层判是 429 还是别的
           let data = '';
-          resp.on('data', (c) => (data += c));
+          resp.on('data', (chunk) => {
+            if (settled) return;
+            try { data += decoder.decode(chunk, { stream: true }); }
+            catch { fail({ status: resp.statusCode, body: 'Invalid UTF-8 in upstream error response', retryAfter: parseRetryAfter(resp.headers['retry-after']) }); }
+          });
           resp.on('end', () => {
-            const retryAfter = parseRetryAfter(resp.headers['retry-after']);
-            finish(() => reject({ status: resp.statusCode, body: data, notStarted: true, retryAfter }));
+            if (settled) return;
+            try { data += decoder.decode(); }
+            catch { return fail({ status: resp.statusCode, body: 'Invalid UTF-8 in upstream error response', retryAfter: parseRetryAfter(resp.headers['retry-after']) }); }
+            finish(() => reject({ status: resp.statusCode, body: data, notStarted: true,
+              retryAfter: parseRetryAfter(resp.headers['retry-after']) }));
           });
           return;
         }
-        // 头**不在这里**发。上游会拿 200 送一个 JSON 错误壳子而不是 SSE
-        // (见 isErrorShapedOk),此刻 writeHead 就等于把这条必败的请求钉死:
-        // started=true 之后任何失败都只能就地收尾,换节点重试的机会没了,
-        // 而客户端拿到的是一条永远不吐帧的空流。所以等第一个 chunk 到手、
-        // 确认它真是 SSE 之后再发头 —— 在那之前 reject 都是安全可重试的。
-
-        // 这份缓冲只用来抓 usage,但解码同样要有状态:半个多字节字符会让
-        // JSON.parse 抛在下面那个 catch 里,表现为偶发丢一次 usage 记账。
-        let buf = '';
-        const decoder = new TextDecoder('utf-8');
-
-        /**
-         * 首帧判定。SSE 帧一定以 `data:`/`event:`/`:` 开头,而错误壳子是一坨
-         * 裸 JSON。只看第一个非空行:够区分这两种形态,又不必攒完整个 body
-         * (真流式的第一个 chunk 之后可能几十秒才有第二个)。
-         */
-        const looksLikeSSE = (text) => {
-          const line = text.split('\n').find((l) => l.trim());
-          if (!line) return false;                 // 还没看到内容,再等下一个 chunk
-          return /^(?:data:|event:|id:|retry:|:)/.test(line.trim());
-        };
-
-        const pinError = (message) => ({
-          status: 502, notStarted: true, backendPinFailed: true,
-          body: JSON.stringify({ error: { type: 'backend_pin_failed', message } }),
-        });
-
-        const openStream = () => {
-          res.writeHead(200, {
-            'Content-Type': 'text/event-stream; charset=utf-8',
-            'Cache-Control': 'no-cache',
-            Connection: 'keep-alive',
-            'X-Accel-Buffering': 'no',
-          });
-          started = true;
-          keepAlive = new StreamKeepAlive((s) => res.write(s));
-          sink = dialect.sink(res, body.model);
-          // 首字节已到,把「等第一个字节」的短超时换成宽松的空闲超时:
-          // 推理模型思考几十秒很正常,拿 TTFB 那个尺度掐会毁掉已经成功的请求
-          r.setTimeout(0);
-          resp.setTimeout(STREAM_IDLE_MS, () => {
-            this.logger('error', `[stream] 空闲超过 ${STREAM_IDLE_MS / 1000}s,断开`);
-            r.destroy();
-          });
-        };
-
         resp.on('data', (chunk) => {
           if (settled) return;
-          // 保活计时重置:活跃的流不发 ping,静默满一个间隔才补
           keepAlive?.touch();
-          firstByte ||= Date.now() - t0;
-          if (!started) {
-            // 头还没发:先攒着判形状。判不出来就继续等,别急着发头
-            buf += decoder.decode(chunk, { stream: true });
-            const sse = looksLikeSSE(buf);
-            if (!sse) {
-              let parsed;
-              try { parsed = JSON.parse(buf); } catch { return; }
-              // 先识别错误壳子:校验错误没有响应 id,不能卡在后端锁定上。
-              if (isErrorShapedOk(parsed)) {
-                return finish(() => reject({
-                  status: embeddedStatus(parsed), body: buf, notStarted: true,
-                }));
-              }
-            }
-            if (pin) {
-              const id = sniffBackendId(buf);
-              // SSE 的注释或半帧还不能判定;完整 JSON 没有 id 则无法确认后端。
-              if (!id && sse) return;
-              if (backendMismatch(body.model, id)) {
-                finish(() => reject({
-                  status: 0, body: `backend mismatch: id=${id}`, notStarted: true,
-                  backendMismatch: true, backendId: id,
-                }));
-                r.destroy();
-                return;
-              }
-              if (!id.startsWith(pin.want)) {
-                finish(() => reject(pinError('无法确认 Claude 后端：上游响应 id 缺失或无法识别。可在面板关闭后端锁定。')));
-                r.destroy();
-                return;
-              }
-            }
-            openStream();
-            sink.write(Buffer.from(buf, 'utf8'));
-          } else {
-            sink.write(chunk);
-            buf += decoder.decode(chunk, { stream: true });
-          }
-          const lines = buf.split('\n');
-          buf = lines.pop();          // 末行可能被截断,留着等下一个 chunk
-          for (const line of lines) {
-            if (!line.startsWith('data: ') || line.includes('[DONE]')) continue;
-            try {
-              const j = JSON.parse(line.slice(6));
-              // usage 可能在三处:chat 流的顶层 j.usage(Responses 漏块型模型收尾
-              // 漏出的 chat.completion.chunk 也在这)、Responses 干净型模型的
-              // response.completed.response.usage。两套命名的归一交给 readUsage。
-              const u = j.usage || j.response?.usage;
-              if (u) usage = u;
-            } catch {}
-          }
+          let text;
+          try { text = decoder.decode(chunk, { stream: true }); }
+          catch { return fail({ status: 502, body: 'Invalid UTF-8 in upstream stream' }); }
+          receive(text);
         });
-        resp.on('end', () => finish(() => {
-          stopHeartbeat();
-          if (!started) {
-            return reject(pin
-              ? pinError('无法确认 Claude 后端：上游在返回响应 id 之前结束。可在面板关闭后端锁定。')
-              : { status: 502, body: '上游在首帧之前结束', notStarted: true });
+        resp.on('end', () => {
+          if (settled) return;
+          let text;
+          try { text = decoder.decode(); }
+          catch { return fail({ status: 502, body: 'Invalid UTF-8 in upstream stream' }); }
+          receive(text, true);
+          if (settled) return;
+          if (!terminal || frames.incomplete) {
+            return fail({ status: 502, body: 'Upstream ended before a complete stream terminal' });
           }
-          sink.end();
-          resolve({ ok: true, usage, ttfb: firstByte, started });
-        }));
-        resp.on('error', (e) => finish(() => {
-          stopHeartbeat();
-          this.logger('error', `[stream] 中断: ${e.message}`);
-          if (!started) return reject({ status: 0, body: e.message, notStarted: true });
-          // sink.fail 会补一个合法收尾(Anthropic 那边是 error + message_stop),
-          // 客户端的状态机于是能正常结束,而不是等到自己超时
-          sink.fail(e.message);
-          resolve({ ok: false, usage, ttfb: firstByte, started });   // 已经发出去一部分了,重试不了,不算可重试失败
-        }));
+          finish(() => {
+            const ok = sink.end() !== false;
+            resolve({ ok, usage, ttfb: firstByte, started, ...(!ok ? { status: 502, body: 'Upstream stream translation failed' } : {}) });
+          });
+        });
       });
-
-      r.on('error', (e) => finish(() => {
-        stopHeartbeat();
-        if (started) {
-          // TLS 错误可能先落在请求上;和响应错误一样走方言收尾,不能裸关 socket。
-          this.logger('error', `[stream] 传输中断: ${e.message}`);
-          sink.fail(e.message);
-          return resolve({ ok: false, usage, ttfb: firstByte, started });
-        }
-        reject({ status: 0, body: e.message, notStarted: true });
-      }));
+      r.on('error', (error) => fail({ status: 0, body: error.message }));
       r.on('timeout', () => {
-        if (started) return;    // 空闲超时归 resp.setTimeout 管,这里不插手
-        r.destroy();
-        finish(() => reject({ status: 0, body: `stream ttfb timeout after ${ttfb}ms`, notStarted: true }));
+        if (!started) fail({ status: 0, body: `stream first-output timeout after ${ttfb}ms` });
       });
       r.end(bodyStr);
     });
@@ -2185,13 +2290,13 @@ export class Gateway {
    * 配置里 health-check 是 lazy 的(没请求走这个组时不测,省机场流量),
    * 所以内核自己不会给出这份数据,必须显式点一遍。
    */
-  async testNodes() {
+  async testNodes({ forceEgress = false } = {}) {
     if (this.testing) return this.testing;        // 已经在测了就搭车,别测两遍
-    this.testing = this._testNodes().finally(() => { this.testing = null; });
+    this.testing = this._testNodes({ forceEgress }).finally(() => { this.testing = null; });
     return this.testing;
   }
 
-  async _testNodes() {
+  async _testNodes({ forceEgress = false } = {}) {
     const list = await this.getAllNodes();
     if (!list.length) return { tested: 0, alive: 0, dead: [], fastest: null, ms: 0 };
 
@@ -2239,6 +2344,8 @@ export class Gateway {
       this.logger('warn', `[delay] ${found.size} 个节点全都测不通(耗时 ${secs}s)${why ? `,内核回:${why}` : ''}`);
       this.logger('warn', `[delay] 探针是 ${HEALTH_URL},这次不剔除任何节点;换个地址试试 NODE_TEST_URL=`);
     }
+    const ranked = this.rankNodes(list);
+    this.measureEgress([this.lockedNode || ranked[0], ...ranked], { force: forceEgress }).catch(() => {});
     return {
       tested: found.size, alive: alive.length, dead,
       fastest: alive[0] ? { node: alive[0][0], delay: alive[0][1] } : null, ms,
@@ -2260,6 +2367,7 @@ export class Gateway {
    * 一遍,一次全灭能刷出一屏。原因由 _testNodes 那两条负责说清楚。
    */
   rankNodes(nodes) {
+    this.refreshCooldownHistory();
     if (!this.delay.size) return nodes;
     const untested = nodes.filter((n) => !this.delay.has(n));
     const alive = nodes.filter((n) => this.delay.get(n) != null);
@@ -2270,24 +2378,199 @@ export class Gateway {
     return [...alive, ...untested];
   }
 
-  /**
-   * 同一个落地地址下的所有节点名。summary() 摊冷却状态给面板用。
-   * 反向索引跟着 provider 文件的 Map 走(那个 Map 只在订阅更新后换新对象),
-   * 所以缓存到对象身份变了才重建。
-   */
-  nodesOfEgress(egress) {
-    const map = loadProviderEgress();
-    if (this._revSrc !== map) {
-      const rev = new Map();
-      for (const [node, server] of map) {
-        if (rev.has(server)) rev.get(server).push(node);
-        else rev.set(server, [node]);
-      }
-      this._revSrc = map;
-      this._rev = rev;
+  rememberEgress(node, provider, ip = null) {
+    provider ??= null;
+    // An association represents an exit of a provider, not every alias ever seen.
+    const key = JSON.stringify(provider || ip ? [provider, ip] : [null, node, null]);
+    const previous = this.egressAssociations.get(key);
+    if (previous?.node === node && previous.provider === provider && previous.ip === ip) return false;
+    this.egressAssociations.set(key, { node, provider, ip });
+    if (provider) this.egressProviders.set(node, provider);
+    return true;
+  }
+
+  providerIdentityOf(node) {
+    // Read-only: merely ranking or querying an unknown node must not grow state.
+    return loadProviderEgress().get(node) || this.egressProviders.get(node) || null;
+  }
+
+  policyIdentity(kind, value) { return JSON.stringify([kind, value]); }
+
+  egressLabel(identity) {
+    try {
+      const value = JSON.parse(identity);
+      if (Array.isArray(value) && ['ip', 'provider', 'node'].includes(value[0]) && typeof value[1] === 'string') return value[1];
+    } catch {}
+    return identity;
+  }
+
+  cooldownIdentityOf(node) {
+    const provider = this.providerIdentityOf(node);
+    const measured = this.egressIdentities.get(node);
+    return measured && measured.provider === provider
+      ? this.policyIdentity('ip', measured.ip)
+      : this.policyIdentity(provider ? 'provider' : 'node', provider || node);
+  }
+
+  /** A changed measured IP is a new exit, never a migration of the old policy. */
+  egressIdentityOf(node) {
+    const provider = this.providerIdentityOf(node);
+    const measured = this.egressIdentities.get(node);
+    return measured && measured.provider === provider ? measured.ip : (provider || node);
+  }
+
+  relatedEgressesOf(node) {
+    const provider = this.providerIdentityOf(node);
+    const measured = this.egressIdentities.get(node);
+    if (!provider || (measured && measured.provider === provider)) return [];
+    const exits = new Set();
+    for (const row of this.egressAssociations.values()) {
+      if (row.provider === provider && row.ip) exits.add(this.policyIdentity('ip', row.ip));
     }
-    // 解析不出来时 egress 就是节点名本身,原样返回
-    return this._rev.get(egress) || [egress];
+    return [...exits];
+  }
+
+  collectEgressHistory(state) {
+    const providers = loadProviderEgress();
+    const currentNodes = new Set(this.nodeCache || providers.keys());
+    const referenced = new Set(state.cooldowns.map((row) => row.egress));
+    for (const row of state.lastMarked) referenced.add(row.egress);
+    const current = new Set();
+    for (const [node, identity] of this.egressIdentities) {
+      const present = currentNodes.has(node) &&
+        (providers.get(node) || this.egressProviders.get(node) || null) === identity.provider;
+      // Provider/IP associations preserve old policy without retaining every
+      // retired name. Provider-less measurements still need their node binding.
+      if (!present && (identity.provider !== null || !referenced.has(this.policyIdentity('ip', identity.ip)))) {
+        this.egressIdentities.delete(node);
+        continue;
+      }
+      const key = JSON.stringify([identity.provider, identity.ip]);
+      current.add(key);
+      this.rememberEgress(node, identity.provider, identity.ip);
+    }
+    for (const [node, provider] of providers) {
+      if (referenced.has(this.policyIdentity('provider', provider))) this.rememberEgress(node, provider);
+    }
+    for (const [key, row] of this.egressAssociations) {
+      const identity = row.ip ? this.policyIdentity('ip', row.ip)
+        : this.policyIdentity(row.provider ? 'provider' : 'node', row.provider || row.node);
+      if (!current.has(key) && !referenced.has(identity)) this.egressAssociations.delete(key);
+    }
+    this.egressProviders.clear();
+    for (const row of this.egressAssociations.values()) {
+      if (row.provider) this.egressProviders.set(row.node, row.provider);
+    }
+    for (const [node, identity] of this.egressIdentities) {
+      if (identity.provider) this.egressProviders.set(node, identity.provider);
+    }
+    this.egressInventory = providers;
+  }
+
+  refreshCooldownHistory() {
+    const nodes = this.nodeCache;
+    const previous = this.egressHistoryNodes;
+    // Normal polls reuse the same node array. A refreshed unchanged inventory
+    // needs only one comparison, never a snapshot or history rebuild.
+    if (loadProviderEgress() !== this.egressInventory || Date.now() >= this.egressHistoryCollectAt ||
+        (nodes && previous && nodes !== previous &&
+          (nodes.length !== previous.length || nodes.some((node, i) => node !== previous[i])))) {
+      this.saveCooldownState();
+    } else if (nodes) {
+      this.egressHistoryNodes = nodes;
+    }
+  }
+
+  saveCooldownState() {
+    const providers = loadProviderEgress();
+    const nodes = this.nodeCache || [...providers.keys()];
+    const current = new Set(nodes.map((node) => {
+      const provider = providers.get(node) || this.egressProviders.get(node) || null;
+      const measured = this.egressIdentities.get(node);
+      return measured?.provider === provider ? this.policyIdentity('ip', measured.ip)
+        : this.policyIdentity(provider ? 'provider' : 'node', provider || node);
+    }));
+    // Related exits of unknown aliases are deliberately not permanent current
+    // references: only their effective policies or recent ranking retain them.
+    this.cooldown.collectHistory(current, { notify: false });
+    const state = this.cooldown.snapshot();
+    this.collectEgressHistory(state);
+    let next = Infinity;
+    const activeUntil = new Map();
+    for (const row of state.cooldowns) {
+      next = Math.min(next, row.until);
+      activeUntil.set(row.egress, Math.max(activeUntil.get(row.egress) || 0, row.until));
+    }
+    for (const row of state.lastMarked) {
+      if (!current.has(row.egress)) {
+        next = Math.min(next, Math.max(row.marked + 24 * 3600 * 1000, activeUntil.get(row.egress) || 0));
+      }
+    }
+    // Old marks protected by active policies are revisited at policy expiry;
+    // directly referenced marks remain until that node/inventory changes.
+    this.egressHistoryCollectAt = next;
+    this.egressHistoryNodes = nodes;
+    this.cooldownState.save({
+      ...state,
+      identities: [...this.egressIdentities].map(([node, { provider, ip }]) => ({ node, provider: provider ?? null, ip })),
+      associations: [...this.egressAssociations.values()],
+    });
+  }
+
+  nodesOfEgress(egress) {
+    const provider = loadProviderEgress();
+    const nodes = this.nodeCache || [...provider.keys()];
+    const typed = this.egressLabel(egress) !== egress;
+    const aliases = nodes.filter((node) => this.cooldownIdentityOf(node) === egress ||
+      (!typed && this.egressIdentityOf(node) === egress) || this.relatedEgressesOf(node).includes(egress));
+    // With an active inventory, historical exits must not become fake node rows.
+    return aliases.length || this.nodeCache || nodes.length ? aliases : [this.egressLabel(egress)];
+  }
+
+  measureEgress(nodes, options = {}) {
+    if (!this.config.subscriptionUrl || !fs.existsSync(PROVIDER_FILE)) return Promise.resolve([]);
+    if (this.egressMeasuring) return this.egressMeasuring;
+    const providers = loadProviderEgress();
+    const subscription = this.config.subscriptionUrl;
+    this.egressMeasuring = this.egressProbe.measure(nodes, options).then((facts) => {
+      const currentProviders = loadProviderEgress();
+      if (subscription !== this.config.subscriptionUrl) return [];
+      let changed = false;
+      const accepted = [];
+      for (const fact of facts) {
+        const provider = providers.get(fact.node) || null;
+        if (fact.provider !== provider || (currentProviders.get(fact.node) || null) !== provider ||
+            (this.nodeCache && !this.nodeCache.includes(fact.node))) continue;
+        accepted.push(fact);
+        if (!fact.exitIp) continue;
+        const previous = this.egressIdentities.get(fact.node);
+        if (previous?.provider === provider && previous.ip === fact.exitIp) continue;
+        const wasMeasured = previous?.provider === provider;
+        const fallback = this.policyIdentity(provider ? 'provider' : 'node', provider || fact.node);
+        this.egressIdentities.set(fact.node, { ip: fact.exitIp, provider });
+        this.rememberEgress(fact.node, provider, fact.exitIp);
+        // Only unknown fallback policy migrates; old real-IP policies stay put.
+        if (!wasMeasured) this.cooldown.rekey(fallback, this.policyIdentity('ip', fact.exitIp), { identities: true, notify: false });
+        changed = true;
+      }
+      if (changed) this.saveCooldownState();
+      return accepted;
+    }).catch(() => {
+      this.logger('warn', '[egress-probe] 出口测量失败,保留原节点健康状态');
+      return [];
+    }).finally(() => { this.egressMeasuring = null; });
+    return this.egressMeasuring;
+  }
+
+  egressStatus(nodes) {
+    this.refreshCooldownHistory();
+    const present = new Set(nodes);
+    const providers = loadProviderEgress();
+    const facts = this.egressProbe.snapshot().filter((fact) => present.has(fact.node) &&
+      fact.provider === (providers.get(fact.node) || null));
+    const ips = facts.filter((fact) => fact.exitIp).map((fact) => fact.exitIp);
+    return { measuring: this.egressMeasuring !== null, tested: facts.length, measured: ips.length,
+      distinct: new Set(ips).size, byNode: Object.fromEntries(facts.map((fact) => [fact.node, fact])) };
   }
 
   /** 被剔除的节点,面板要显示出来 —— 静默消失会让人以为订阅少了节点 */
@@ -2316,11 +2599,12 @@ export class Gateway {
     try {
       if (!fs.existsSync(LAST_NODE_FILE)) return;
       const last = fs.readFileSync(LAST_NODE_FILE, 'utf8').trim();
-      if (!last || (await this.getCurrentNode()) === last) return;
-      if ((await this.getAllNodes()).includes(last)) {
+      if (!last || !(await this.getAllNodes()).includes(last)) return;
+      if ((await this.getCurrentNode()) !== last) {
         this.logger('info', `[memo] 恢复上次节点: ${last}`);
-        await this.switchNode(last);
+        if (!(await this.switchNode(last))) return;
       }
+      this.lockedNode = last;
     } catch {}
   }
 

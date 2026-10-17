@@ -51,17 +51,41 @@ const { ModelMetadataStore } = await import('../server/model-metadata.mjs');
 const indexMod = await import('../server/index.mjs');
 const { createApp, createSubscriptionUpdater, createModelsSync, createDeadNodeReviver } = indexMod;
 
+// Self checks must not contact real upstreams or spend model probe quota.
+// Explicit per-test transports remain injectable; real HTTP stays on loopback.
+const isLoopback = host => ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(host);
+for (const transport of [http, https]) {
+  const request = transport.request;
+  transport.request = function (input, ...args) {
+    const host = typeof input === 'string' || input instanceof URL
+      ? new URL(input).hostname : input?.hostname || input?.host || 'localhost';
+    if (!isLoopback(host)) throw new Error(`Unexpected external self-check request: ${host}`);
+    return Reflect.apply(request, this, [input, ...args]);
+  };
+}
+const localFetch = globalThis.fetch;
+globalThis.fetch = async (input, options) => {
+  const host = new URL(input?.url || input).hostname;
+  if (!isLoopback(host)) throw new Error(`Unexpected external self-check fetch: ${host}`);
+  return localFetch(input, options);
+};
+
 let n = 0;
-const t = async (name, fn) => { await fn(); n++; console.log(`  ok  ${name}`); };
+const t = async (name, fn) => {
+  fs.rmSync(path.join(TMP, 'cooldowns.json'), { force: true });
+  await fn();
+  n++;
+  console.log(`  ok  ${name}`);
+};
 
 // ── 冷却状态机 ──────────────────────────────────────────
 
 const NODES = ['A', 'B', 'C'];
 
 // 冷却表的 key 是内部编码(落地地址 + 分组),测试不该拼它。
-// 这几个 helper 按 value 里存的 egress/group 找条目。
+// 这几个 helper 按 value 里存的政策身份/group 找条目。
 const entryOf = (c, node, group = 'default') => {
-  const egress = c.egress(node);
+  const egress = c.identityOf(node);
   for (const v of c.cooldowns.values()) {
     if (v.egress === egress && v.group === group) return v;
   }
@@ -74,7 +98,7 @@ const setRemain = (c, node, remainMs, group = 'default', extra = {}) => {
 };
 /** 模拟冷却已过期被清掉,但 lastMarked 还留着 */
 const thaw = (c, node, group = 'default') => {
-  const egress = c.egress(node);
+  const egress = c.identityOf(node);
   for (const [k, v] of c.cooldowns) {
     if (v.egress === egress && v.group === group) c.cooldowns.delete(k);
   }
@@ -652,18 +676,6 @@ await t('每条成功调用单独记一行,同一节点的不同强度都留得�
   assert.equal(c[0].ttfb, 100);
   assert.equal(c[0].ms, 900);
   assert.ok(c[0].at > 0, '得有时间戳,面板靠它排序和显示时刻');
-});
-
-await t('只有成功的调用进日志(失败的没 token 没耗时,会把跑通的挤出窗口)', () => {
-  const u = new UsageTracker(path.join(TMP, 'calls2.json'), () => {});
-  u.recordAttempt('A', 'rateLimited', null, null, { model: 'm', effort: 'max' });
-  u.recordAttempt('A', 'timeout');
-  u.recordAttempt('A', 'upstreamError');
-  assert.deepEqual(u.getStats().calls, [], '失败的三类都不进');
-  // 但它们在 byNode 的计数里得留着 —— 面板的「累计限流/超时/错误」读的就是那儿
-  assert.equal(u.getStats().byNode.A.rateLimited, 1);
-  assert.equal(u.getStats().byNode.A.timeout, 1);
-  assert.equal(u.getStats().byNode.A.upstreamError, 1);
 });
 
 await t('没有 usage / timing 的成功调用也记一行,缺的字段归零而不是 undefined', () => {
@@ -1501,7 +1513,7 @@ await t('v2 exo-free 不启用旧的后端钉选', async () => {
         response.headers = {};
         response.setTimeout = () => response;
         callback(response);
-        response.emit('data', Buffer.from('data: {"id":"resp_gpt","object":"chat.completion.chunk","choices":[]}' + '\n\n'));
+        response.emit('data', Buffer.from('data: {"id":"resp_gpt","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}' + '\n\ndata: [DONE]\n\n'));
         response.emit('end');
       };
       return request;
@@ -1602,17 +1614,18 @@ await t('Gateway 选点:新会话一律粘 lockedNode,已有会话粘原节点',
  * attempt() 对 res 只用 writeHead/end/write,不用真起 HTTP 服务就能验状态机。
  *
  * 是个 EventEmitter:attempt 会挂 'close' 来接客户端断开,真的 ServerResponse
- * 也是 EventEmitter。writableEnded 跟着 end() 走 —— attempt 靠它区分「正常收尾
- * 触发的 close」和「客户端主动取消」。
+ * 也是 EventEmitter。end() 同步模拟已刷完的小响应,emit finish;
+ * hangup() 则只有 close,区分正常结束与客户端取消。
  */
 function fakeRes() {
   const r = new EventEmitter();
   r.code = 0;
   r.chunks = [];
   r.writableEnded = false;
-  r.writeHead = (c) => { r.code = c; return r; };
+  r.writableFinished = false;
+  r.writeHead = (c) => { r.code = c; r.statusCode = c; return r; };
   r.write = (c) => { r.chunks.push(String(c)); return true; };
-  r.end = (c) => { if (c) r.chunks.push(String(c)); r.ended = true; r.writableEnded = true; };
+  r.end = (c) => { if (c) r.chunks.push(String(c)); r.ended = true; r.writableEnded = true; r.writableFinished = true; r.emit('finish'); };
   Object.defineProperty(r, 'body', { get: () => r.chunks.join('') });
   /** 模拟客户端中途挂断:socket 关了但响应没正常结束 */
   r.hangup = () => { r.emit('close'); };
@@ -1649,6 +1662,161 @@ function retryGateway(file, script) {
 }
 
 const BODY = { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'hi' }] };
+
+for (const stream of [false, true]) {
+  await t(`主 lane ${stream ? '流式' : '缓冲'}成功锁定并持久化节点,新会话不被更低延迟抢走`, async () => {
+    const g = retryGateway(`sm-main-sticky-${stream}.json`, (i, node, args) => {
+      if (stream) {
+        args[0].writeHead(200);
+        args[0].end('data: [DONE]\n\n');
+        return { ok: true, usage: { total_tokens: 2 } };
+      }
+      return { choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 2 } };
+    });
+    g.getAllNodes = async () => ['A', 'B'];
+    g.measureEgress = async () => [];
+    g.modelProtocol = () => 'chat';
+    g.delay = new Map([['A', 20], ['B', 1]]);
+    const saved = [];
+    g.saveLastNode = (node) => saved.push(node);
+    for (const session of ['first', 'new-session']) {
+      const req = Readable.from([JSON.stringify({ ...BODY, stream })]);
+      req.headers = { 'x-opencode-session-id': session };
+      const res = fakeRes();
+      await g.handleChat(req, res, OPENAI);
+      assert.equal(res.code, 200);
+      assert.equal(g.lockedNode, 'B', 'main 是无 inst 的真值对象,成功也必须写主锁');
+      assert.equal(g.lanes.main.active, 0, '请求结束后归还真实主 lane');
+      g.delay = new Map([['A', 1], ['B', 20]]);
+    }
+    assert.deepEqual(g.tries, ['B', 'B'], '新的会话优先粘已确认成功的主节点');
+    assert.deepEqual(saved, ['B', 'B'], '流式和缓冲成功都持久化主节点');
+  });
+
+  await t(`子 lane ${stream ? '流式' : '缓冲'}成功不覆盖主节点或它的持久化记录`, async () => {
+    const g = retryGateway(`sm-child-sticky-${stream}.json`, () => stream
+      ? { ok: true, usage: { total_tokens: 2 } }
+      : { choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 2 } });
+    g.lockedNode = 'A';
+    g.cur = 'B';
+    const saved = [];
+    g.saveLastNode = (node) => saved.push(node);
+    const child = { id: 'child', inst: {}, agent: {}, node: 'B', nodes: ['B'], active: 1 };
+    await g.attempt(fakeRes(), BODY, ['A', 'B'], 'B', stream, OPENAI,
+      Date.now() + 60_000, null, '', '', child);
+    assert.equal(g.lockedNode, 'A');
+    assert.deepEqual(saved, [], '不能将子出口写成重启后的默认主出口');
+    assert.equal(child.active, 0);
+    assert.equal(g.usage.getStats().byNode.B.success, 1);
+  });
+}
+
+await t('恢复最后成功节点后新会话继续粘住它,切换失败时不锁定坏节点', async () => {
+  for (const [initial, canSwitch, expected] of [['A', true, 'B'], ['B', true, 'B'], ['A', false, 'A']]) {
+    const g = new Gateway(load(), () => {});
+    let current = initial;
+    g.getAllNodes = async () => ['A', 'B'];
+    g.getCurrentNode = async () => current;
+    g.switchNode = async (node) => {
+      if (node === 'B' && !canSwitch) return false;
+      current = node;
+      return true;
+    };
+    g.saveLastNode('B');
+    try {
+      await g.restoreLastNode();
+      const selected = await g.ensureNode(['A', 'B'], fakeRes(), OPENAI,
+        Date.now() + 5_000, BODY.model, 'new-session-after-restart');
+      assert.equal(selected, expected);
+      assert.equal(current, expected);
+    } finally {
+      g.forgetLastNode();
+    }
+  }
+});
+
+await t('连续客户端请求越过 FreeTierError 拒绝前缀,到达此前没试过的出口', async () => {
+  const nodes = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
+  const g = retryGateway('sm-rejected-prefix.json', (i, node) => {
+    if (node !== 'H') throw { status: 403, body: '{"error":{"message":"FreeTierError: from within OpenCode"}}' };
+    return { choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 2 } };
+  });
+  g.getAllNodes = async () => nodes;
+  g.measureEgress = async () => [];
+  g.modelProtocol = () => 'chat';
+  g.delay = new Map(nodes.map((node, i) => [node, i + 1]));
+  const send = async (session) => {
+    const req = Readable.from([JSON.stringify(BODY)]);
+    req.headers = { 'x-opencode-session-id': session };
+    const res = fakeRes();
+    await g.handleChat(req, res, OPENAI);
+    return res;
+  };
+  await send('prefix-first');
+  assert.deepEqual(g.tries, nodes.slice(0, 7), '保留已有每请求尝试上限');
+  const res = await send('prefix-second');
+  assert.equal(g.tries[7], 'H', '新请求必须越过上一轮拒绝的低延迟前缀');
+  assert.equal(res.code, 200);
+  assert.equal(g.lockedNode, 'H');
+  for (const node of nodes.slice(0, 7)) {
+    assert.equal(g.cooldown.get(node, 'default')?.reason, 'rejected');
+    assert.equal(g.cooldown.isCooling(node, 'nemotron'), false, '拒绝策略按供应商组隔离');
+    assert.equal(g.usage.getStats().byNode[node].rateLimited, 0, '拒绝不是额度耗尽');
+  }
+  for (const node of nodes.slice(0, 7)) thaw(g.cooldown, node);
+  assert.equal(g.rankNodes(nodes)[0], 'H', '短冷却过期仍优先此前未拒绝的节点');
+});
+
+await t('重试拒绝不缩短并发 Retry-After,日志只写状态、组和节点', async () => {
+  let until;
+  const secret = 'do-not-log-rejection-body';
+  const g = retryGateway('sm-rejected-policy.json', (i, node) => {
+    if (i === 0) {
+      g.cooldown.mark429(node, 'default', 3600);
+      until = g.cooldown.get(node, 'default').until;
+      throw { status: 403, body: JSON.stringify({ error: { message: `FreeTierError ${secret}` } }) };
+    }
+    return { choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 2 } };
+  });
+  const logs = [];
+  g.logger = (level, message) => logs.push(message);
+  g.cur = 'A';
+  await g.attempt(fakeRes(), BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+  assert.equal(g.cooldown.get('A', 'default').until, until);
+  assert.equal(g.cooldown.get('A', 'default').retryAfter, 3600);
+  assert.equal(g.cooldown.isCooling('A', 'nemotron'), false);
+  assert.ok(logs.some((line) => /403/.test(line) && /group="default"/.test(line) && /node="A"/.test(line)),
+    '安全重试日志必须能定位拒绝状态、供应商组和节点');
+  assert.ok(logs.every((line) => !line.includes(secret)), '不能把上游原文或请求秘密写进重试日志');
+});
+
+await t('全员临时拒绝时新请求立即回上游不可用,不等待也不伪报额度耗尽', async () => {
+  const g = retryGateway('sm-all-rejected.json', () => {
+    throw { status: 403, body: '{"error":{"message":"FreeTierError"}}' };
+  });
+  g.cur = 'A';
+  await g.attempt(fakeRes(), BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+  const res = fakeRes();
+  const cur = await g.ensureNode(['A', 'B'], res, OPENAI, Date.now() + 5_000, BODY.model);
+  assert.equal(cur, null);
+  assert.equal(res.code, 503);
+  assert.match(res.body, /all_nodes_unavailable/);
+  assert.doesNotMatch(res.body, /all_nodes_429/);
+  assert.deepEqual(g.tries, ['A', 'B'], '预检不能再发上游请求');
+});
+
+await t('普通 terminal 403 原样返回,不换出口或记录临时拒绝', async () => {
+  const payload = '{"error":{"message":"forbidden: invalid API key"}}';
+  const g = retryGateway('sm-terminal-403.json', () => { throw { status: 403, body: payload }; });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+  assert.equal(res.code, 403);
+  assert.deepEqual(JSON.parse(res.body), JSON.parse(payload));
+  assert.deepEqual(g.tries, ['A']);
+  assert.equal(g.cooldown.get('A', 'default'), null);
+});
+
 await t('工具别名不能改变 OpenAI 上游错误透传', async () => {
   const upstream = { error: { message: 'bad tool', type: 'invalid_request_error', code: 'tool_schema', param: 'tools' } };
   const g = retryGateway('sm-alias-error.json', () => {
@@ -1912,7 +2080,7 @@ await t('连续 3 个节点 5xx 立即停,不在这批坏出口里空转', async
   assert.equal(g.tries.length, 3, '连续 3 个 5xx 立即停,不空转 6 个');
 });
 
-await t('408 不计入连续 5xx,也不标 5xx 冷却', async () => {
+await t('408 重置连续 5xx,下一客户端请求暂避超时出口', async () => {
   const g = retryGateway('sm-408-reset.json', (i) => {
     if (i === 0) throw Object.assign(new Error('upstream overloaded'), {
       status: 503, body: '{"error":{"message":"overloaded"}}',
@@ -1931,8 +2099,12 @@ await t('408 不计入连续 5xx,也不标 5xx 冷却', async () => {
 
   assert.equal(res.code, 200, '408 应重置 5xx 连续计数,让后续节点继续尝试');
   assert.deepEqual(g.tries, ['A', 'B', 'C', 'D']);
-  assert.equal(g.cooldown.summary().find((x) => x.node === 'B'), undefined,
-    '408 节点不能标成 5xx 冷却');
+  const nextRes = fakeRes();
+  const next = await g.ensureNode(['B', 'E'], nextRes, OPENAI, Date.now() + 60_000, BODY.model);
+  assert.equal(next, 'E', '下一次客户端请求不能再次优先撞刚超时的 B');
+  await g.attempt(nextRes, BODY, ['B', 'E'], next, false, OPENAI, Date.now() + 60_000);
+  assert.equal(nextRes.code, 200);
+  assert.deepEqual(g.tries, ['A', 'B', 'C', 'D', 'E']);
 });
 
 await t('全员 5xx 冷却时立即回 503,不等待并误报 429', async () => {
@@ -2674,6 +2846,53 @@ await t('探测撞上 429:按 Retry-After 冷却该出口并换下一个,真实�
   const entry = g.cooldown.summary().find((x) => x.node === 'A');
   assert.ok(entry.remain > 20_000, `冷却要按上游 Retry-After 记(约 5.7 小时),实际剩 ${entry.remain}s`);
   assert.equal(g.cooldown.pickAvailable(['A', 'B', 'C'], group), 'B', '真实请求的选点也要跳过它');
+});
+
+for (const status of [403, 503]) {
+  await t(`连续探测跳过 ${status} 拒绝的当前出口和旧前缀,不突破单次上限`, async () => {
+    const g = new Gateway(load(), () => {});
+    const nodes = ['A', 'B', 'C', 'D'];
+    g.cur = 'A';
+    g.getCurrentNode = async () => g.cur;
+    g.getAllNodes = async () => nodes;
+    g.delay = new Map(nodes.map((node, i) => [node, i + 1]));
+    g.switchNode = async (node) => { g.cur = node; return true; };
+    const seen = [];
+    g.probeOnce = async () => {
+      seen.push(g.cur);
+      if (g.cur !== 'D') throw { status, body: status === 403 ? 'FreeTierError' : 'upstream overloaded' };
+      return { choices: [{ message: { content: 'pong' } }] };
+    };
+    const body = { model: 'big-pickle', messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 };
+    await assert.rejects(() => g.probeRequest(body), (e) => e.status === status);
+    assert.deepEqual(seen, ['A', 'B', 'C'], '每轮仍只发三次探测');
+    const out = await g.probeRequest(body);
+    assert.ok(out.choices);
+    assert.deepEqual(seen, ['A', 'B', 'C', 'D'], '下一轮不能再发冷却中的当前 C,也不能回到 A/B');
+    for (const node of nodes.slice(0, 3)) {
+      assert.equal(g.cooldown.get(node, 'default')?.reason, status === 403 ? 'rejected' : '5xx');
+      assert.equal(g.cooldown.isCooling(node, 'nemotron'), false);
+    }
+  });
+}
+
+await t('拒绝探测不缩短更强 Retry-After,全员冷却后不再出站', async () => {
+  const g = new Gateway(load(), () => {});
+  g.getCurrentNode = async () => 'A';
+  g.getAllNodes = async () => ['A'];
+  let calls = 0, until;
+  g.probeOnce = async () => {
+    calls++;
+    g.cooldown.mark429('A', 'default', 3600);
+    until = g.cooldown.get('A', 'default').until;
+    throw { status: 403, body: 'FreeTierError' };
+  };
+  const body = { model: 'big-pickle', messages: [{ role: 'user', content: 'ping' }] };
+  await assert.rejects(() => g.probeRequest(body), (e) => e.status === 403);
+  assert.equal(g.cooldown.get('A', 'default').until, until);
+  assert.equal(g.cooldown.get('A', 'default').retryAfter, 3600);
+  await assert.rejects(() => g.probeRequest(body), (e) => e.status === 503);
+  assert.equal(calls, 1, '已冷却出口没有新证据前不可反复探测');
 });
 
 await t('探测撞上 terminal 原文时原样抛出,不换节点重发', async () => {

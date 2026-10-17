@@ -11,6 +11,10 @@ import {
 } from './anthropic.mjs';
 import { applyFingerprintTools, aliasSseSink } from './opencode-fingerprint.mjs';
 import { json } from './http-util.mjs';
+import {
+  bridgeChatToResponses, responsesToChatBody, validateResponsesForChat,
+  chatContentToResponses, splitToolContent,
+} from './responses-chat.mjs';
 
 export const OPENCODE_HOST = 'opencode.ai';
 // OpenCode v2 free-tier traffic moved to /inference/v1/* on 2026-10-14.
@@ -53,10 +57,10 @@ const attachmentKind = (part) => {
  * 从 **Responses 事件流** 里取出完整响应对象。
  *
  * Responses 的 sink 近乎透传,所以缓冲里就是上游那一串 response.* 事件。
- * 完整对象挂在 response.completed 事件的 response 字段上 —— 直接取它,
+ * 完整对象挂在 response.completed/incomplete 的 response 字段上 —— 直接取它,
  * 不要去逐段拼 output:上游怎么分片是它的事,我们照抄整块最不容易出错。
  *
- * 取不到 completed(比如上游提前断了)时退回 null,调用方按失败处理。
+ * 失败或取不到合法终态(比如上游提前断了)时退回 null,调用方按失败处理。
  */
 export function assembleFromResponsesEvents(sseText, model = '') {
   let last = null;
@@ -68,7 +72,7 @@ export function assembleFromResponsesEvents(sseText, model = '') {
     let j;
     try { j = JSON.parse(payload); } catch { continue; }
     if (!j || typeof j !== 'object') continue;
-    if (j.type === 'response.completed' && j.response) return j.response;
+    if ((j.type === 'response.completed' || j.type === 'response.incomplete') && j.response) return j.response;
     // 有些实现把整块 response 直接发出来(没有 type 包装),留作兜底
     if (j.object === 'response') last = j;
   }
@@ -182,12 +186,14 @@ export function gateResponsesBody(body) {
   return { forcedStream, aliases };
 }
 
-/** Restore request-local aliases before any client-specific sink translates output. */
+/** Restore request-local aliases at each dialect's complete-name boundary. */
 export function withToolAliases(dialect, aliases) {
   if (!aliases?.size) return dialect;
   return {
     ...dialect,
-    sink: (res, model) => aliasSseSink(dialect.sink(res, model), aliases),
+    sink: (res, model) => dialect.sinkWithToolAliases
+      ? dialect.sinkWithToolAliases(res, model, aliases)
+      : aliasSseSink(dialect.sink(res, model), aliases),
   };
 }
 
@@ -206,21 +212,6 @@ function chatToolToResponses(tool) {
   };
 }
 
-/** 一条 chat 消息的 content(字符串或分片数组)→ Responses input 的分片数组 */
-function chatContentToResponses(content, textType) {
-  if (typeof content === 'string') return content ? [{ type: textType, text: content }] : [];
-  if (!Array.isArray(content)) return [];
-  const out = [];
-  for (const part of content) {
-    if (typeof part === 'string') { if (part) out.push({ type: textType, text: part }); continue; }
-    if (!isObject(part)) continue;
-    if (typeof part.text === 'string') { out.push({ type: textType, text: part.text }); continue; }
-    // 附件在 downgradeOpenAIAttachments 里已按纯文本模型换成占位文本;走不到这
-    // 分支的(多模态模型)保持原样透传,让上游自己解释
-    out.push(part);
-  }
-  return out;
-}
 
 /**
  * chat body → Responses body。
@@ -243,18 +234,24 @@ export function chatToResponsesBody(chatBody) {
   const out = { model: src.model, stream: true };
 
   const input = [];
+  const toolVisuals = [];
+  const flushToolVisuals = () => {
+    if (toolVisuals.length) input.push({ role: 'user', content: toolVisuals.splice(0) });
+  };
   for (const msg of Array.isArray(src.messages) ? src.messages : []) {
     if (!isObject(msg)) continue;
     const role = msg.role;
     if (role === 'tool') {
-      // chat 的 tool 结果消息 → Responses 的 function_call_output
+      const result = splitToolContent(msg.content);
       input.push({
         type: 'function_call_output',
         call_id: msg.tool_call_id || msg.id || '',
-        output: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? ''),
+        output: result.text,
       });
+      toolVisuals.push(...chatContentToResponses(result.visual, 'input_text'));
       continue;
     }
+    flushToolVisuals();
     const textType = role === 'assistant' ? 'output_text' : 'input_text';
     const parts = chatContentToResponses(msg.content, textType);
     if (parts.length) input.push({ role, content: parts });
@@ -272,6 +269,7 @@ export function chatToResponsesBody(chatBody) {
       }
     }
   }
+  flushToolVisuals();
   out.input = input;
 
   if (Array.isArray(src.tools) && src.tools.length) {
@@ -472,7 +470,7 @@ export const RESPONSES = {
   respond: (res, oai) => json(res, oai),
   sink: (res) => responsesSink(res),
   // Responses 的 sink 是近乎透传,所以缓冲里是上游的 response.* 事件流。
-  // 完整对象在 response.completed 的 response 字段里,直接取它 —— 比重新
+  // 完整对象在 response.completed/incomplete 的 response 字段里,直接取它 —— 比重新
   // 拼装各段 output 更可靠(上游的 output 分片规则我们没必要猜)。
   collect: (sseText, model) => assembleFromResponsesEvents(sseText, model),
 };
@@ -519,8 +517,10 @@ function rawSink(res) {
   return {
     write: (chunk) => safe(() => res.write(chunk)),
     end: () => safe(() => res.end()),
-    // 已经开始吐了才失败,补不了合法结尾,只能断开让客户端自己发现
-    fail: () => safe(() => res.end()),
+    fail: (message = 'Upstream stream failed') => safe(() => {
+      res.write(`data: ${JSON.stringify({ error: { type: 'server_error', message: String(message) } })}\n\n`);
+      res.end();
+    }),
   };
 }
 
@@ -538,6 +538,7 @@ function rawSink(res) {
 function responsesSink(res) {
   const safe = (fn) => { try { fn(); } catch {} };
   let buf = '';
+  let sequence = 0;
   // 有状态解码:chunk 边界会切在多字节字符中间(中文 3 字节),每块各自
   // toString() 会把被切开的字符换成 U+FFFD,而且不可恢复。
   const decoder = new TextDecoder('utf-8');
@@ -549,6 +550,7 @@ function responsesSink(res) {
       if (payload && payload !== '[DONE]') {
         try {
           const j = JSON.parse(payload);
+          if (Number.isInteger(j?.sequence_number)) sequence = Math.max(sequence, j.sequence_number + 1);
           if (j && j.object === 'chat.completion.chunk') return;
         } catch {}
       }
@@ -566,7 +568,12 @@ function responsesSink(res) {
       for (const line of lines) forwardLine(line);
     },
     end: () => { if (buf) { forwardLine(buf); buf = ''; } safe(() => res.end()); },
-    fail: () => safe(() => res.end()),
+    fail: (message = 'Upstream stream failed') => {
+      buf = '';
+      const error = { type: 'error', code: 'server_error', message: String(message), param: null, sequence_number: sequence++ };
+      safe(() => res.write(`event: error\ndata: ${JSON.stringify(error)}\n\n`));
+      safe(() => res.end());
+    },
   };
 }
 
@@ -754,14 +761,11 @@ export class ResponsesToChatStream {
     this.emitDone?.();
   }
 
-  // 中途断了:chat 流没有专门的 error 事件,补一个 finish_reason 收尾即可,
-  // 别让下游 sink(尤其 anthropic)悬着
-  fail() {
+  // A failed upstream must never manufacture a successful stop/[DONE] pair.
+  fail(message = 'Responses upstream stream failed') {
     if (this.done) return;
     this.done = true;
-    this.ensureRole();
-    this.emit({ ...this.head(), choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-    this.emitDone?.();
+    this.emit({ error: { type: 'server_error', message: String(message) } });
   }
 }
 
@@ -779,7 +783,7 @@ export function bridgeResponsesToChat(inner, model) {
   return {
     write: (chunk) => st.feed(chunk),
     end: () => { st.end(); inner.end(); },
-    fail: (msg) => { st.fail(msg); inner.fail(msg); },
+    fail: (msg) => { st.fail(msg); inner.end(); },
   };
 }
 
@@ -805,3 +809,16 @@ export function responsesUpstreamDialect(clientDialect) {
   };
 }
 
+/** Responses client -> native Chat upstream, preserving the Responses client boundary. */
+export function chatUpstreamDialect(clientDialect) {
+  return {
+    ...clientDialect,
+    name: `${clientDialect.name}->chat`,
+    path: CHAT_PATH,
+    validate: (body) => validateResponsesForChat(body) || clientDialect.validate(body),
+    toUpstream: (body, meta) => responsesToChatBody(body, meta),
+    applyEffort: OPENAI.applyEffort,
+    sink: (res, model) => bridgeChatToResponses(clientDialect.sink(res, model), model),
+    sinkWithToolAliases: (res, model, aliases) => bridgeChatToResponses(clientDialect.sink(res, model), model, aliases),
+  };
+}

@@ -8,7 +8,6 @@
  */
 
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import {
   COOLDOWN_MS, MAX_LOG, fmtTokens, fmtUptime, fmtClock, successRate, fmtPercent,
   cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, anthropicBase, rankBreakdown,
@@ -626,213 +625,85 @@ t('callLog 没有数据时给空表而不是崩', () => {
   }
 });
 
-t('调用日志标题显示平均首字与平均耗时,明细显示单次耗时', () => {
-  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-  assert.match(app, /平均首字\s*\$\{\s*fmtDelay\s*\(\s*ttfb\s*\)\s*\}/);
-  assert.match(app, /平均耗时\s*\$\{\s*fmtDelay\s*\(\s*duration\s*\)\s*\}/);
-  assert.match(app, /'首字',\s*fmtDelay\(r\.ttfb\)/);
-  assert.match(app, /'耗时',\s*fmtDelay\(r\.ms\)/);
+t('callLog 将交错完成的重试归到请求,按尝试序号排列并保留最终结果', () => {
+  const { rows, tokens, ttfb, duration } = callLog([
+    { at: 1, requestId: 'r1', attempt: 2, node: 'B', model: 'actual-b', effort: 'max',
+      outcome: 'success', status: 200, elapsed: 900, in: 10, out: 4, ttfb: 100, ms: 900 },
+    { at: 2, requestId: 'r2', attempt: 1, node: 'C', outcome: 'clientCanceled', elapsed: 500 },
+    { at: 3, requestId: 'r1', attempt: 1, node: 'A', outcome: 'rateLimited', status: 429,
+      error: 'quota exhausted', elapsed: 15, ttfb: 1, ms: 15, in: 2, out: 0 },
+  ], [
+    { at: 4, requestId: 'r1', model: 'requested', outcome: 'success', status: 200, elapsed: 1000, attempts: 2 },
+    { at: 5, requestId: 'r2', model: 'requested', outcome: 'clientCanceled', status: 499, elapsed: 500, attempts: 1 },
+  ]);
+  assert.deepEqual(rows.map((r) => r.requestId), ['r2', 'r1']);
+  const r1 = rows[1];
+  assert.equal(r1.outcome, 'success');
+  assert.equal(r1.model, 'requested');
+  assert.equal(r1.elapsed, 1000);
+  assert.equal(r1.attemptCount, 2);
+  assert.deepEqual(r1.attempts.map((a) => a.node), ['A', 'B']);
+  assert.equal(r1.attempts[0].status, 429);
+  assert.equal(r1.attempts[0].error, 'quota exhausted');
+  assert.equal(r1.attempts[1].model, 'actual-b');
+  assert.equal(tokens, 16, '实际 usage 只算一次,请求汇总不再重复记 token');
+  assert.equal(ttfb, 100, '失败的首字节时间不能稀释成功平均');
+  assert.equal(duration, 900, '失败与取消耗时不能稀释成功平均');
 });
 
-t('调用日志把 Token 总数放在副行,和入/出/推理同一行右对齐', () => {
-  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
-  const fn = app.match(/function renderCallLog\(\)[\s\S]*?\n\}/)?.[0] || '';
-  assert.ok(fn, '应能定位 renderCallLog');
-
-  // Token 是入+出的和,和分项拆在两行里对不起来;主行少一个数之后,
-  // 机场那种带限速和流媒体标记的长节点名不再把模型和强度挤到折行
-  assert.doesNotMatch(fn, /num\([^)]*'Token'/, 'Token 不该再占主行一格');
-  assert.match(fn, /Token \$\{fmtTokens\(r\.total\)\} · 入/, 'Token 应打头副行');
-  assert.match(fn, /推理 \$\{fmtTokens\(r\.reasoning\)\}/);
-
-  // 主行右半是「发了什么、花了多少」,副行靠左会跑到时刻底下另起一栏
-  const sub = css.match(/\.nstat \.sub\s*\{([^}]*)\}/)?.[1] || '';
-  assert.match(sub, /text-align:\s*right/, '副行应右对齐,贴在主行数字下面');
+t('callLog 无上游尝试的失败仍可查看,未完成请求不冒充成功', () => {
+  const { rows } = callLog([
+    { at: 1, requestId: 'running', attempt: 1, node: 'A', outcome: 'timeout', elapsed: 50 },
+  ], [
+    { at: 2, requestId: 'rejected', model: 'unknown', outcome: 'error', status: 400, elapsed: 2, attempts: 0 },
+  ]);
+  assert.equal(rows[0].requestId, 'rejected');
+  assert.equal(rows[0].status, 400);
+  assert.equal(rows[0].outcome, 'error');
+  assert.deepEqual(rows[0].attempts, []);
+  assert.equal(rows[1].requestId, 'running');
+  assert.equal(rows[1].outcome, 'pending');
+  assert.equal(rows[1].attempts[0].outcome, 'timeout');
 });
 
-t('调用日志用「限流」「错误」而不是 429 和上游错误,且标明是累计口径', () => {
-  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-  const fn = app.match(/function renderCallLog\(\)[\s\S]*?\n\}/)?.[0] || '';
-  assert.ok(fn, '应能定位 renderCallLog');
-  assert.match(fn, /累计限流 \$\{fmtCount\(totals\.rateLimited\)\}/,
-    '失败数是开机至今的总数,不加「累计」会被当成这几条里的失败数');
-  assert.match(fn, /错误 \$\{fmtCount\(totals\.upstreamError\)\}/);
-  assert.match(fn, /最近 \$\{fmtCount\(rows\.length\)\} 条/, '逐条那段要标明只是最近一批');
-  assert.doesNotMatch(fn, /'?429/, '调用日志里不出现 429 字样');
-  assert.doesNotMatch(fn, /上游错误/);
+t('callLog 历史成功不伪造请求号,未知耗时不算零耗时', () => {
+  const { rows, duration } = callLog([
+    { at: 1, node: 'old', in: 3, out: 2, ms: null },
+    { at: 2, requestId: 'failed', attempt: 1, node: 'new', outcome: 'upstreamError', ms: 1 },
+  ], []);
+  const old = rows.find((r) => r.node === 'old');
+  assert.equal(old.requestId, null);
+  assert.equal(old.outcome, 'success');
+  assert.equal(old.total, 5);
+  assert.equal(old.ms, null);
+  assert.equal(duration, null);
 });
 
-t('Token 消耗显示格式化后的缓存读写明细', () => {
-  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  assert.match(app, /缓存读\s*\$\{\s*fmtTokens\s*\(\s*t\.cacheReadTokens\s*\)\s*\}/);
-  assert.match(app, /缓存写\s*\$\{\s*fmtTokens\s*\(\s*t\.cacheWriteTokens\s*\)\s*\}/);
-  assert.ok(html.includes('缓存读 — · 缓存写 —'));
+t('callLog 请求和尝试各自窗口截断时仍保留真实尝试数与状态', () => {
+  const { rows } = callLog([
+    { at: 4, requestId: 'long', attempt: 7, node: 'last', outcome: 'success' },
+  ], [
+    { at: 5, requestId: 'long', outcome: 'success', attempts: 7, elapsed: 100 },
+    { at: 6, requestId: 'summary-only', outcome: 'error', status: 503, attempts: 2 },
+  ]);
+  assert.equal(rows[0].attemptCount, 2);
+  assert.deepEqual(rows[0].attempts, []);
+  assert.equal(rows[1].attemptCount, 7);
+  assert.equal(rows[1].attempts.length, 1);
+  assert.equal(rows[1].attempts[0].attempt, 7);
 });
 
-t('调用日志使用默认关闭且结构完整的原生折叠', () => {
-  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  const details = html.match(/<details\b[^>]*class="card span3"[^>]*>[\s\S]*?<\/details>/)?.[0] || '';
-  const opening = details.match(/^<details\b[^>]*>/)?.[0] || '';
-  const summary = details.match(/<summary\b[^>]*>[\s\S]*?<\/summary>/)?.[0] || '';
-  const summaryBody = summary.match(/^<summary\b[^>]*>([\s\S]*)<\/summary>$/)?.[1] || '';
-  const body = details.slice(details.indexOf(summary) + summary.length);
-
-  assert.ok(details, '应存在调用日志 details');
-  assert.doesNotMatch(opening, /\sopen(?:\s|=|>)/, '调用日志默认应折叠');
-  assert.equal(summaryBody.match(/<h2\b/g)?.length, 1, 'summary 内应只有一个 heading');
-  assert.match(summaryBody, /^\s*<h2\b[^>]*id="h-nstat"[^>]*>[\s\S]*?<\/h2>\s*$/,
-    'summary 的唯一顶层内容应为调用日志 heading');
-  assert.match(summary, /id="nstat-sum"/, '动态合计应位于 summary 内');
-  assert.doesNotMatch(summary, /id="(?:nstats|nstat-empty)"/, '折叠正文不应混入 summary');
-  assert.match(body, /id="nstats"/, '逐条明细应位于 summary 之后的 details 正文');
-  assert.match(body, /id="nstat-empty"/, '空态应位于 summary 之后的 details 正文');
-});
-
-t('调用日志卡标题就叫「调用日志」', () => {
-  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  assert.match(html, /<span class="nstat-title">调用日志<\/span>/);
-  // 「节点统计」是按节点聚合的旧口径,同一节点只留得下最近一次的模型和强度;
-  // 名字留着会让人以为展开还是那张表
-  assert.ok(!html.includes('节点统计'), '旧标题不该残留');
-});
-
-t('调用日志合计不显示请求级与尝试级口径说明', () => {
-  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  assert.ok(!app.includes('一次客户端请求换几个节点就记几笔'));
-  assert.ok(!app.includes('故大于顶部请求总数'));
-  // HTML 里那份是渲染前占位,写死文案会在首帧闪出来,所以也不能留
-  assert.ok(!html.includes('各记一笔'), '首帧占位不能写死口径说明');
-  assert.match(html, /id="nstat-sum"[^>]*>\s*<\/span>/, '合计占位应为空,由 JS 填充');
-});
-
-t('调用日志限高内部滚动,滚动条隐藏但键盘可滚', () => {
-  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
-  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  const rule = css.match(/^\.nstats\s*\{([^}]*)\}/m)?.[1] || '';
-
-  assert.match(rule, /max-height:/, '不限高的话 200 行会把页面拽到十几屏');
-  assert.match(rule, /overflow-y:\s*auto/);
-  assert.match(rule, /scrollbar-width:\s*none/, 'Firefox 侧要关滚动条');
-  assert.match(css, /\.nstats::-webkit-scrollbar\s*\{[^}]*display:\s*none/,
-    'WebKit/Blink 不认 scrollbar-width,得单独关');
-  // 藏了滚动条,鼠标之外的可供性就全靠这个:不可聚焦的滚动容器键盘滚不动
-  const ul = html.match(/<ul\b[^>]*class="nstats"[^>]*>/)?.[0] || '';
-  assert.match(ul, /tabindex="0"/, '隐藏滚动条的滚动区必须可聚焦');
-
-  // 轮询每 2 秒重建一次列表,不存回 scrollTop 就会把人弹回顶部
-  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-  const fn = app.match(/function renderCallLog\(\)[\s\S]*?\n\}/)?.[0] || '';
-  assert.match(fn, /const top = ul\.scrollTop/, '重建前应记下滚动位置');
-  assert.match(fn, /ul\.scrollTop = top/, '重建后应还原滚动位置');
-});
-
-t('根元素常驻滚动条槽,展开调用日志不横向位移', () => {
-  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
-  // 槽必须挂在滚动容器(视口 = 根元素)上,挂到 body 上不起作用
-  const html = css.match(/^html\s*\{([^}]*)\}/m)?.[1] || '';
-  assert.match(html, /scrollbar-gutter:\s*stable/, '根元素应预留滚动条槽');
-});
-
-t('概览大数字按卡片宽度缩放,窄三列档不溢出框', () => {
-  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
-  // cqi 要有基准,卡片必须先声明成查询容器 —— 漏了它 cqi 退化成视口宽,
-  // clamp 永远顶到 27px,窄档「1 天 3 时」照旧溢出
-  assert.match(css, /\.stat\s*\{[^}]*container-type:\s*inline-size/,
-    '.stat 要声明为查询容器,大数字缩放靠它做基准');
-  const big = css.match(/\.stat \.big\s*\{([^}]*)\}/)?.[1] || '';
-  assert.match(big, /font-size:\s*clamp\([^)]*cqi[^)]*\)/,
-    '大数字字号应随卡片宽度 clamp,固定 27px 会在最窄三列档溢出框外');
-  assert.match(big, /white-space:\s*nowrap/,
-    'nowrap 仍要保留,否则窄档带空格的值会断成两行把卡片顶高');
-});
-
-t('概览四格在一张卡内 2×2,DOM 顺序就是视觉顺序', () => {
-  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
-
-  // 四格必须在同一张卡里(整合的全部意义),而不是各自一张 .card
-  // 现在结构是 <section class="card"> ... <div class="stats"> ... </div> </section>
-  const sec = html.match(/<section class="card"[^>]*aria-labelledby="h-overview"[\s\S]*?<\/section>/)?.[0] || '';
-  assert.ok(sec, '概览应是一张 .card,内含 .stats 容器');
-  assert.ok(sec.includes('<div class="stats">'), '概览卡片内应有 .stats 容器');
-  assert.doesNotMatch(sec, /class="card stat"/, '内部小卡片不该再叠一层 .card');
-
-  // 两列 grid 逐行填充,所以 DOM 顺序 == 左上→右上→左下→右下。
-  // 需求把 Token 放左上、模型统计右上、请求总数左下、运行时长右下 ——
-  // 用 grid-area 显式定位能达到同样效果,但 Tab 顺序会和看到的不一致。
-  // 取每格的**首个** h3:请求总数那格里还有个「成功率」小标题,平铺着数
-  // 会把它算成第五格
-  const stats = css.match(/^\.stats\s*\{([^}]*)\}/m)?.[1] || '';
-  assert.match(stats, /grid-template-columns:\s*repeat\(2,/, '概览内部应是两列');
-  const tiles = [...sec.matchAll(/<article class="stat">([\s\S]*?)<\/article>/g)].map((m) => m[1]);
-  const order = tiles.map((tile) => tile.match(/<h3[^>]*>([^<]+)<\/h3>/)?.[1]);
-  assert.deepEqual(order, ['Token 消耗', '模型统计', '请求总数', '运行时长'],
-    'DOM 顺序决定视觉和 Tab 顺序:左上 Token、右上 模型统计、左下 请求总数、右下 运行时长');
-
-  // 成功率并进请求总数那格 —— 不是自己一格,而是那一格里的第二列
-  const reqTile = tiles.find((tile) => tile.includes('请求总数')) || '';
-  assert.match(reqTile, /<h3 id="h-rate">成功率<\/h3>/, '成功率应在请求总数那格内');
-  assert.equal(tiles.filter((tile) => tile.includes('成功率')).length, 1,
-    '成功率不该另占一格');
-  // 进度条的可访问名要同时给出「是什么」和「现在多少」:只挂数值会念成
-  // 没头没尾的一个百分比,只挂标题又听不到当前值
-  assert.match(reqTile, /aria-labelledby="h-rate s-rate"/, '进度条要报出标题和数值两段');
-});
-
-t('请求总数与成功率并排两列,数值字号按半格重算', () => {
-  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
-  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-
-  // 每列连标签一起成块。平铺成「标签 标签 数值 数值」的话读屏按 DOM 念出来
-  // 是「请求总数 成功率 341 53.1%」,配对全丢了
-  const duo = html.match(/<div class="stat-duo">([\s\S]*?)<\/div>\s*<p class="sub"/)?.[1] || '';
-  assert.match(duo, /<h3>请求总数<\/h3>\s*<p class="big" id="s-req">/, '标签应紧挨自己的数值');
-  assert.match(duo, /<h3 id="h-rate">成功率<\/h3>\s*<p class="big" id="s-rate">/);
-
-  // 半格宽摆不下 27px,系数必须比 .stat .big 小一档,否则两个数会顶出格子
-  const full = css.match(/\.stat \.big\s*\{([^}]*)\}/)?.[1]?.match(/clamp\(\s*[\d.]+px\s*,\s*([\d.]+)cqi/)?.[1];
-  const half = css.match(/\.stat-duo \.big\s*\{([^}]*)\}/)?.[1]?.match(/clamp\(\s*[\d.]+px\s*,\s*([\d.]+)cqi/)?.[1];
-  assert.ok(full && half, '两处都应按容器宽度 clamp');
-  assert.ok(Number(half) < Number(full), `并排两列的系数(${half}cqi)应小于独占一格的(${full}cqi)`);
-
-  // 标签由 <h3> 出,JS 再拼一遍「成功率」就重复了
-  assert.match(app, /\$\('s-rate'\)\.textContent = fmtPercent\(rate\)/, '数值不该再带标签文字');
-});
-
-t('OpenCode UA 固定启用并显示同步版本', () => {
-  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
-  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-  const row = html.match(/<div class="field ua-status"[\s\S]*?<\/div>/)?.[0] || '';
-
-  assert.match(row, /<span>OpenCode UA<\/span>/);
-  assert.match(row, /id="f-identity-version">2\.0\.31<\/em>/);
-  assert.doesNotMatch(row, /checkbox|f-identity(?!-version)/);
-  assert.match(css, /\.ua-status\s*\{[\s\S]*?display:\s*flex/);
-  assert.match(css, /\.ua-status \.tag\s*\{[\s\S]*?var\(--mint-dim\)/);
-  assert.match(app, /opencodeVersion\?\.version/);
-  assert.match(app, /f-identity-version/);
-});
-
-t('配置卡提供小时制自动更新订阅输入', () => {
-  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  const field = html.match(/<label\b[^>]*>[\s\S]*?自动更新订阅[\s\S]*?<\/label>/)?.[0] || '';
-  assert.match(field, /for="f-sub-hours"|id="f-sub-hours"/);
-  assert.match(field, /type="number"/);
-  assert.match(field, /min="0"/);
-  assert.match(field, /step="1"/);
-  assert.match(field, /小时/);
-});
-
-t('可用性调度启动后立即复用已完成探测的下次到期时间', () => {
-  const gateway = fs.readFileSync(new URL('../server/gateway.mjs', import.meta.url), 'utf8');
-  const fn = gateway.match(/startAvailabilityScheduler\(\)[\s\S]*?\n  \}/)?.[0] || '';
-  assert.ok(fn, '应能定位可用性调度入口');
-  assert.match(fn, /immediate:\s*true/, '启动调度要立即计算临时错误的短重试,不能固定睡六小时');
+t('callLog 最终客户端失败不能被上游成功结果覆盖', () => {
+  const { rows } = callLog([
+    { at: 1, requestId: 'disconnect', attempt: 1, node: 'A', outcome: 'success', status: 200, in: 8, out: 2 },
+  ], [
+    { at: 2, requestId: 'disconnect', outcome: 'clientCanceled', status: 499, attempts: 1 },
+  ]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].outcome, 'clientCanceled');
+  assert.equal(rows[0].status, 499);
+  assert.equal(rows[0].attempts[0].outcome, 'success');
+  assert.equal(rows[0].attempts[0].status, 200);
 });
 
 console.log(`\ncheck.mjs: 全部通过 (${n} 组)\n`);

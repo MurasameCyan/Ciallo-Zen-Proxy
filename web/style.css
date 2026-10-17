@@ -477,6 +477,10 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .node .ms.mid  { color: var(--fg-2); }
 .node .ms.slow { color: var(--amber); }
 .node .st { display: flex; align-items: center; gap: 8px; }
+.node .route {
+  grid-column: 2 / -1; min-width: 0; overflow-wrap: anywhere;
+  font-family: var(--mono); font-size: 11px; color: var(--fg-2);
+}
 
 /* 在用节点:唯一被强调的一行 */
 .node.active {
@@ -573,6 +577,18 @@ details[open] > .nstat-summary { margin-bottom: 13px; }
   font-family: var(--mono); font-size: 11px; color: var(--fg-2);
   font-variant-numeric: tabular-nums;
 }
+
+.trace-summary { cursor: pointer; }
+.trace-summary > .nstat-main { display: inline-flex; width: calc(100% - 20px); }
+.trace-summary > .sub { display: block; overflow-wrap: anywhere; }
+.trace-result { font-size: 12px; font-weight: 600; }
+.trace-result.ok { color: var(--mint); }
+.trace-result.pending { color: var(--amber); }
+.trace-result.failed { color: var(--rose); }
+.trace-attempts { margin: 10px 0 0 14px; border-left: 1px solid var(--line-2); }
+.trace-attempts > li { padding: 9px 0 9px 12px; }
+.trace-attempts > li + li { border-top: 1px solid var(--line); }
+.trace-error { margin-top: 6px; color: var(--rose); font-size: 12px; overflow-wrap: anywhere; }
 
 /* ── 表单 ─────────────────────────────────────────────── */
 

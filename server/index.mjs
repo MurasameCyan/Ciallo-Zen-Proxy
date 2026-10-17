@@ -452,6 +452,7 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
         nodes: gateway.rankNodes(all),
         excluded: gateway.excludedNodes(all),
         delay: gateway.delayMap(),
+        egress: gateway.egressStatus(all),
         testedAt: gateway.testedAt || null,
         testing: gateway.testing != null,
         current: await gateway.getCurrentNode(),
@@ -461,7 +462,7 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
     }
 
     if (path === '/api/nodes/test' && m === 'POST') {
-      const r = await gateway.testNodes();
+      const r = await gateway.testNodes({ forceEgress: true });
       return json(res, r);
     }
 
@@ -836,6 +837,7 @@ async function main() {
     clearInterval(laneReaper);
     server.close();
     await gateway.stopChildLanes?.();
+    await gateway.egressProbe.stop();
     await mihomo.stop(log);
     process.exit(0);
   };

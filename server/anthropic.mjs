@@ -235,6 +235,21 @@ function toolResultText(content, textOnly) {
   return parts.join('\n');
 }
 
+function toolResultVisuals(content) {
+  if (!Array.isArray(content)) return [];
+  let hasAttachment = false;
+  const parts = [];
+  for (const block of content) {
+    if (typeof block?.text === 'string') parts.push({ type: 'text', text: block.text });
+    else {
+      const part = block?.type === 'image' ? imageToOpenAI(block)
+        : (block?.type === 'document' ? documentToOpenAI(block) : null);
+      if (part) { parts.push(part); hasAttachment = true; }
+    }
+  }
+  return hasAttachment ? parts : [];
+}
+
 /**
  * 请求:Anthropic → OpenAI。
  *
@@ -248,6 +263,8 @@ function toolResultText(content, textOnly) {
  */
 export function anthropicToOpenAI(req, { textOnly = false } = {}) {
   const msgs = [];
+  const toolContext = [];
+  const flushToolContext = () => { if (toolContext.length) msgs.push(...toolContext.splice(0)); };
 
   const sys = flattenText(req.system);
   if (sys) msgs.push({ role: 'system', content: sys });
@@ -255,6 +272,9 @@ export function anthropicToOpenAI(req, { textOnly = false } = {}) {
   for (const m of Array.isArray(req.messages) ? req.messages : []) {
     if (!m || typeof m !== 'object') continue;
     const role = m.role === 'assistant' ? 'assistant' : 'user';
+    const hasToolResults = role === 'user' && Array.isArray(m.content)
+      && m.content.some((block) => block?.type === 'tool_result');
+    if (!hasToolResults) flushToolContext();
 
     if (typeof m.content === 'string') {
       msgs.push({ role, content: m.content });
@@ -320,15 +340,19 @@ export function anthropicToOpenAI(req, { textOnly = false } = {}) {
             },
           });
           break;
-        case 'tool_result':
-          // 每个 result 都得单独成一条 role:'tool' —— 一轮里并行调了 N 个工具就有
-          // N 个 result 挤在同一条 user 消息里,合并或覆盖会让模型对不上 id
+        case 'tool_result': {
+          // Keep every parallel result together before lifting visual context to a user message.
           toolResults.push({
             role: 'tool',
             tool_call_id: String(b.tool_use_id ?? ''),
             content: toolResultText(b.content, textOnly),
           });
+          if (!textOnly) {
+            const visual = toolResultVisuals(b.content);
+            if (visual.length) { contentParts.push(...visual); hasAttachment = true; }
+          }
           break;
+        }
         // 其它上游不吃的块丢掉,别让请求整体失败
       }
     }
@@ -339,7 +363,7 @@ export function anthropicToOpenAI(req, { textOnly = false } = {}) {
     if (toolResults.length) {
       msgs.push(...toolResults);
       // 同一条消息里跟工具结果混在一起的文字要保留,但得排在结果之后
-      if (contentParts.length) msgs.push({ role, content });
+      if (contentParts.length) toolContext.push({ role, content });
       continue;
     }
     if (role === 'assistant' && toolCalls.length) {
@@ -353,6 +377,7 @@ export function anthropicToOpenAI(req, { textOnly = false } = {}) {
     msgs.push(message);
   }
 
+  flushToolContext();
   const out = { model: req.model, messages: msgs, stream: req.stream === true };
   if (Number.isFinite(req.max_tokens) && req.max_tokens > 0) out.max_tokens = req.max_tokens;
   if (Number.isFinite(req.temperature)) out.temperature = req.temperature;
@@ -570,6 +595,7 @@ export class AnthropicStream {
   }
 
   line(line) {
+    if (this.done) return;
     if (!line.startsWith('data:')) return;   // 空行、注释、event: 行都跳过
     const payload = line.slice(5).trim();
     if (!payload) return;
@@ -579,9 +605,7 @@ export class AnthropicStream {
 
     // 上游可能在流中途塞个错误帧
     if (obj.error) {
-      this.start();
-      this.emit('error', anthropicError(obj.error.message || 'upstream error', 'api_error'));
-      this.end();
+      this.fail(obj.error.message || 'upstream error');
       return;
     }
     if (obj.model && !this.model) this.model = obj.model;
@@ -702,11 +726,13 @@ export class AnthropicStream {
     this.emit('message_stop', { type: 'message_stop' });
   }
 
-  /** 中途断了:先报 error 事件再按正常流程收尾,别让客户端悬着 */
+  /** 失败收尾:关掉开放块并报错,不伪造正常 stop_reason。 */
   fail(message) {
     if (this.done) return;
     this.start();
+    this.done = true;
+    this.closeOpen();
     this.emit('error', anthropicError(message, 'api_error'));
-    this.end();
+    this.emit('message_stop', { type: 'message_stop' });
   }
 }
