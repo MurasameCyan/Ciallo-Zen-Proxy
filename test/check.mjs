@@ -126,6 +126,28 @@ t('延迟原样带出,没测过的是 null 而不是 0', () => {
   assert.equal(by.D, null, '压根没在 delay 里');
 });
 
+t('出口国旗取实测 IP 国家,不跟随机场节点名', () => {
+  const node = '🇩🇪 德国 03 · 上海联通';
+  const [row] = nodeRows({
+    nodes: [node],
+    egress: { byNode: { [node]: { exitIp: '89.187.177.57', exitCountry: 'US', neutral: { ms: 816 } } } },
+  });
+  assert.deepEqual(row.exit, { country: 'US', title: '中立 816ms · 出口 89.187.177.57' });
+});
+
+t('未测量不伪造出口,未知国家或缺少 IP 时不用国旗', () => {
+  const rows = nodeRows({
+    nodes: ['未测量', '未知国家', '缺少 IP'],
+    egress: { byNode: {
+      '未知国家': { exitIp: '203.0.113.50', exitCountry: 'ZZ', neutral: { ms: 1200 } },
+      '缺少 IP': { exitIp: null, exitCountry: 'US', neutral: { ms: 0 } },
+    } },
+  });
+  assert.equal(rows[0].exit, null);
+  assert.deepEqual(rows[1].exit, { country: null, title: '中立 1.2s · 出口 203.0.113.50' });
+  assert.deepEqual(rows[2].exit, { country: null, title: '中立 — · 出口 未知' });
+});
+
 t('测不通的节点垫在最底下并标 dead,不参与轮换', () => {
   const r = nodeRows({
     nodes: ['A', 'B'], excluded: ['Z', 'Y'],

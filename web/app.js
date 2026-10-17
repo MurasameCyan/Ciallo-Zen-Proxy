@@ -12,6 +12,9 @@ import {
   fmtDelay, delayGrade, hasNewer, callLog, nodeStats, configPayload, updateHours,
   modelLabel, modelState, modelTooltip, backendPin,
 } from './core.js';
+import { FLAG_SPRITE } from './flag-sprite.js';
+
+document.body.prepend(new DOMParser().parseFromString(FLAG_SPRITE, 'image/svg+xml').documentElement);
 
 const $ = (id) => document.getElementById(id);
 const POLL_MS = 2000;
@@ -184,6 +187,30 @@ function renderNodes() {
     nm.textContent = n.name;
     nm.title = n.name;
 
+    const exit = tag('exit', '');
+    if (n.exit) {
+      exit.title = n.exit.title;
+      exit.tabIndex = 0;
+      exit.setAttribute('role', 'img');
+      exit.setAttribute('aria-label', `${n.exit.country || '国家未知'} · ${n.exit.title}`);
+      if (n.exit.country) {
+        const ns = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(ns, 'svg');
+        svg.setAttribute('viewBox', '0 0 18 12');
+        svg.setAttribute('aria-hidden', 'true');
+        const use = document.createElementNS(ns, 'use');
+        use.setAttribute('href', `#exit-flag-${n.exit.country}`);
+        use.setAttribute('width', '18');
+        use.setAttribute('height', '12');
+        svg.append(use);
+        exit.append(svg);
+      } else {
+        exit.textContent = '🌐';
+      }
+    } else {
+      exit.setAttribute('aria-hidden', 'true');
+    }
+
     const ms = document.createElement('span');
     ms.className = `ms ${delayGrade(n.latency)}`;
     ms.textContent = fmtDelay(n.latency);
@@ -206,13 +233,7 @@ function renderNodes() {
       st.append(tag('badge', '待用'));
     }
 
-    li.append(idx, nm, ms, st);
-    const fact = probe.byNode[n.name];
-    if (fact) {
-      const detail = tag('route', `中立 ${fact.neutral?.ms > 0 ? fmtDelay(fact.neutral.ms) : '—'} · 出口 ${fact.exitIp || '未知'}`);
-      detail.title = `独立定向测量 ${fmtClock(fact.at)};Zen ${fact.zen?.status ?? fact.zen?.error ?? '未知'};中立 ${fact.neutral?.status ?? fact.neutral?.error ?? '未知'}`;
-      li.append(detail);
-    }
+    li.append(idx, nm, exit, ms, st);
     if (n.cooldown) {
       const policy = n.cooldown;
       const cause = policy.blocked ? '连接被拒绝' : policy.reason === 'rejected' ? '可重试上游拒绝或超时'

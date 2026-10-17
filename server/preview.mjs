@@ -43,6 +43,16 @@ const NODES = [
   '🇺🇸 圣何塞 02 · GIA', '🇰🇷 首尔 01', '🇬🇧 伦敦 01',
 ];
 
+// 模拟实测出口,刻意与机场名不一致,并覆盖未知国家和未测量的节点。
+const DEMO_EGRESS = {
+  measuring: false, tested: 3, measured: 3, distinct: 3,
+  byNode: {
+    [NODES[0]]: { exitIp: '203.0.113.10', exitCountry: 'US', neutral: { ms: 816 } },
+    [NODES[1]]: { exitIp: '203.0.113.11', exitCountry: 'JP', neutral: { ms: 930 } },
+    [NODES[2]]: { exitIp: '203.0.113.12', exitCountry: null, neutral: { ms: 1200 } },
+  },
+};
+
 /**
  * 真网关从上游每天同步清单;预览保留长名字与各状态,并带 exo-free 后端开关。
  */
@@ -467,6 +477,7 @@ async function handleApi(req, res, path) {
       current: state.current,
       locked: state.current,
       cooldowns: coolingList(),
+      egress: DEMO_EGRESS,
     });
   }
 

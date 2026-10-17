@@ -13,7 +13,7 @@ import { MihomoAgent } from './proxy.mjs';
 const TTL_MS = 10 * 60 * 1000;
 const MAX_FACTS = 256;
 const ZEN_URL = 'https://opencode.ai/';
-const NEUTRAL_URL = 'https://api.ipify.org?format=json';
+const NEUTRAL_URL = 'https://api.country.is/';
 const quiet = () => {};
 const copy = (record) => ({ ...record, zen: { ...record.zen }, neutral: { ...record.neutral } });
 const failed = (error) => ({ ok: false, status: null, ms: 0, error });
@@ -146,19 +146,23 @@ export class EgressProbe {
       const { body, ...fact } = await requestBody(this.requestImpl, neutral ? NEUTRAL_URL : ZEN_URL,
         { agent, method: neutral ? 'GET' : 'HEAD', signal: this.controller?.signal }, this.timeoutMs, 64 * 1024);
       let exitIp = null;
+      let exitCountry = null;
       if (neutral && fact.ok) {
         if (fact.status < 200 || fact.status >= 300) {
           fact.ok = false;
           fact.error = 'http_status';
         } else {
           try {
-            const ip = JSON.parse(body).ip;
-            if (typeof ip === 'string' && isIP(ip)) exitIp = ip;
+            const { ip, country } = JSON.parse(body);
+            if (typeof ip === 'string' && isIP(ip)) {
+              exitIp = ip;
+              if (typeof country === 'string' && /^[A-Z]{2}$/.test(country)) exitCountry = country;
+            }
           } catch { /* Invalid bodies are unknown, never a provider-server fallback. */ }
           if (!exitIp) { fact.ok = false; fact.error = 'invalid_exit_ip'; }
         }
       }
-      return { fact, exitIp };
+      return { fact, exitIp, exitCountry };
     } finally {
       finished = true;
       agent.destroy();
@@ -173,7 +177,7 @@ export class EgressProbe {
     const stale = nodes.filter((node) => force || !this.records.has(node));
     if (stale.length) {
       const results = stale.map((node) => ({ node, provider: snapshot.providers.get(node) || null,
-        providerRevision: snapshot.fingerprint, at: 0, exitIp: null,
+        providerRevision: snapshot.fingerprint, at: 0, exitIp: null, exitCountry: null,
         zen: failed('probe_failed'), neutral: failed('probe_failed') }));
       const reservations = [];
       let workspace, instance, startupTimer, abortStartup;
@@ -238,6 +242,7 @@ export class EgressProbe {
           const neutral = await this.#target(ports[i], true);
           results[i].neutral = neutral.fact;
           results[i].exitIp = neutral.exitIp;
+          results[i].exitCountry = neutral.exitCountry;
         }
       } catch {
         this.logger('warn', '[egress-probe] Independent measurement unavailable');

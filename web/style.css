@@ -450,7 +450,7 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   display: grid;
   /* 延迟列固定 46px 而不是 auto:每行宽度不一样的话数字列参差不齐,
      一列 tabular-nums 右对齐才扫得快。"1.2s" 和 "1840ms" 都塞得进去。 */
-  grid-template-columns: 22px minmax(0, 1fr) 46px auto;
+  grid-template-columns: 22px minmax(0, 1fr) 18px 46px auto;
   align-items: center; gap: 11px;
   padding: 10px 12px;
   border: 1px solid var(--line);
@@ -467,6 +467,12 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   text-overflow: ellipsis; white-space: nowrap;
   font-size: 13px;
 }
+.node .exit {
+  display: flex; align-items: center; justify-content: center;
+  width: 18px; height: 14px; font-size: 14px; line-height: 1;
+}
+.node .exit svg { display: block; width: 18px; height: 12px; border-radius: 2px; }
+.node .exit:focus-visible { outline: 2px solid var(--mint); outline-offset: 3px; border-radius: 2px; }
 .node .ms {
   font-family: var(--mono); font-size: 11px;
   color: var(--fg-2); text-align: right;

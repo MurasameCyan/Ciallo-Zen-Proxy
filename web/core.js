@@ -5,6 +5,8 @@
  * 界面里凡是「算出来的东西」都放这儿,app.js 只负责把结果贴到 DOM 上。
  */
 
+import { FLAG_COUNTRIES } from './flag-countries.js';
+
 /** 节点 429 后的兜底冷却窗口,与网关侧 COOLDOWN_MS 一致(无 Retry-After 时 60 秒) */
 export const COOLDOWN_MS = 60_000;
 
@@ -217,7 +219,7 @@ export function remainMs(deadline, now = Date.now()) {
  * delay: { 节点名: 毫秒 | null }。null / 缺失 = 没有实测数据,显示成 '—'
  * 而不是 0ms —— 0ms 是个具体的谎。
  */
-export function nodeRows({ nodes = [], cooldowns = [], current = '', locked = '', delay = {}, excluded = [], now = Date.now() } = {}) {
+export function nodeRows({ nodes = [], cooldowns = [], current = '', locked = '', delay = {}, excluded = [], egress = {}, now = Date.now() } = {}) {
   const cooling = new Map();
   for (const c of cooldowns) {
     if (!c?.node) continue;
@@ -232,10 +234,15 @@ export function nodeRows({ nodes = [], cooldowns = [], current = '', locked = ''
     const policy = cooling.get(name);
     const remain = policy?.remain || 0;
     const d = Number(delay?.[name]);
+    const fact = egress?.byNode?.[name];
+    const exit = fact ? {
+      country: fact.exitIp && FLAG_COUNTRIES.has(fact.exitCountry) ? fact.exitCountry : null,
+      title: `中立 ${fmtDelay(fact.neutral?.ms)} · 出口 ${fact.exitIp || '未知'}`,
+    } : null;
     // 冷却优先于 active:当前节点正被限流时它其实不可用,标成 active 是骗人
     const state = dead ? 'dead' : remain > 0 ? 'cooling' : name === current ? 'active' : 'idle';
     return {
-      name, i, remain, state,
+      name, i, remain, state, exit,
       latency: dead ? null : Number.isFinite(d) && d > 0 ? d : null,
       locked: name === locked, ratio: remain / COOLDOWN_MS,
       cooldown: policy?.policy || null,

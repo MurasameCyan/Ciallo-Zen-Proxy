@@ -274,9 +274,11 @@ openai-compatibility:
 
 **延迟排序 + 剔除死节点。** 订阅解析完自动测一遍延迟,快的排前面,轮换就按这个顺序取(刚限流过的节点例外 —— 它会被压到序列末尾,见上「429 轮换」)。测不通的直接不进候选表 —— 不然一个已经下线的节点每次轮换都要先浪费一次超时。测延迟这件事整包交给内核:一次 `GET /group/zen-pool/delay`,内核内部并发测完再一起回,我们不逐个节点发请求(节点名里常带 `/`,例如 `FI_1|1.4MB/s`,拼进 URL 路径要靠转义活着回来)。探针默认打上游 `https://opencode.ai/` 而不是 `gstatic.com/generate_204`:实测后者会让一份 17 节点的订阅**全部**测不通,而同一批节点跑上游是好的 —— 机场封 80 端口、劫持 Google 域名都很常见,探针自己到不了就会把能用的节点全判死。两条保险:全部节点都测不通时**不剔除任何一个**(那更像是探针地址本身不可达,不能让网关自己瘫掉),没测过的节点也不算死。面板上每个节点显示实测延迟,「测延迟」按钮可以随时重测;全灭时日志会把内核给的原因(比如 `all proxies timeout`)一起打出来,换探针地址就用 `NODE_TEST_URL`。
 
-**Zen 与中立目标分开测。** 原有 `/group/zen-pool/delay` 继续决定健康排序；另起独立 mihomo 进程定向测中立站和公网 IP，不修改正在服务的 selector。每批至多 3 个节点，事实缓存 10 分钟；中立站失败只显示「未知」，不会把 Zen 可达的节点剔除。面板分别显示 Zen 延迟、中立延迟和各节点已测 IP，并区分「限流」「暂避」「上游错误」「拒连」。站点可达不等于模型可用。
+**Zen 与中立目标分开测。** 原有 `/group/zen-pool/delay` 继续决定健康排序；另起独立 mihomo 进程定向测中立站和公网 IP，不修改正在服务的 selector。每批至多 3 个节点，事实缓存 10 分钟；中立站失败只显示「未知」，不会把 Zen 可达的节点剔除。面板保留 Zen 延迟列，在节点名与延迟之间显示实测出口国家图标，中立延迟和 IP 收进图标悬停提示，并区分「限流」「暂避」「上游错误」「拒连」。站点可达不等于模型可用。
 
 「测节点/出口」按钮位于节点池标题行右侧，平时只显示按钮原文；点击后整段文字切换为「进度 已测数/总数」，随轮询更新，测量请求结束或失败后恢复原文。不再另起测量时间、已测出口数或 IP 数摘要行。
+
+**出口国旗。** 中立探针通过同一次 [country.is](https://country.is/) 请求取得公网 IP 和国家码，不另加归属地查询，也不按机场节点名猜国家。悬停图标显示 `中立 816ms · 出口 89.187.177.57`；国家未知时显示地球图标，未测量的节点留空。IP 地理归属不等于机房物理位置。国旗来自本地内置的 [country-flag-icons](https://gitlab.com/catamphetamine/country-flag-icons) 1.6.20（MIT，许可随资源保留），每页只装载一次，不依赖 CDN，也不随轮询重复下载。
 
 **推理内容。** `deepseek-v4-flash-free` 这类模型会先吐几分钟 `reasoning_content` 再出正文(实测「写个 SVG 动画」的提问 200 秒内推理 68000 字、正文 0 字)。这个字段在 OpenAI 协议里原样透传;在 Anthropic 协议里翻译成 `thinking` 块 —— 丢掉它的话客户端在 `message_start` 之后几分钟收不到任何事件,看起来就是卡死,而上游其实一直在吐。客户端下一轮带回 assistant `thinking` 时,网关会把原推理文本还原为 `reasoning_content` 交还上游,避免 thinking 模式报“必须回传 reasoning_content”。`SHOW_THINKING=0` 可以关掉,那时推理内容整段丢弃,也不占块序号。
 
@@ -313,7 +315,7 @@ openai-compatibility:
 | 接入 | 一排四颗按钮(「OpenAI 地址」/「Anthropic 地址」/「复制 Key」/「重置 Key」)，下面是可用模型；长名字可横向滚动，`exo-free[1M]` 后紧邻一个无文字的 Claude 后端锁定开关 |
 | 配置 | 订阅地址（右端一个节点状态灯）+ 自动更新订阅周期 + 「保存并应用」+ 固定显示当前 OpenCode UA 版本，以及「重启内核」「同步模型」「补探能力」「清零统计」「手动重置」 |
 | 运行日志 | 内核和网关的实时日志 |
-| 节点池 | 现有 Zen 健康排序、当前节点、按供应商组显示的冷却原因和剩余时间；另列独立中立延迟、真实出口 IP、已测数量与独立 IP 数；未知测量不冒充节点故障 |
+| 节点池 | Zen 健康排序、当前节点、按供应商组显示的冷却原因和剩余时间；节点名与延迟之间显示实测出口国家图标，悬停查看中立延迟和真实出口 IP；测量进度只在测试期间显示于按钮内，未知测量不冒充节点故障 |
 | 调用日志 | 默认折叠，逐个客户端请求显示最终结果、请求号、总耗时和真实尝试数；展开可看每次成功、失败、取消或重抽的节点、HTTP 状态、耗时与脱敏错误摘要 |
 
 **exo-free 后端锁定。** 实时免费清单当前不含 `exo-free`。旧的后端识别与重抽逻辑仍保留兼容，但 OpenCode v2 的 `/inference/v1` 请求不会发送已被上游拒绝的 `x-opencode-request`，所以它不为新入口伪造旧 v1 身份。
@@ -390,7 +392,7 @@ API Key 屏幕上永远是掩码,只有「重置」和「复制」两个动作 �
 | --- | --- | --- |
 | `/api/status` | GET | 网关/内核状态、实时免费模型清单、模型可用性(`modelAvailability`)、探测调度(`modelAvailabilityStatus`)、模型冷却(`modelCooldowns`)、上下文上限(`ctx`)、实测能力(`modelCapabilities`)、可锁定后端(`pinnableBackends`)、锁定开关(`pinClaudeBackend`)、构建标识 |
 | `/api/config` | GET · POST | 读取/保存订阅地址、`opencodeIdentityHeaders`、`persistUsage`、`pinClaudeBackend` 与 `subscriptionUpdateHours`；明确提交订阅时当场应用，只切开关不碰内核。`port` 只读，提交了也忽略 |
-| `/api/nodes` | GET | 排过序的节点、剔除名单、Zen 延迟、带分组/原因/出口的冷却及当前节点；`egress` 含定向测量事实、已测数量、独立 IP 数与 `byNode` |
+| `/api/nodes` | GET | 排过序的节点、剔除名单、Zen 延迟、带分组/原因/出口的冷却及当前节点；`egress` 含定向测量事实、已测数量、独立 IP 数与 `byNode`，各节点事实中的 `exitIp` 与 `exitCountry` 来自同一次中立请求，无法确认的值为 `null` |
 | `/api/nodes/test` | POST | 立刻测一遍延迟,回 `{tested, alive, fastest}` |
 | `/api/models/sync` | POST | 立刻拉一遍免费清单(直连优先),回 `{models, added, gone}`。两条网络路径都不通时回 500,清单保持原样 |
 | `/api/models/probe` | POST | 给清单里还没有能力记录的模型探一遍,回 `{probed, skipped, note, ctx, running}`。都有记录时 `note` 是 `nothing-missing`,一次都不出站;超过 20 秒没探完就先回 `running: true`,探测在后台继续 |
