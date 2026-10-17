@@ -1381,6 +1381,53 @@ await t('lane:_childNodes 轮询等 provider 拉完订阅,拿到自己的表', a
   assert.ok(calls >= 3, '确实轮询过(不是一次就成功)');
 });
 
+await t('lane:启动子实例时刷新旧订阅快照,只绑定新快照里的出口', async () => {
+  const g = new Gateway(load(), () => {});
+  g.config = { subscriptionUrl: 'https://fake.sub' };
+  let nodes = ['expired|08-25'];
+  let selected = null;
+  const control = http.createServer(async (req, res) => {
+    if (req.url === '/providers/proxies/airport' && req.method === 'PUT') {
+      nodes = ['main|10-17', 'ready|10-17'];
+      res.writeHead(204).end();
+      return;
+    }
+    if (req.url !== '/proxies/zen-pool') {
+      res.writeHead(404).end();
+      return;
+    }
+    if (req.method === 'PUT') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const { name } = JSON.parse(body);
+      if (!nodes.includes(name)) {
+        res.writeHead(400).end();
+        return;
+      }
+      selected = name;
+      res.writeHead(204).end();
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ all: nodes, now: selected }));
+  });
+  await new Promise(resolve => control.listen(0, '127.0.0.1', resolve));
+  const origStart = MihomoInstance.prototype.start;
+  const origStop = MihomoInstance.prototype.stop;
+  MihomoInstance.prototype.start = async function () { this.ctrlPort = control.address().port; };
+  MihomoInstance.prototype.stop = async function () {};
+  try {
+    const lane = await g._spawnChildLane({ node: 'expired|08-25', nodes: [], mainNode: 'main|10-17' });
+    assert.deepEqual({ reported: lane.node, selected }, {
+      reported: 'ready|10-17', selected: 'ready|10-17',
+    }, '旧缓存可读也不能据此绑定过期出口');
+  } finally {
+    MihomoInstance.prototype.start = origStart;
+    MihomoInstance.prototype.stop = origStop;
+    await new Promise(resolve => control.close(resolve));
+  }
+});
+
 await t('lane:_spawnChildLane 选节点排除主 lane 当前节点,落到不同出口', async () => {
   const g = new Gateway(load(), () => {});
   g.config = { subscriptionUrl: 'https://fake.sub' };   // 测试里绕过 writeMihomoConfig 的订阅校验
@@ -1389,6 +1436,7 @@ await t('lane:_spawnChildLane 选节点排除主 lane 当前节点,落到不同�
   MihomoInstance.prototype.start = async function () { this.configFile = 'x'; this.dataDir = 'y'; this.ctrlPort = 19099; };
   MihomoInstance.prototype.stop = async function () {};
   let bound = null;
+  g._mihomoApi = async () => ({});
   g._childNodes = async () => ['A|0%', 'B|0%', 'C|0%'];
   g._childSwitch = async (inst, name) => { bound = name; return true; };
   try {
@@ -2672,6 +2720,33 @@ await t('/v1/models 附带 models.dev 元数据,但不覆盖实测能力字段',
   assert.equal(item.deprecated, false);
   const unknown = JSON.parse(res.body).data.find((m) => m.id === 'unknown-free');
   assert.equal(unknown.name, undefined, '没有元数据时保持基础 OpenAI model 形状');
+});
+
+await t('/v1/models 上下文使用官方目录而非 bracket 粗估,明确实测仍优先', () => {
+  const g = new Gateway(load(), () => {});
+  const estimated = 'nemotron-3.5-super-vl-free';
+  g.models = [estimated, 'validated-free', 'uncatalogued-free', 'catalog-only-free'];
+  g.modelsAt = Date.now();
+  g.metadata.models = new Map(g.models.map(id => [id, { id, provider: 'opencode', name: id }]));
+  g.caps.records = {
+    [estimated]: { ctx: 262144, method: 'bracket' },
+    'validated-free': { ctx: 200000, method: 'validator' },
+    'uncatalogued-free': { ctx: 256000, method: 'bracket' },
+  };
+  g.catalog.models = new Map([
+    [estimated, { context: 1048576 }],
+    ['validated-free', { context: 1048576 }],
+    ['catalog-only-free', { context: 131072 }],
+  ]);
+  const res = fakeRes();
+  g.handleModels(res);
+  const contexts = Object.fromEntries(JSON.parse(res.body).data.map(model => [model.id, model.context_window]));
+  assert.deepEqual(contexts, {
+    [estimated]: 1048576,
+    'validated-free': 200000,
+    'uncatalogued-free': 256000,
+    'catalog-only-free': 131072,
+  });
 });
 
 await t('Responses 出站预算按模型输出上限钳制,原生与转换两条腿一致', async () => {

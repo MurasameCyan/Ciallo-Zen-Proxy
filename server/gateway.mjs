@@ -851,14 +851,15 @@ export class Gateway {
   /**
    * 面板要的那张「id → 上下文上限」,只给当前清单里的 —— 下线的模型不该显示。
    *
-   * 两层来源,实测优先:自己发真实请求探出来的值(caps)盖在上面,opencode
-   * 目录(catalog)只填我们**还没探到**的模型。为什么不反过来让目录当权威 ——
-   * 实测过我们放行的 256K~1M 请求确实能过,而目录对同一批模型报的 context 明显
-   * 偏小(big-pickle 目录 200000 vs 实测 1048576),目录填的是「广告值」不是
-   * 上游校验器的实际放行线。展示上以实测为准,目录只补空。
+   * 能力记录优先于目录,但 bracket 只是候选粗估,不是明确的上游放行线。
+   * 目录有值时不让粗估压过它;校验器/截断实测仍优先,目录缺值才回落粗估。
    */
   modelCtx() {
-    return { ...this.catalog.ctxMap(this.models), ...this.caps.ctxMap(this.models) };
+    const out = this.caps.ctxMap(this.models);
+    for (const [id, ctx] of Object.entries(this.catalog.ctxMap(this.models))) {
+      if (!out[id] || this.caps.get(id)?.method === 'bracket') out[id] = ctx;
+    }
+    return out;
   }
 
   /**
@@ -992,8 +993,8 @@ export class Gateway {
           ...base,
           name: meta.name,
           ...(meta.description ? { description: meta.description } : {}),
-          // models.dev context values are advisory and known to be wrong for some
-          // Zen models; expose the locally probed capability instead.
+          // Use the effective capability + OpenCode catalog context projection,
+          // not the advisory models.dev context.
           ...(ctx[id] != null ? { context_window: ctx[id] } : {}),
           ...(meta.maxOutputTokens != null ? { max_output_tokens: meta.maxOutputTokens } : {}),
           ...(meta.inputCost != null ? { input_cost: meta.inputCost } : {}),
@@ -2618,8 +2619,8 @@ export class Gateway {
 
   /**
    * 拉起一个子 lane:独立 mihomo 进程 + 独立端口 + 独立数据目录,只为固定走
-   * 某个节点。它不拉订阅(配置里 provider 直接引用主 lane 的订阅 url),
-   * 不维护冷却(全在主进程 Gateway 内存里)。subscriptionUrl 由调用方传入。
+   * 某个节点。provider 沿用主 lane 的订阅 URL,启动时刷新自己的磁盘快照;
+   * 冷却仍由主进程 Gateway 维护。
    */
   async _spawnChildLane({ node, nodes, mainNode }) {
     const id = ++this._laneSeq;
@@ -2635,8 +2636,16 @@ export class Gateway {
     });
     await inst.start(this.logger);
 
-    // inst.start 只保证控制端口就绪,provider 还在异步拉订阅。等子 lane 自己的
-    // 节点表出来(带 | 的节点名必须用它自己那份为准,不能拿主 lane 的名字硬切)。
+    // 控制端口就绪时可能仍在使用旧磁盘订阅;刷新成功后才能绑定出口。
+    try {
+      await this._mihomoApi(inst.ctrlPort, '/providers/proxies/airport', 'PUT');
+    } catch (e) {
+      await inst.stop(this.logger);
+      throw e;
+    }
+
+    // 只认子 lane 刷新后的节点表。带 | 的节点名必须用它自己的那份,
+    // 不能拿主 lane 的名字硬切。
     const own = await this._childNodes(inst);
     if (!own.length) {
       await inst.stop(this.logger);

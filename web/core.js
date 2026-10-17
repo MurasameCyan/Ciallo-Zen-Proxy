@@ -32,15 +32,9 @@ const ctxFmt = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFrac
 /**
  * "mimo-v2.5-free" -> "mimo-v2.5-free[1M]";查不到上限的原样返回。
  *
- * 上限从哪来:`/api/status` 的 `ctx`,也就是服务端 `server/capabilities.mjs`
- * 那份**实测记录**(上游 `/zen/v1/models` 一个字节的元数据都不给,models.dev
- * 那份对至少 4 个模型是错的 —— 给 deepseek-v4-flash-free 写 200000,真值
- * 1048576)。这张表以前是手写在这个文件里的常量,代价付过两次:新模型上线不会
- * 自动长出来,下线的模型倒是一直挂着。现在服务端只给当前清单里那些,前端拿到
- * 什么显示什么。
- *
- * 服务端还没探到的(比如刚上线的模型、或者开机那次撞上限流)这里查不到,
- * 就只显示模型名 —— 少个括号,不影响清单本身。
+ * 上限来自 `/api/status.ctx`:能力记录与官方 OpenCode 目录合并,明确实测
+ * 优先,bracket 候选粗估只在目录缺值时兜底。models.dev 的 contextWindow
+ * 不作为容量真值;前端不自行拼表,只显示当前清单。两处都没有值时只显示模型名。
  */
 export function modelLabel(id, ctxMap) {
   const ctx = Number(ctxMap?.[id]);
@@ -81,8 +75,8 @@ export function modelState(id, availability) {
  * 输出」和「它认哪几个思考档位」同样是填客户端时要看的数 —— 2026-10-02 那次
  * muse-spark 400 就是客户端拿上下文上限当输出预算发上去的(两个数差 8 倍)。
  *
- * 取值规则和服务端一致:**实测记录优先,models.dev 兜底**。那份第三方元数据对
- * 好几个 Zen 模型是错的,但它是唯一在我们还没探到时能给出数的来源。
+ * 上下文直接用服务端的 ctxMap,来源优先级见 modelLabel。
+ * 最大输出用实测 maxOut,缺失再用 models.dev;两种上限不混用。
  *
  * 缺字段一律明说「未知」/「未探测」,不显示 0、undefined 或 NaN:这几行是给人
  * 判断「能不能照着填」的,一个假的 0 比空着更坏。探针错误原文附在状态后面 ——

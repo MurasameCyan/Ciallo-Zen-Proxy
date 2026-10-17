@@ -296,9 +296,9 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
         // 前端据 status=unavailable 灰显,unknown/probing 保持可点击。
         modelAvailability: gateway.modelAvailability(),
         modelAvailabilityStatus: gateway.modelAvailabilityStatus?.() || null,
-        // 每个模型的上下文上限,只给清单里现有的那些。这张表以前手写在
-        // web/core.js 里,现在是探出来的实测记录(见 server/capabilities.mjs)——
-        // 于是下线的模型不会再挂在面板上,新上的也不用等人去补一行常量
+        // 只给当前清单里的上下文,合并能力记录与 OpenCode 官方目录。
+        // 明确实测优先,bracket 粗估仅在目录缺值时兜底;
+        // 下线模型不出现在该投影。
         ctx: gateway.modelCtx(),
         // 实测的最大输出和思考档位。胶囊悬停要把「上下文 / 最大输出 / 思考等级」
         // 一起说清 —— 前两个是两件事(Claude Code 拿上下文当输出预算发 1M,

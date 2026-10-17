@@ -22,6 +22,7 @@ const S = {
   nodes: [], cooldowns: [], current: '', locked: '',
   delay: {}, excluded: [],
   egress: { byNode: {}, measured: 0, distinct: 0, measuring: false },
+  nodeTestPending: false,
   logs: [], filter: 'all', follow: true,
   pinSaving: false, pinRevision: 0,
   // 检查更新查到的远端 hash。记 hash 而不是布尔:更新完镜像重启后 status 里的
@@ -159,9 +160,9 @@ function renderNodes() {
   $('nodes-empty').hidden = rows.length > 0;
   const total = S.nodes.length + S.excluded.length;
   const probe = S.egress;
-  const progress = $('nodes-progress');
-  progress.hidden = total === 0;
-  progress.textContent = `进度 ${probe.measured}/${total}`;
+  $('btn-speed').textContent = S.nodeTestPending
+    ? `进度 ${probe.measured}/${total}`
+    : '测节点/出口';
 
   // 全量重建。节点数是几十条量级,重建比 diff 简单且看不出差别。
   // ponytail: 上限约几百条;再多要改成按 name 复用 <li>。
@@ -613,11 +614,13 @@ function wire() {
     return `探到 ${got} 个${miss ? `,${miss} 个没探到(看运行日志)` : ''}`;
   });
 
-  // 保留按钮内的进度节点，异步测量期间继续由轮询更新。
+  // 仅本次点击等待测量时显示进度，轮询继续更新已测数量。
   $('btn-speed').onclick = async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true;
     btn.setAttribute('aria-busy', 'true');
+    S.nodeTestPending = true;
+    renderNodes();
     try {
       const r = await api('/nodes/test', { method: 'POST' });
       const fastest = r?.fastest ? `最快 ${r.fastest.node} ${fmtDelay(r.fastest.delay)}` : '没有可用节点';
@@ -625,8 +628,10 @@ function wire() {
     } catch (err) {
       toast(`测节点/出口失败:${err.message}`, 'err');
     } finally {
+      S.nodeTestPending = false;
       btn.disabled = false;
       btn.removeAttribute('aria-busy');
+      renderNodes();
       refresh();
     }
   };
