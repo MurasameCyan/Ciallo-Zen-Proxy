@@ -7,6 +7,7 @@ import path from 'node:path';
 import { NodeCooldown } from '../server/rotation.mjs';
 
 import { EgressProbe } from '../server/egress-probe.mjs';
+import { MihomoInstance } from '../server/mihomo.mjs';
 
 for (const [kind, mark] of [
   ['429', (c, n, g) => c.mark429(n, g, 3600)],
@@ -144,18 +145,38 @@ test('isolated listener routes both targets to exact special-character node with
   assert.equal(await fs.stat(options.dataDir).catch(() => null), null, 'probe workspace is released');
 });
 
-test('single-flight and ten-minute freshness bound repeated traffic to three-node batches', async (t) => {
+test('one scan covers every unique candidate and reuses fresh measurements', async (t) => {
   const { probe, observed } = await fixture(t);
-  const [first, second] = await Promise.all([probe.measure(['A', 'B', 'C', 'D']), probe.measure(['A', 'B', 'C'])]);
-  assert.equal(first.length, 3);
-  assert.equal(second.length, 3);
-  assert.equal(observed.starts, 1);
-  assert.equal(observed.maxActive, 1);
-  assert.equal(observed.requests.length, 6);
-  assert.equal(probe.get('A').exitIp, '203.0.113.50');
-  assert.equal(probe.snapshot().length, 3);
+  const nodes = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+  const [first, second] = await Promise.all([probe.measure([...nodes, 'A', '', null]), probe.measure(nodes)]);
+  assert.deepEqual(first.map((fact) => fact.node), nodes);
+  assert.deepEqual(second.map((fact) => fact.node), nodes);
+  assert.equal(observed.maxActive, 1, 'batches never overlap independent processes');
+  assert.equal(observed.requests.length, nodes.length * 2, 'fresh nodes are not probed again');
+  for (const node of nodes) assert.equal(probe.get(node).exitIp, '203.0.113.50');
   await probe.measure(['A'], { force: true });
-  assert.equal(observed.starts, 2);
+  assert.equal(observed.requests.length, nodes.length * 2 + 2);
+});
+
+test('completed results become visible during a scan, including unknown exits', async (t) => {
+  const { probe } = await fixture(t, { neutral: '{"ip":"not-an-ip"}' });
+  const seen = [];
+  const results = await probe.measure(['A', 'B', 'C', 'D'], {
+    onResult: (fact) => {
+      seen.push(fact.node);
+      assert.equal(probe.get(fact.node).neutral.error, 'invalid_exit_ip');
+    },
+  });
+  assert.deepEqual(new Set(seen), new Set(['A', 'B', 'C', 'D']));
+  assert.equal(results.length, 4, 'unknown IPs are completed checks, not unmeasured nodes');
+});
+
+test('large scans retain results beyond the former 256-fact ceiling', async (t) => {
+  const { probe } = await fixture(t);
+  const nodes = Array.from({ length: 260 }, (_, i) => `node-${i}`);
+  const results = await probe.measure(nodes);
+  assert.deepEqual(results.map((fact) => fact.node), nodes);
+  assert.equal(probe.snapshot().length, nodes.length);
 });
 
 for (const options of [{ neutral: '{"ip":"not-an-ip"}' }, { neutral: '{"ip":"203.0.113.1:443"}' }, { drip: true }, { huge: true }, { missing: true }, { wrongSelector: true }, { failStart: true }]) {
@@ -241,4 +262,21 @@ test('a provider changed during a batch cannot publish or cache the old snapshot
   assert.deepEqual(await probe.measure(['A']), []);
   assert.equal(probe.get('A'), null);
   assert.deepEqual(probe.snapshot(), []);
+});
+
+test('cancelling during the initial readiness check prevents a late child spawn', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zen-probe-start-'));
+  const configFile = path.join(dir, 'probe.json');
+  await fs.writeFile(configFile, '{}');
+  const instance = new MihomoInstance({ bin: process.execPath, configFile, dataDir: dir, ctrlPort: 1 });
+  t.after(async () => { await instance.stop(() => {}); await fs.rm(dir, { recursive: true, force: true }); });
+  let ready;
+  const initialCheck = new Promise((resolve) => { ready = resolve; });
+  instance.isRunning = () => initialCheck;
+  const controller = new AbortController();
+  const starting = instance.start(() => {}, { signal: controller.signal });
+  controller.abort();
+  ready(false);
+  await assert.rejects(starting, (error) => error.name === 'AbortError');
+  assert.equal(instance.child, null);
 });

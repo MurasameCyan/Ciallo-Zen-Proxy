@@ -45,7 +45,7 @@ const NODES = [
 
 // 模拟实测出口,刻意与机场名不一致,并覆盖未知国家和未测量的节点。
 const DEMO_EGRESS = {
-  measuring: false, tested: 3, measured: 3, distinct: 3,
+  measuring: false, tested: 3, measured: 3, distinct: 3, progress: null,
   byNode: {
     [NODES[0]]: { exitIp: '203.0.113.10', exitCountry: 'US', neutral: { ms: 816 } },
     [NODES[1]]: { exitIp: '203.0.113.11', exitCountry: 'JP', neutral: { ms: 930 } },
@@ -253,8 +253,56 @@ function excluded() {
   return NODES.filter((n) => state.delay.has(n) && state.delay.get(n) == null);
 }
 
+let speedJob = null;
+let egressJob = null;
+
+function speedTest() {
+  if (!speedJob) speedJob = measureDelay().finally(() => { speedJob = null; });
+  return speedJob;
+}
+
+/** 出口扫描独立运行,逐个完成(含未知 IP),202 不等待整轮结束。 */
+function startEgress() {
+  if (egressJob) return;
+  const progress = {
+    startedAt: Date.now(), finishedAt: null, total: NODES.length,
+    completed: 0, measured: 0, failed: 0, cancelled: false, error: null,
+  };
+  DEMO_EGRESS.progress = progress;
+  DEMO_EGRESS.measuring = true;
+  log('info', `[egress] 开始测出口,${NODES.length} 个节点`);
+  egressJob = (async () => {
+    for (const [i, node] of NODES.entries()) {
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      // 保留前三条展示事实:美国、日本、国家未知;两个死节点模拟拿不到 IP。
+      const fact = i < 3 ? DEMO_EGRESS.byNode[node] : {
+        exitIp: i === 4 || i === 9 ? null : `203.0.113.${10 + i}`,
+        exitCountry: i === 4 || i === 9 ? null : ['SG', 'JP', 'US'][i % 3],
+        neutral: { ms: i === 4 || i === 9 ? null : 800 + i * 57 },
+      };
+      DEMO_EGRESS.byNode[node] = fact;
+      progress.completed++;
+      if (fact.exitIp) progress.measured++;
+      progress.failed = progress.completed - progress.measured;
+      const facts = Object.values(DEMO_EGRESS.byNode);
+      DEMO_EGRESS.tested = facts.length;
+      DEMO_EGRESS.measured = facts.filter((item) => item.exitIp).length;
+      DEMO_EGRESS.distinct = new Set(facts.map((item) => item.exitIp).filter(Boolean)).size;
+    }
+    log('ok', `[egress] 测完 ${progress.completed} 个,${progress.measured} 个测得出口,${progress.failed} 个未知`);
+  })().catch(() => {
+    progress.error = '出口扫描失败';
+    progress.cancelled = progress.completed < progress.total;
+    log('error', '[egress] 出口扫描失败');
+  }).finally(() => {
+    progress.finishedAt = Date.now();
+    DEMO_EGRESS.measuring = false;
+    egressJob = null;
+  });
+}
+
 /** 模拟一遍延迟测试:重新摇一次延迟,不通的那两个保持不通 */
-async function speedTest() {
+async function measureDelay() {
   const t0 = Date.now();
   log('info', `[delay] 开始测延迟,${NODES.length} 个节点`);
   await new Promise((r) => setTimeout(r, 1600));
@@ -473,7 +521,7 @@ async function handleApi(req, res, path) {
       excluded: excluded(),
       delay: Object.fromEntries(state.delay),
       testedAt: state.testedAt,
-      testing: false,
+      testing: speedJob !== null,
       current: state.current,
       locked: state.current,
       cooldowns: coolingList(),
@@ -482,6 +530,11 @@ async function handleApi(req, res, path) {
   }
 
   if (path === '/api/nodes/test' && m === 'POST') return json(res, await speedTest());
+
+  if (path === '/api/nodes/egress' && m === 'POST') {
+    startEgress();
+    return json(res, DEMO_EGRESS, 202);
+  }
 
   // 同步模型。假数据每点一次翻面:第一次「新增一个」、第二次翻回来变成「下线一个」,
   // 于是 added/gone 两种 toast 文案都试得到 —— 真网关上清单几周才变一次,

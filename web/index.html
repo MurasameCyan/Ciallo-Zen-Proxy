@@ -219,7 +219,10 @@
   <section class="card fill" aria-labelledby="h-nodes">
     <div class="card-head node-head">
       <h2 id="h-nodes">节点池</h2>
-      <button type="button" class="btn tiny node-test" id="btn-speed">测节点/出口</button>
+      <div class="node-tools" role="group" aria-label="节点测量">
+        <button type="button" class="btn tiny node-test" id="btn-speed" aria-busy="false">测速</button>
+        <button type="button" class="btn tiny node-test" id="btn-egress" aria-busy="false">测出口</button>
+      </div>
     </div>
     <ul class="nodes" id="nodes" aria-live="polite"
         aria-label="节点池,按实测延迟排序,从上往下就是网关接下来会用的顺序"></ul>

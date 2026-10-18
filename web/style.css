@@ -510,10 +510,13 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .badge.cool { color: var(--amber); border-color: color-mix(in oklab, var(--amber) 40%, transparent); }
 .badge.dead { color: var(--rose); border-color: color-mix(in oklab, var(--rose) 40%, transparent); }
 
-.node-head { align-items: center; flex-wrap: nowrap; }
-.node-test {
-  margin-left: auto; flex-shrink: 0; white-space: nowrap;
+.node-head { align-items: center; flex-wrap: wrap; }
+.node-head h2 { flex-shrink: 0; }
+.node-tools {
+  margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap;
+  justify-content: flex-end; min-width: 0; max-width: 100%;
 }
+.node-test { flex-shrink: 0; white-space: nowrap; font-variant-numeric: tabular-nums; }
 
 .empty { color: var(--fg-2); font-size: 13px; padding: 14px 2px; }
 

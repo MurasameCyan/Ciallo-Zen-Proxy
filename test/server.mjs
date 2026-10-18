@@ -36,7 +36,7 @@ const {
   NodeCooldown, NodeAffinity, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
   identityHeaders, OPENAI, ANTHROPIC, RESPONSES, readUsage, CALL_LOG_LIMIT, REQUEST_DEADLINE_MS, budgetFor, silentFor,
   classifyUpstreamError, MODEL_COOLDOWN_MS, BLOCKED_COOLDOWN_MS, isNodeBlockedError,
-  StreamKeepAlive, SSE_HEARTBEAT_MS, MODELS_TTL_MS, DEAD_NODE_REVIVE_MS,
+  StreamKeepAlive, SSE_HEARTBEAT_MS, MODELS_TTL_MS,
   sniffBackendId, backendMismatch,
 } = await import('../server/gateway.mjs');
 const { chatToResponsesBody, withToolAliases } = await import('../server/dialects.mjs');
@@ -49,7 +49,7 @@ const { MihomoInstance } = await import('../server/mihomo.mjs');
 const { shortSha, buildId, buildInfo, checkUpdate } = await import('../server/build.mjs');
 const { ModelMetadataStore } = await import('../server/model-metadata.mjs');
 const indexMod = await import('../server/index.mjs');
-const { createApp, createSubscriptionUpdater, createModelsSync, createDeadNodeReviver } = indexMod;
+const { createApp, createSubscriptionUpdater, createModelsSync } = indexMod;
 
 // Self checks must not contact real upstreams or spend model probe quota.
 // Explicit per-test transports remain injectable; real HTTP stays on loopback.
@@ -3254,83 +3254,6 @@ await t('免费清单每 24 小时自动同步一次,清单拉失败不会带走
   assert.equal(lines.at(-1), 'ok:[models-auto] 清单 2 个,元数据 12 条,目录 7 条');
 });
 
-await t('死节点复活:有测不通的才重测,全通时一个字节都不出站', async () => {
-  const scheduled = [];
-  const cleared = [];
-  const lines = [];
-  let tested = 0;
-  let dead = [];
-  const gateway = {
-    deadNodes: () => dead,
-    testNodes: async () => { tested++; return { tested: 3, alive: 3, dead: [] }; },
-  };
-  const reviver = createDeadNodeReviver({
-    gateway,
-    logger: (lv, msg) => lines.push(`${lv}:${msg}`),
-    setTimer: (fn, ms) => { const h = { fn, ms, unref() { h.unrefed = true; } }; scheduled.push(h); return h; },
-    clearTimer: (h) => cleared.push(h),
-  });
-
-  reviver.schedule();
-  assert.equal(scheduled.length, 1, 'schedule 必须真挂一个定时器');
-  assert.equal(scheduled[0].ms, DEAD_NODE_REVIVE_MS, '周期就是复活探测的间隔');
-  assert.equal(scheduled[0].unrefed, true, '定时器必须 unref,否则 SIGTERM 要等满一拍才退得掉');
-
-  // 没有死节点:这一拍不该出站
-  dead = [];
-  assert.equal(await reviver.run(), null, '没有死节点时 run 直接返回,不碰 testNodes');
-  assert.equal(tested, 0, '全通时一个字节都不出站 —— 这是常态,勤跑是白出站');
-
-  // 有死节点:重测一遍
-  dead = ['B'];
-  const r = await reviver.run();
-  assert.equal(tested, 1, '有测不通的节点才 testNodes');
-  assert.deepEqual(r, { tested: 3, alive: 3, dead: [] });
-  assert.ok(lines.some((x) => x.includes('[revive]') && x.includes('1 个节点')), '重测前记一行,说清为什么出站');
-
-  reviver.schedule();
-  assert.equal(cleared.at(-1), scheduled[0], '重排必须先取消旧定时器');
-  reviver.stop();
-  assert.equal(cleared.at(-1), scheduled.at(-1));
-  assert.equal(scheduled.length, 2, 'stop 之后不再安排新的');
-});
-
-await t('死节点复活:testNodes 抛错被自己接住,不变成没人管的 rejection', async () => {
-  const lines = [];
-  const reviver = createDeadNodeReviver({
-    gateway: { deadNodes: () => ['B'], testNodes: async () => { throw new Error('内核没起来'); } },
-    logger: (lv, msg) => lines.push(`${lv}:${msg}`),
-    setTimer: () => ({ unref() {} }),
-    clearTimer: () => {},
-  });
-  // tick 是定时器那条路走的:它不能往外抛,否则 Node 20 起默认把进程带走
-  reviver.tick();
-  await new Promise((r) => setImmediate(r));
-  assert.ok(lines.some((x) => x.startsWith('warn:') && x.includes('[revive]')), '失败要记一行 warn,而不是崩');
-});
-
-await t('复活周期为 0 或非法时不启动空转定时器', () => {
-  let scheduled = 0;
-  const mk = (intervalMs) => createDeadNodeReviver({
-    gateway: { deadNodes: () => [], testNodes: async () => ({}) },
-    logger: () => {},
-    intervalMs,
-    setTimer: () => { scheduled++; return {}; },
-    clearTimer: () => {},
-  });
-  mk(0).schedule();
-  mk(NaN).schedule();
-  mk(-1).schedule();
-  assert.equal(scheduled, 0, '0 / 非法 / 负数一律不挂定时器');
-});
-
-await t('deadNodes 只报测过不通的(delay=null),没测过的不算死', async () => {
-  const g = fakeGateway({ A: 300, B: null, C: 80 });
-  await g.testNodes();
-  assert.deepEqual(g.deadNodes(), ['B'], 'B 测过不通才算死;A/C 通的不报');
-  const g2 = fakeGateway({ A: 100 });
-  assert.deepEqual(g2.deadNodes(), [], '还没测过延迟时,delay 表空,没有死节点');
-});
 
 // ── 鉴权 ────────────────────────────────────────────────
 
@@ -4318,15 +4241,16 @@ await t('/api/nodes 给出排过序的表、剔除名单和延迟', async () => 
 
 await t('POST /api/nodes/test 触发测延迟并回摘要', async () => {
   gateway.mihomoApi = async (p) => {
-    const m = decodeURIComponent(p).match(/^\/proxies\/(.+?)\/delay/);
-    if (!m) return { all: ['A', 'B'], now: 'A' };
-    if (m[1] === 'B') throw new Error('HTTP 503');
-    return { delay: 120 };
+    if (p.startsWith('/group/')) return { A: 120, B: 80 };
+    return { all: ['A', 'B', 'C'], now: 'A' };
   };
   const r = await fetch(`${base}/api/nodes/test`, { method: 'POST', headers: { authorization: auth } });
   assert.equal(r.status, 200);
   const j = await r.json();
   assert.equal(j.tested, 3, 'getAllNodes 被前面的测试替过,这里测的是它给的 3 个');
+  assert.equal(j.alive, 2);
+  assert.deepEqual(j.dead, ['C']);
+  assert.deepEqual(j.fastest, { node: 'B', delay: 80 });
   assert.equal(typeof j.ms, 'number');
 });
 

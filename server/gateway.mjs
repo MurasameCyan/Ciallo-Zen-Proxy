@@ -74,10 +74,6 @@ export { ModelAvailability, MODEL_AVAILABILITY_TTL_MS } from './model-availabili
 // env 可调(ZEN_MAX_CHILD_LANES),config.json 里存的 maxChildLanes 优先。
 export const MAX_CHILD_LANES = Number(process.env.ZEN_MAX_CHILD_LANES) || 2;
 export const LANE_IDLE_MS = 5 * 60 * 1000;
-// 死节点复活探测周期。rankNodes 把「测过不通」(delay=null)的节点整个排除出
-// 候选,只有开机 / 订阅更新(默认 1h)/ 手动测速 / 重置才会重测 —— 见 index.mjs
-// 的 createDeadNodeReviver。取 5min:比可用性探测(6h)勤,和 lane 回收同量级。
-export const DEAD_NODE_REVIVE_MS = 5 * 60 * 1000;
 
 /**
  * 从远端日志钉死的三类「机场节点拒绝代理 opencode.ai」,加上 CONNECT 直接回 403:
@@ -560,6 +556,7 @@ export class Gateway {
     this.egressAssociations = new Map();
     this.egressInventory = loadProviderEgress();
     this.egressMeasuring = null;
+    this.egressProgress = null;
     this.cooldownState = new CooldownStateStore({ logger });
     const savedCooldowns = this.cooldownState.load();
     for (const row of savedCooldowns?.associations || []) this.rememberEgress(row.node, row.provider, row.ip);
@@ -1355,7 +1352,6 @@ export class Gateway {
       this.lanes.release(lane);
       lane = null;
     }
-    this.measureEgress([cur, ...nodes]).catch(() => {});
     return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort, affinityKey, lane);
   }
 
@@ -2289,13 +2285,13 @@ export class Gateway {
    * 配置里 health-check 是 lazy 的(没请求走这个组时不测,省机场流量),
    * 所以内核自己不会给出这份数据,必须显式点一遍。
    */
-  async testNodes({ forceEgress = false } = {}) {
+  async testNodes() {
     if (this.testing) return this.testing;        // 已经在测了就搭车,别测两遍
-    this.testing = this._testNodes({ forceEgress }).finally(() => { this.testing = null; });
+    this.testing = this._testNodes().finally(() => { this.testing = null; });
     return this.testing;
   }
 
-  async _testNodes({ forceEgress = false } = {}) {
+  async _testNodes() {
     const list = await this.getAllNodes();
     if (!list.length) return { tested: 0, alive: 0, dead: [], fastest: null, ms: 0 };
 
@@ -2343,8 +2339,6 @@ export class Gateway {
       this.logger('warn', `[delay] ${found.size} 个节点全都测不通(耗时 ${secs}s)${why ? `,内核回:${why}` : ''}`);
       this.logger('warn', `[delay] 探针是 ${HEALTH_URL},这次不剔除任何节点;换个地址试试 NODE_TEST_URL=`);
     }
-    const ranked = this.rankNodes(list);
-    this.measureEgress([this.lockedNode || ranked[0], ...ranked], { force: forceEgress }).catch(() => {});
     return {
       tested: found.size, alive: alive.length, dead,
       fastest: alive[0] ? { node: alive[0][0], delay: alive[0][1] } : null, ms,
@@ -2526,38 +2520,60 @@ export class Gateway {
     return aliases.length || this.nodeCache || nodes.length ? aliases : [this.egressLabel(egress)];
   }
 
-  measureEgress(nodes, options = {}) {
-    if (!this.config.subscriptionUrl || !fs.existsSync(PROVIDER_FILE)) return Promise.resolve([]);
+  measureEgress(nodes, { force = false } = {}) {
     if (this.egressMeasuring) return this.egressMeasuring;
+    const candidates = new Set(nodes.filter((node) => typeof node === 'string' && node.length));
+    const progress = this.egressProgress = {
+      startedAt: Date.now(), finishedAt: null, total: candidates.size,
+      completed: 0, measured: 0, failed: 0, cancelled: false, error: null,
+    };
+    if (!this.config.subscriptionUrl || !fs.existsSync(PROVIDER_FILE)) {
+      progress.error = 'probe_unavailable';
+      progress.cancelled = true;
+      progress.finishedAt = Date.now();
+      return Promise.resolve([]);
+    }
     const providers = loadProviderEgress();
     const subscription = this.config.subscriptionUrl;
-    this.egressMeasuring = this.egressProbe.measure(nodes, options).then((facts) => {
-      const currentProviders = loadProviderEgress();
-      if (subscription !== this.config.subscriptionUrl) return [];
-      let changed = false;
-      const accepted = [];
-      for (const fact of facts) {
-        const provider = providers.get(fact.node) || null;
-        if (fact.provider !== provider || (currentProviders.get(fact.node) || null) !== provider ||
-            (this.nodeCache && !this.nodeCache.includes(fact.node))) continue;
-        accepted.push(fact);
-        if (!fact.exitIp) continue;
-        const previous = this.egressIdentities.get(fact.node);
-        if (previous?.provider === provider && previous.ip === fact.exitIp) continue;
-        const wasMeasured = previous?.provider === provider;
-        const fallback = this.policyIdentity(provider ? 'provider' : 'node', provider || fact.node);
-        this.egressIdentities.set(fact.node, { ip: fact.exitIp, provider });
-        this.rememberEgress(fact.node, provider, fact.exitIp);
-        // Only unknown fallback policy migrates; old real-IP policies stay put.
-        if (!wasMeasured) this.cooldown.rekey(fallback, this.policyIdentity('ip', fact.exitIp), { identities: true, notify: false });
-        changed = true;
-      }
-      if (changed) this.saveCooldownState();
-      return accepted;
+    const accepted = new Map();
+    let changed = false;
+    const accept = (fact) => {
+      if (!candidates.has(fact.node) || accepted.has(fact.node) || subscription !== this.config.subscriptionUrl) return;
+      const provider = providers.get(fact.node) || null;
+      if (fact.provider !== provider || (loadProviderEgress().get(fact.node) || null) !== provider ||
+          (this.nodeCache && !this.nodeCache.includes(fact.node))) return;
+      accepted.set(fact.node, fact);
+      progress.completed++;
+      if (!fact.exitIp) { progress.failed++; return; }
+      progress.measured++;
+      const previous = this.egressIdentities.get(fact.node);
+      if (previous?.provider === provider && previous.ip === fact.exitIp) return;
+      const wasMeasured = previous?.provider === provider;
+      const fallback = this.policyIdentity(provider ? 'provider' : 'node', provider || fact.node);
+      this.egressIdentities.set(fact.node, { ip: fact.exitIp, provider });
+      this.rememberEgress(fact.node, provider, fact.exitIp);
+      // Only unknown fallback policy migrates; old real-IP policies stay put.
+      if (!wasMeasured) this.cooldown.rekey(fallback, this.policyIdentity('ip', fact.exitIp), { identities: true, notify: false });
+      changed = true;
+    };
+    this.logger('info', `[egress-probe] 开始测出口,${candidates.size} 个节点`);
+    this.egressMeasuring = this.egressProbe.measure([...candidates], { force, onResult: accept }).then((facts) => {
+      for (const fact of facts) accept(fact);
+      progress.cancelled = progress.completed !== progress.total || subscription !== this.config.subscriptionUrl ||
+        facts.length !== candidates.size;
+      return [...accepted.values()];
     }).catch(() => {
+      progress.error = 'probe_failed';
+      progress.cancelled = true;
       this.logger('warn', '[egress-probe] 出口测量失败,保留原节点健康状态');
       return [];
-    }).finally(() => { this.egressMeasuring = null; });
+    }).finally(() => {
+      if (changed) this.saveCooldownState();
+      progress.finishedAt = Date.now();
+      this.egressMeasuring = null;
+      this.logger(progress.cancelled ? 'warn' : 'ok',
+        `[egress-probe] ${progress.cancelled ? '扫描中止' : '测出口完成'},已检测 ${progress.completed}/${progress.total},确认 IP ${progress.measured},未确认 ${progress.failed}`);
+    });
     return this.egressMeasuring;
   }
 
@@ -2569,7 +2585,8 @@ export class Gateway {
       fact.provider === (providers.get(fact.node) || null));
     const ips = facts.filter((fact) => fact.exitIp).map((fact) => fact.exitIp);
     return { measuring: this.egressMeasuring !== null, tested: facts.length, measured: ips.length,
-      distinct: new Set(ips).size, byNode: Object.fromEntries(facts.map((fact) => [fact.node, fact])) };
+      distinct: new Set(ips).size, byNode: Object.fromEntries(facts.map((fact) => [fact.node, fact])),
+      progress: this.egressProgress ? { ...this.egressProgress } : null };
   }
 
   /** 被剔除的节点,面板要显示出来 —— 静默消失会让人以为订阅少了节点 */
@@ -2583,16 +2600,6 @@ export class Gateway {
     return Object.fromEntries(this.delay);
   }
 
-  /**
-   * 测过但不通的节点名(delay=null)。给死节点复活探测用:有这种节点才值得
-   * 重测一遍(见 index.mjs 的 createDeadNodeReviver),否则一个字节都不出站。
-   * 没测过的节点(delay 里没有条目)不算死 —— 它们本来就还没被判过。
-   */
-  deadNodes() {
-    const out = [];
-    for (const [node, d] of this.delay) if (d == null) out.push(node);
-    return out;
-  }
 
   async restoreLastNode() {
     try {

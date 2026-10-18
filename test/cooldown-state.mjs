@@ -318,6 +318,43 @@ test('gateway rejects obsolete cached and in-flight provider measurements', asyn
   assert.equal(restored.cooldown.egress('A'), 'third.example');
 });
 
+test('a completed exit adopts its cooldown policy before the rest of the scan finishes', async (t) => {
+  providers([['A', 'shared.example'], ['B', 'shared.example']]);
+  const g = gateway();
+  g.config.subscriptionUrl = 'test-only';
+  g.nodeCache = ['A', 'B'];
+  g.cooldown.mark429('A', 'default', 3600);
+  const deadline = g.cooldown.get('A').until;
+  let report, finish;
+  const first = { node: 'A', provider: 'shared.example', exitIp: '203.0.113.72' };
+  const unknown = { node: 'B', provider: 'shared.example', exitIp: null };
+  g.egressProbe.measure = (_, { onResult }) => {
+    report = onResult;
+    return new Promise((resolve) => { finish = resolve; });
+  };
+  const pending = g.measureEgress(g.nodeCache);
+  t.after(async () => { finish([first, unknown]); await pending; });
+  report?.(first);
+  assert.equal(g.cooldown.egress('A'), first.exitIp, 'new evidence must be usable without waiting for slow nodes');
+  assert.equal(g.cooldown.get('A').until, deadline);
+  assert.equal(g.cooldown.get('B').until, deadline, 'unknown aliases retain their existing protection');
+  let status = g.egressStatus(g.nodeCache);
+  assert.equal(status.measuring, true);
+  assert.equal(status.progress.completed, 1);
+  report(unknown);
+  status = g.egressStatus(g.nodeCache);
+  assert.equal(status.progress.completed, 2, 'failed IP checks still advance completion');
+  assert.equal(status.progress.failed, 1);
+  assert.equal(status.measuring, true, 'cleanup is still part of the active scan');
+  finish([first, unknown]);
+  await pending;
+  status = g.egressStatus(g.nodeCache);
+  assert.equal(status.measuring, false);
+  assert.equal(status.progress.completed, 2, 'final results must not count streaming callbacks twice');
+  assert.equal(status.progress.measured, 1);
+  assert.equal(status.progress.cancelled, false);
+});
+
 test('policy-free identity churn is collected and read lookups never rewrite history', async () => {
   const g = gateway();
   for (let i = 0; i < 24; i++) {

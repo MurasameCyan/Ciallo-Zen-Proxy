@@ -72,8 +72,12 @@ export class MihomoInstance {
     return (await this.getVersion()) !== null;
   }
 
-  async start(logger) {
-    if (await this.isRunning()) {
+  async start(logger, { signal } = {}) {
+    signal?.throwIfAborted();
+    const running = await this.isRunning();
+    // A cancelled readiness check must never resume by spawning a new child.
+    signal?.throwIfAborted();
+    if (running) {
       logger('info', `[${this.label}] 已在运行`);
       return true;
     }
@@ -115,8 +119,11 @@ export class MihomoInstance {
 
     // 首次要拉订阅,给足 30 秒
     for (let waited = 0; waited < 30_000; waited += 500) {
+      signal?.throwIfAborted();
       if (!this.isSpawned()) throw new Error(`${this.label} 启动即退出${this.lastErr ? ': ' + this.lastErr : '(多半是订阅拉不下来或格式不对)'}`);
-      if (await this.isRunning()) {
+      const ready = await this.isRunning();
+      signal?.throwIfAborted();
+      if (ready) {
         logger('ok', `[${this.label}] 已启动 (PID ${self.pid})`);
         return true;
       }

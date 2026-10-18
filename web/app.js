@@ -24,8 +24,9 @@ const S = {
   cfg: {}, status: {}, usage: null,
   nodes: [], cooldowns: [], current: '', locked: '',
   delay: {}, excluded: [],
-  egress: { byNode: {}, measured: 0, distinct: 0, measuring: false },
-  nodeTestPending: false,
+  egress: { byNode: {}, measured: 0, distinct: 0, measuring: false, progress: null },
+  nodeTestPending: false, nodeTesting: false, nodeTestRevision: 0,
+  egressPending: false, egressRevision: 0, egressObserved: null, egressNotified: null,
   logs: [], filter: 'all', follow: true,
   pinSaving: false, pinRevision: 0,
   // 检查更新查到的远端 hash。记 hash 而不是布尔:更新完镜像重启后 status 里的
@@ -161,11 +162,7 @@ function renderNodes() {
   const rows = nodeRows({ ...S, now: Date.now() });
   const ul = $('nodes');
   $('nodes-empty').hidden = rows.length > 0;
-  const total = S.nodes.length + S.excluded.length;
-  const probe = S.egress;
-  $('btn-speed').textContent = S.nodeTestPending
-    ? `进度 ${probe.measured}/${total}`
-    : '测节点/出口';
+  renderNodeControls();
 
   // 全量重建。节点数是几十条量级,重建比 diff 简单且看不出差别。
   // ponytail: 上限约几百条;再多要改成按 name 复用 <li>。
@@ -498,14 +495,62 @@ function toast(msg, kind = '') {
   setTimeout(() => el.remove(), 3200);
 }
 
+function renderNodeControls() {
+  const latencyBusy = S.nodeTestPending || S.nodeTesting;
+  const exitBusy = S.egressPending || S.egress.measuring;
+  const progress = S.egress.measuring ? S.egress.progress : null;
+  const speed = $('btn-speed');
+  speed.textContent = latencyBusy ? '测速中…' : '测速';
+  speed.disabled = latencyBusy;
+  speed.setAttribute('aria-busy', String(latencyBusy));
+  const egress = $('btn-egress');
+  egress.textContent = exitBusy
+    ? `出口 ${progress?.completed ?? 0}/${progress?.total ?? S.nodes.length + S.excluded.length}`
+    : '测出口';
+  egress.disabled = exitBusy;
+  egress.setAttribute('aria-busy', String(exitBusy));
+}
+
+/** 同一轮进度只能前进;请求回包不能把较新的轮询结果倒回去。 */
+function adoptEgress(probe, watch = false) {
+  if (!probe) return;
+  const previous = S.egress.progress;
+  const progress = probe.progress;
+  if (watch && progress && (!previous || progress.startedAt >= previous.startedAt)) {
+    S.egressObserved = progress.startedAt;
+  }
+  if (previous && progress) {
+    if (progress.startedAt < previous.startedAt) return;
+    if (progress.startedAt === previous.startedAt
+      && (progress.completed < previous.completed || (previous.finishedAt && !progress.finishedAt))) return;
+  }
+  S.egress = probe;
+  if (!progress) return;
+  if (probe.measuring) S.egressObserved = progress.startedAt;
+  if (watch || probe.measuring || !progress.finishedAt || S.egressObserved !== progress.startedAt
+    || S.egressNotified === progress.startedAt) return;
+  S.egressNotified = progress.startedAt;
+  const counts = `${progress.completed}/${progress.total} 个,${progress.measured} 个测得出口,${progress.failed} 个未测得`;
+  if (progress.error) toast(`出口扫描失败:${progress.error},${counts}`, 'err');
+  else if (progress.cancelled) toast(`出口扫描已取消,${counts}`, 'err');
+  else toast(`测出口完成,${counts}`, 'ok');
+}
+
 // ── 轮询 ────────────────────────────────────────────────
 
+let refreshSequence = 0;
+let refreshApplied = 0;
 async function refresh() {
   const pinRevision = S.pinRevision;
+  const sequence = ++refreshSequence;
+  const nodeTestRevision = S.nodeTestRevision;
+  const egressRevision = S.egressRevision;
   try {
     const [status, cfg, usage, pool] = await Promise.all([
       api('/status'), api('/config'), api('/usage'), api('/nodes'),
     ]);
+    if (sequence < refreshApplied) return;
+    refreshApplied = sequence;
     const preservePin = S.pinSaving || pinRevision !== S.pinRevision;
     const pin = S.status.pinClaudeBackend;
     S.status = status || {};
@@ -521,7 +566,8 @@ async function refresh() {
     S.locked = pool?.locked || '';
     S.delay = pool?.delay || {};
     S.excluded = pool?.excluded || [];
-    S.egress = pool?.egress || { byNode: {}, measured: 0, distinct: 0, measuring: false };
+    if (nodeTestRevision === S.nodeTestRevision) S.nodeTesting = pool?.testing === true;
+    if (egressRevision === S.egressRevision) adoptEgress(pool?.egress);
     // 服务端给秒,进来立刻折算成本地截止点,之后本地走秒不用等下次轮询
     S.cooldowns = (pool?.cooldowns || []).map((c) => ({ ...c, deadline: cooldownDeadline(c.remain) }));
 
@@ -536,6 +582,8 @@ async function refresh() {
     if (document.activeElement !== hours) hours.value = S.cfg.subscriptionUpdateHours || 0;
     renderOpenCodeUa();
   } catch (e) {
+    if (sequence < refreshApplied) return;
+    refreshApplied = sequence;
     setPill($('pill-node'), 'down', '连接不上后端');
   }
 }
@@ -635,24 +683,40 @@ function wire() {
     return `探到 ${got} 个${miss ? `,${miss} 个没探到(看运行日志)` : ''}`;
   });
 
-  // 仅本次点击等待测量时显示进度，轮询继续更新已测数量。
-  $('btn-speed').onclick = async (e) => {
-    const btn = e.currentTarget;
-    btn.disabled = true;
-    btn.setAttribute('aria-busy', 'true');
+  $('btn-speed').onclick = async () => {
+    if (S.nodeTestPending || S.nodeTesting) return;
     S.nodeTestPending = true;
-    renderNodes();
+    S.nodeTestRevision++;
+    renderNodeControls();
     try {
       const r = await api('/nodes/test', { method: 'POST' });
+      S.nodeTesting = false;
       const fastest = r?.fastest ? `最快 ${r.fastest.node} ${fmtDelay(r.fastest.delay)}` : '没有可用节点';
-      toast(r?.tested ? `测节点/出口完成,${r.alive}/${r.tested} 可用,${fastest}` : '测节点/出口完成', 'ok');
+      toast(r?.tested ? `测速完成,${r.alive}/${r.tested} 可用,${fastest}` : '测速完成', 'ok');
     } catch (err) {
-      toast(`测节点/出口失败:${err.message}`, 'err');
+      toast(`测速失败:${err.message}`, 'err');
     } finally {
       S.nodeTestPending = false;
-      btn.disabled = false;
-      btn.removeAttribute('aria-busy');
-      renderNodes();
+      S.nodeTestRevision++;
+      renderNodeControls();
+      refresh();
+    }
+  };
+
+  $('btn-egress').onclick = async () => {
+    if (S.egressPending || S.egress.measuring) return;
+    S.egressPending = true;
+    S.egressRevision++;
+    renderNodeControls();
+    try {
+      // 202 只表示已启动/复用,完成以之后的轮询快照为准。
+      adoptEgress(await api('/nodes/egress', { method: 'POST' }), true);
+    } catch (err) {
+      toast(`测出口失败:${err.message}`, 'err');
+    } finally {
+      S.egressPending = false;
+      S.egressRevision++;
+      renderNodeControls();
       refresh();
     }
   };
