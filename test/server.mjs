@@ -290,6 +290,20 @@ await t('上游错误分类:模型不可用不当成节点限流,5xx 才是可�
   assert.equal(classifyUpstreamError(403,
     '{"error":{"type":"FreeTierError","message":"OpenCode\'s free tier can only be used from within OpenCode"}}'),
   'retryable');
+  // 2026-10-19 实测的新文案:类型仍是 FreeTierError,但正文里没有旧关键词。
+  // 同一节点所有模型 403、换节点立刻 200,说明是出口 IP 被标记。
+  // 以前只看正文 -> terminal -> 保留锁定节点、不写冷却,每个请求原地失败。
+  const ipBanned = JSON.stringify({
+    type: 'error',
+    error: {
+      type: 'FreeTierError',
+      message: "OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address. This isn't related to your account. If you're on a VPN or proxy, turn it off and try again, or subscribe to OpenCode Go to keep building.",
+    },
+  });
+  assert.equal(classifyUpstreamError(403, ipBanned), 'retryable');
+  // 只有 type、没有旧文案时也必须认出这是免费层拒绝。
+  assert.equal(classifyUpstreamError(403,
+    '{"error":{"type":"FreeTierError","message":"Access denied"}}'), 'retryable');
   assert.equal(classifyUpstreamError(403, '{"error":{"message":"Forbidden"}}'), 'terminal');
 });
 

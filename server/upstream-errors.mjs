@@ -14,6 +14,17 @@ export function upstreamErrorMessage(body) {
   return text.trim();
 }
 
+/** 上游错误体的 type 字段;免费层拒绝统一用 FreeTierError,文案会变。 */
+function upstreamErrorType(body) {
+  if (body && typeof body === 'object') return String(body?.error?.type || body?.type || '');
+  try {
+    const parsed = JSON.parse(String(body ?? ''));
+    return String(parsed?.error?.type || parsed?.type || '');
+  } catch {
+    return '';
+  }
+}
+
 export function isModelUnavailableError(status, body) {
   if (Number(status) !== 400) return false;
   return /\bmodel\s+(?:(?:is|was)\s+)?(?:unavailable|not\s+available)\b/i
@@ -21,21 +32,24 @@ export function isModelUnavailableError(status, body) {
 }
 
 /**
- * 免费层准入门(403 FreeTierError:「can only be used from within OpenCode」)。
+ * 免费层准入门。上游有两个阶段的拒绝,类型都是 403 FreeTierError:
  *
- * v2 上游要求 inference/v1 路径、完整的四段 cli UA、配对的 session 头，以及
- * 精确的 `read` / `shell` 工具定义(见 identityHeaders / gate*Body)。客户端带来的
- * UUID 或自定义 session 不能直接拿来当上游 session;identityHeaders 会保留合法的
- * OpenCode 形状,其余按原值稳定哈希后再发。剩下的 403 仍可能是上游按出口/时间窗
- * 做的间歇性抽检,所以它该被当成可重试(换出口重发),而不是 terminal 直接甩给客户端。
+ *   1. 旧文案「can only be used from within OpenCode」—— 身份头/Session 形状
+ *      不对时出现,也可能是按出口/时间窗的间歇抽检。
+ *   2. 2026-10-19 实测的新文案「free models aren't available from your current
+ *      network ... abusive traffic from this IP address」—— 出口 IP 被上游标记。
+ *      同一个节点上所有免费模型都 403,换一个节点立刻 200(同一身份头、同一
+ *      请求体),所以它是**出口属性**,不是客户端身份坏了。
  *
- * 若把这类 403 当 terminal，会让用户在一次抽检上原地失败，隔壁节点明明能过。
- * 若 session 形状非法，则所有节点都会稳定拒绝；归一化逻辑在身份头构造处处理。
+ * 两种都必须归为可重试(换出口重发),不能判 terminal —— terminal 会保留当前
+ * 锁定节点、不写冷却,于是每个请求都在同一个被封 IP 上原地失败。文案会继续变,
+ * 因此优先认 error.type=FreeTierError,旧关键词只作为没有 type 时的兜底。
  */
 export function isFreeTierError(status, body) {
   if (Number(status) !== 403) return false;
+  if (upstreamErrorType(body) === 'FreeTierError') return true;
   const message = upstreamErrorMessage(body);
-  return /free\s*tier|FreeTierError|from\s+within\s+OpenCode/i.test(message);
+  return /free\s*tier|from\s+within\s+OpenCode|abusive\s+traffic|free\s+models\s+(?:aren't|are not)\s+available\s+from\s+your\s+current\s+network/i.test(message);
 }
 
 export function isCapabilityError(status, body) {
