@@ -29,6 +29,11 @@ jobs:
       # 而 npm test 得能在没有 openssl 的机器上跑。runner 自带 openssl。
       - name: 验 TLS-over-CONNECT 出站
         run: node scripts/verify-tunnel.mjs
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+      - name: 验 Bun 节点切换与 lane 隔离
+        run: node scripts/verify-bun-egress.mjs
 
   build:
     needs: test

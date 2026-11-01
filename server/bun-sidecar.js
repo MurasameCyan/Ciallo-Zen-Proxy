@@ -49,6 +49,9 @@ const server = Bun.serve({
       upstream = await fetch(UPSTREAM + url.pathname + url.search, {
         method: req.method, headers, body,
         proxy: `http://127.0.0.1:${proxyPort}`,
+        // A mihomo selector can change behind this same proxy port. Reusing a
+        // CONNECT tunnel would keep sending retries through the old exit IP.
+        keepalive: false,
         redirect: 'manual',
         signal: req.signal,
       });

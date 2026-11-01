@@ -71,7 +71,7 @@ compose 默认只绑 `127.0.0.1:9527`。想让同网段其它机器连,把端口
 
 **真实请求成功也算证据,而且比探针硬。** 探针对 5xx 只记 `unknown` 并等满六小时(上游故障不是这个模型的属性),于是上游抖一下就能让胶囊灰着「状态未知」好几个小时 —— 而同一个模型其实一直在为你干活。所以上游确认成功的请求(流式跑完、或非流式拼装完成)会把该模型写回 `available` 并清掉上一次的错误原因;失败、中断、客户端取消都不写。这条不增加任何出站:用的是你本来就要发的那个请求。
 
-**429 是出口额度耗尽,不是模型属性。** 免费额度按出口 IP 计。2026-10-13 实测:`muse-spark-1.3-contributor-free` 在部分出口上回 `429 FreeUsageLimitError` + `retry-after: 20661`(约 5.7 小时),官方 CLI `1.19.0` 在同一出口上也一样;换到还有额度的出口就是 200。探针以前撞上 429 只换节点、不记冷却,而且要等满六小时才重探,于是 muse / space-bunny 的胶囊一直灰着,其实真实请求换个出口就能跑。现在探针和真实请求一样,把 429 的出口按上游的 Retry-After 记进同一张冷却表,两边都不再撞它;429 的模型 15 分钟后换出口再探,不等六小时。`muse-spark-1.2-contributor-free` 在上游目录里已标 `deprecated`,官方 1.19.0 不再列出它,但同样的请求在有额度的出口上仍回 200。
+**429 不是模型属性，也不能单凭原文认定额度耗尽。** 免费额度按出口 IP 计。2026-10-13 实测:`muse-spark-1.3-contributor-free` 在部分出口上回 `429 FreeUsageLimitError` + `retry-after: 20661`(约 5.7 小时),官方 CLI `1.19.0` 在同一出口上也一样;换到还有额度的出口就是 200。探针以前撞上 429 只换节点、不记冷却,而且要等满六小时才重探,于是 muse / space-bunny 的胶囊一直灰着,其实真实请求换个出口就能跑。现在探针和真实请求一样,把 429 的出口按上游的 Retry-After 记进同一张冷却表,两边都不再撞它;429 的模型 15 分钟后换出口再探,不等六小时。`muse-spark-1.2-contributor-free` 在上游目录里已标 `deprecated`,官方 1.19.0 不再列出它,但同样的请求在有额度的出口上仍回 200。
 
 **免费层拒绝必须与当前官方 CLI 对照。** 2026-10-17，官方发行版 `2.0.32` 对 `nemotron-3.5-super-vl-free` 在部分隔离出口上也返回 `403 FreeTierError`，同出口的网关与探针一致；换到另一条已独立确认公网 IP 的出口后，官方 CLI、真实网关请求和探针均回 200，客户端收到完整 `PONG`。期间还遇到短暂 500，同一请求交错重放后恢复。因此不能只凭错误原文判定额度耗尽、模型永久下线或能力上限。
 
@@ -331,6 +331,7 @@ openai-compatibility:
 - 合成 session 的 12 位 hex 使用官方降序编码 `~(timeMs * 0x1000 + 1)`，毫秒内计数器固定为 1（把哈希熵塞进计数器会触发 `FreeTierError`）。时间字段必须是**最近的**：2026-11-01 实测，30 天内放行，90 天以上一律 `429 FreeUsageLimitError`。网关取当前 7 天窗口的起点再按哈希往前偏移，最多 14 天前，同一对话在一个窗口内保持不变。
 - Chat 请求的 system 里必须有 `<env>` 块并包含 `Working directory:`，tools 也不能为空，缺了同样是 `429 FreeUsageLimitError`；只写这一行不带标签、或放进 user 消息都不行。（官方的会话标题请求原文例外，那是上游认得的固定提示。）客户端自己带了 `<env>`（Claude Code、OpenCode 都会带）就原样转发，没带时网关在第一条 system 末尾补一个最小块；网关总会补上 `read`/`shell`，所以 tools 不会为空。
 - **上游按 TLS 握手识别客户端。** 同一出口、同一份请求字节：Node 的 OpenSSL 握手回 `429 FreeUsageLimitError`，Bun 的 BoringSSL 握手回 200；把 Node 的加密套件和曲线改成 Bun 那套也没用。所以推理请求由一个只监听 127.0.0.1 的 Bun 子进程发出（`server/bun-sidecar.js`），Node 只把请求转给它；镜像里固定装 Bun `1.4.4`，换版本前要重新对照官方 CLI。找不到 Bun 时启动日志会告警，请求回退 Node TLS。
+- Bun 上游 `fetch` 显式关闭连接复用（`keepalive: false`），每次请求重新建立 CONNECT 隧道。mihomo 在同一个 mixed-port 后切换 selector 时，旧隧道仍通向旧出口；复用它会让重试看似换了节点、实际仍打旧 IP，并把新节点误记成限流。Node 到本地 Bun 代理的 HTTP 连接仍可复用，已经开始的流不受后续 selector 切换影响。`scripts/verify-bun-egress.mjs` 用真实 Bun 验证 A → B → A 切换与并发 lane 隔离，CI 单独运行。
 - 免费请求必须带 OpenCode v2 的精确 `read` 与 `shell` 工具定义。网关不再发送旧的五工具 stub；缺少的定义按 CLI 原文补上，并在 system/instructions 中标记为 placeholder，避免模型真的调用网关没有实现的工具。
 - 客户端自己的工具原样保留。若客户端正好把不同 schema 的工具命名为 `read` 或 `shell`，出站临时改成 `read_client` / `shell_client`（重名递增），历史调用和响应再恢复原名；`Read`、`Bash` 等大小写不同的名字不改。
 - 版本成功记录原子写入 `/data/opencode-version.json`，启动先读缓存，到期后后台同步，之后每 24 小时检查一次，不依赖面板轮询或客户端请求。网络失败、非法元数据或版本倒退都保留最近成功值；完全没有有效缓存时使用已验证的 `2.0.29`。真实请求与可用性、能力探针共用当前版本，单次请求跨节点重试时身份不变；身份头开关不影响版本同步。`/api/status` 的 `opencodeVersion` 与 `[opencode-version]` 日志提供版本、检查时间和最近错误。
@@ -432,6 +433,7 @@ npm run preview       # 不起内核,只看 UI
 npm start             # 完整跑,需要 /data 可写
 
 npm run verify:tunnel     # TLS-over-CONNECT 出站(要 openssl)
+node scripts/verify-bun-egress.mjs # Bun 实际出口切换与并发 lane 隔离(要 Bun 1.4.4 + openssl)
 npm run verify:upstream   # 出站是否真经代理(比对出口 IP),PROXY_PORT=2080 驱动
 npm run verify:api        # 打真实部署,BASE=http://... KEY=... 两个环境变量驱动
 npm run verify:logout     # 无头浏览器走一遍登录/退出登录(要 Chrome 或 Edge)

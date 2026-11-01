@@ -22,9 +22,7 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'Free usage limit reached.' } }));
     return;
   }
-  let body = ''; req.on('data', (c) => { body += c; });
-  req.on('end', () => res.writeHead(200, { 'content-type': 'application/json' })
-    .end(JSON.stringify({ path: req.url, proxy: req.headers['x-sidecar-proxy'], body })));
+  res.writeHead(400).end();
 });
 server.listen(0, '127.0.0.1', () => console.log('SIDECAR_READY ' + server.address().port));
 `);
@@ -47,15 +45,6 @@ const t = async (name, fn) => { await fn(); n++; console.log(`  ok  ${name}`); }
 
 assert.equal(await startBunTransport({ bin: process.execPath, script: fake }), true);
 assert.equal(bunTransportStatus().ready, true);
-
-await t('请求经代理发出:路径、请求体和 mihomo 端口原样带到代理', async () => {
-  const r = await call('echo', 27897);
-  assert.equal(r.status, 200);
-  const seen = JSON.parse(r.text);
-  assert.equal(seen.path, '/inference/v1/chat/completions');
-  assert.equal(seen.proxy, '27897', '子 lane 有自己的 mixed-port,代理必须走请求指定的那个');
-  assert.equal(seen.body, '{"model":"m"}');
-});
 
 await t('上游 429 原样交给网关,不当成代理故障', async () => {
   const r = await call('quota');
