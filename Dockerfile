@@ -29,13 +29,37 @@ RUN set -eux; \
     gunzip mihomo.gz; \
     chmod +x mihomo; \
     ./mihomo -v
+# Bun 只用来发上游推理请求(见 server/bun-sidecar.js):免费层按 TLS 握手识别
+# 客户端,Node 的 OpenSSL 握手一律 429 FreeUsageLimitError,Bun 的 BoringSSL 放行。
+# 版本钉死在实测过的那一版 —— 换版本可能换掉 ClientHello,得重新对照官方 CLI。
+# amd64 取 baseline,理由同上面的 mihomo compatible。
+ARG BUN_VERSION=1.4.4
+RUN set -eux; \
+    apk add --no-cache unzip; \
+    case "$TARGETARCH" in \
+      amd64) asset="bun-linux-x64-musl-baseline.zip" ;; \
+      arm64) asset="bun-linux-aarch64-musl.zip" ;; \
+      *) echo "不支持的架构: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    base="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}"; \
+    curl -fsSL -o bun.zip "$base/$asset"; \
+    curl -fsSL -o SHASUMS256.txt "$base/SHASUMS256.txt"; \
+    sum="$(awk -v a="$asset" '$2 == a { print $1 }' SHASUMS256.txt)"; \
+    test -n "$sum"; \
+    echo "$sum  bun.zip" | sha256sum -c -; \
+    unzip -q bun.zip; \
+    mv bun-linux-*/bun ./bun; \
+    chmod +x bun
 
 FROM node:22-alpine
 # ca-certificates 是给 mihomo 的:Go 从 /etc/ssl/certs 读根证书,
 # 没有它拉 https 订阅会失败。Node 自己带了一套编进去的,不受影响。
-RUN apk add --no-cache ca-certificates
+# libstdc++/libgcc 是 musl 版 Bun 的运行时依赖。
+RUN apk add --no-cache ca-certificates libstdc++ libgcc
 
 COPY --from=kernel /out/mihomo /usr/local/bin/mihomo
+COPY --from=kernel /out/bun /usr/local/bin/bun
+RUN bun --version
 
 WORKDIR /app
 # 没有依赖要装(本项目零 npm 依赖),直接拷源码

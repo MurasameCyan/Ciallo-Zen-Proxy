@@ -25,6 +25,7 @@ import {
   Sessions, FailWindow, SESSION_COOKIE, sessionCookie, CLEAR_COOKIE,
 } from './auth.mjs';
 import { readUtf8Body } from './http-util.mjs';
+import { startBunTransport, stopBunTransport } from './bun-transport.mjs';
 
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const MAX_LOG = 500;
@@ -735,6 +736,11 @@ async function main() {
     log('warn', `[auth] 没设 PANEL_PASS,本次随机生成 —— 用户 ${creds.user} 密码 ${creds.pass}`);
   }
 
+  // 上游推理请求经 Bun 发出(见 bun-transport.mjs)。必须在开机探测之前就绪:
+  // 探针撞上 Node 的 TLS 会收到 429,会把好节点按额度耗尽冷却。找不到 Bun 时
+  // 只记一条警告,请求回退 Node TLS。
+  await startBunTransport({ logger: log });
+
   // 没订阅就先不拉内核:配置文件都写不出来,拉起来只会启动失败刷错误日志。
   // 用户在面板填完订阅,保存那一步会把内核带起来。
   if (cfg.subscriptionUrl) {
@@ -789,6 +795,7 @@ async function main() {
     await gateway.stopChildLanes?.();
     await gateway.egressProbe.stop();
     await mihomo.stop(log);
+    await stopBunTransport();
     process.exit(0);
   };
   process.on('SIGTERM', () => bye('SIGTERM'));

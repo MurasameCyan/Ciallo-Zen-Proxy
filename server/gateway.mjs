@@ -13,6 +13,7 @@ import https from 'node:https';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { MihomoAgent } from './proxy.mjs';
+import { upstreamRequest } from './bun-transport.mjs';
 import {
   LAST_NODE_FILE, USAGE_FILE, CAPS_FILE, MODELS_DEV_FILE, OPENCODE_CATALOG_FILE,
   MIXED_PORT, CTRL_PORT, POOL_NAME, lanePorts, laneDataDir, writeMihomoConfig,
@@ -450,20 +451,28 @@ function conversationSeed(body) {
 
 /**
  * Stable v2 session ID. The prefix is `~(timeMs * 0x1000 + counter)` in the
- * low 48 bits. Translated client session hints use only 36 time bits and keep
- * counter 1; filling the counter from a digest is rejected by FreeTierError.
+ * low 48 bits; counter stays 1 (filling it from a digest is rejected by
+ * FreeTierError).
+ *
+ * The time field must be recent. 2026-11-01, official 2.2.5 request bytes over
+ * Bun TLS on one exit: session timestamps up to 30 days old pass, 90 days or
+ * older get `429 FreeUsageLimitError`. Deriving the time from a digest put most
+ * synthesized sessions hundreds of days in the past, so every node looked
+ * quota-exhausted. The time is now `windowStart - offset`, at most two windows
+ * (14 days) old, and stays fixed for the same signal within one window.
  */
 const SESSION_ALNUM = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 const SESSION_ID_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const SESSION_PREFIX_MASK = (1n << 48n) - 1n;
-const SESSION_TIME_MASK = (1n << 36n) - 1n;
+const SESSION_WINDOW_MS = 7 * 24 * 3600 * 1000;
 function descendingTimeHex(time, counterValue) {
   return (~(BigInt(time) * 0x1000n + BigInt(counterValue)) & SESSION_PREFIX_MASK)
     .toString(16).padStart(12, '0');
 }
-function stableSessionId(signal) {
+function stableSessionId(signal, now = Date.now()) {
   const digest = crypto.createHash('sha256').update(`ses\0${signal}`).digest();
-  const time = BigInt(`0x${digest.subarray(0, 5).toString('hex')}`) & SESSION_TIME_MASK;
+  const windowStart = Math.floor(now / SESSION_WINDOW_MS) * SESSION_WINDOW_MS;
+  const time = windowStart - (digest.readUIntBE(0, 6) % SESSION_WINDOW_MS);
   const prefix = descendingTimeHex(time, 1);
   let alnum = '';
   for (let i = 6; i < 20; i++) alnum += SESSION_ALNUM[digest[i] % 62];
@@ -1929,7 +1938,7 @@ export class Gateway {
       // 单次超时不能超过整体剩余预算,否则一次慢请求就把预算吃穿
       const timeout = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
       const t0 = Date.now();
-      const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout, identity, path, agent, signal }), (resp) => {
+      const r = upstreamRequest(this.reqOpts(bodyStr, { accept: '*/*', timeout, identity, path, agent, signal }), (resp) => {
         let data = '';
         // 非流式的「首字」= 上游开始回话的时刻。整个 body 是一次攒完的,
         // 所以它和总耗时差的就是传输那点时间,不像流式那样能差几十秒
@@ -2170,7 +2179,7 @@ export class Gateway {
       // postpone first business output forever. This timer is a wall-clock deadline.
       firstTimer = setTimeout(() => fail({ status: 0, body: `stream first-output timeout after ${ttfb}ms` }), ttfb);
       firstTimer.unref?.();
-      r = https.request(this.reqOpts(bodyStr, {
+      r = upstreamRequest(this.reqOpts(bodyStr, {
         accept: 'text/event-stream', timeout: ttfb, identity, path: dialect.path, agent, signal,
       }), (resp) => {
         upstream = resp;

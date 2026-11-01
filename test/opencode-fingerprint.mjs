@@ -95,6 +95,19 @@ const namesOf = (tools) => tools.map((tool) => tool.name ?? tool.function?.name)
   assert.equal(body.tool_choice, undefined, 'chat must not send tool_choice=none');
   assert.equal(body.messages[0].role, 'system');
   assert.match(body.messages[0].content, /^Do not call the `read` or `shell` tools;/);
+  // 上游要求 system 里有 <env> + Working directory:,缺了一律 429 FreeUsageLimitError。
+  assert.match(body.messages[0].content, /<env>\n {2}Working directory: [^\n]+\n<\/env>$/);
+  assert.equal(body.messages.filter((m) => m.role === 'system').length, 1, 'env 必须并进同一条 system,不能另起一条');
+}
+
+{
+  // 客户端自己带了 <env>(Claude Code / OpenCode)时不重复注入,原文不动。
+  const own = '<env>\nWorking directory: /home/me/proj\nPlatform: linux\n</env>';
+  const body = { messages: [{ role: 'system', content: [{ type: 'text', text: own }] }, { role: 'user', content: 'hi' }], tools: chat(['Edit']) };
+  applyFingerprintTools(body, false);
+  const text = JSON.stringify(body.messages);
+  assert.equal(text.split('Working directory:').length - 1, 1, 'existing env block must not be duplicated');
+  assert.ok(text.includes('/home/me/proj'));
 }
 
 {

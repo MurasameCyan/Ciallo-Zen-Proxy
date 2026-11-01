@@ -791,6 +791,11 @@ await t('合成的会话 ID 使用官方降序编码且计数器固定为 1', ()
     assert.match(first, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
     const decoded = ~BigInt(`0x${first.slice(4, 16)}`) & mask;
     assert.equal(decoded & 0xfffn, 1n, `${first} 的降序前缀解码低位必须为 1`);
+    // 上游只认最近的会话时间:2026-11-01 实测 30 天内放行、90 天以上 429。
+    // 解码只能还原 ts mod 2^36,所以按模比较年龄。
+    const mod = 1n << 36n;
+    const age = Number(((BigInt(Date.now()) % mod) - (decoded >> 12n) + mod) % mod);
+    assert.ok(age >= 0 && age <= 15 * 24 * 3600 * 1000, `${first} 的时间字段离现在 ${Math.round(age / 86400000)} 天,超过 15 天会被上游拒绝`);
     assert.equal(identityHeaders(inbound, () => 'unused')['x-opencode-session'], first, '同一对话必须稳定');
   }
 });

@@ -193,6 +193,37 @@ function noteUnavailableTools(body, flat, names) {
   }
 }
 
+/**
+ * The free tier rejects chat requests whose system prompt lacks an `<env>` block
+ * with a `Working directory:` line (429 FreeUsageLimitError). 2026-11-01, Bun
+ * TLS, same exit: a minimal block in the system message passes; the line
+ * without the tag, or the block in a user message, still gets 429. Clients that
+ * already send one (Claude Code, OpenCode) are left unchanged.
+ */
+const ENV_BLOCK = '<env>\n  Working directory: /workspace\n</env>';
+const ENV_RE = /<env>[\s\S]*?Working directory:[\s\S]*?<\/env>/;
+
+function systemText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('\n');
+  return '';
+}
+
+export function ensureEnvBlock(body) {
+  if (!body || !Array.isArray(body.messages) || body.system !== undefined) return false;
+  const systems = body.messages.filter((msg) => msg?.role === 'system');
+  if (systems.some((msg) => ENV_RE.test(systemText(msg.content)))) return false;
+  const first = body.messages[0];
+  if (first?.role === 'system' && typeof first.content === 'string') {
+    body.messages = [{ ...first, content: `${first.content}\n\n${ENV_BLOCK}` }, ...body.messages.slice(1)];
+  } else if (first?.role === 'system' && Array.isArray(first.content)) {
+    body.messages = [{ ...first, content: [...first.content, { type: 'text', text: ENV_BLOCK }] }, ...body.messages.slice(1)];
+  } else {
+    body.messages = [{ role: 'system', content: ENV_BLOCK }, ...body.messages];
+  }
+  return true;
+}
+
 export function applyFingerprintTools(body, flat) {
   if (!body || typeof body !== 'object') return new Map();
   const { tools, map } = concealFingerprintToolNames(body.tools, flat);
@@ -201,6 +232,7 @@ export function applyFingerprintTools(body, flat) {
   retargetToolChoice(body, map);
   aliasHistoryToolCalls(body, map);
   if (appended.length) noteUnavailableTools(body, flat, appended);
+  if (!flat) ensureEnvBlock(body);
   const choice = body.tool_choice;
   const none = choice === 'none'
     || (choice && typeof choice === 'object' && !Array.isArray(choice) && choice.type === 'none');

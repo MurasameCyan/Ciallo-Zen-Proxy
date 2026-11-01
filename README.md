@@ -328,11 +328,15 @@ openai-compatibility:
 
 - 出站 UA 保持已实测的 `opencode/latest/<发行版本>/cli` 形状，版本号从[官方 CLI 发行接口](https://opencode.ai/update/api/latest/cli/npm)同步，不使用 GitHub 的 v1 release tag。完整四段、major ≥ 2 且不旧于同步版本的下游 UA 仍可转发；旧客户端不能把网关拉回旧版本。
 - 免费推理发送 `Authorization: Bearer public`、`x-opencode-session`、`x-opencode-session-id`、`x-session-affinity`、`x-session-id`；不发送 `x-opencode-request`。UA 与会话头始终发送，旧 `opencodeIdentityHeaders` API 字段只控制可选的 client/project 头。
-- 合成 session 的 12 位 hex 使用官方降序编码 `~(timeMs * 0x1000 + 1)`；从客户端会话提示派生时只取 36 位时间字段，避免把哈希熵塞进毫秒内计数器而触发 `FreeTierError`。
+- 合成 session 的 12 位 hex 使用官方降序编码 `~(timeMs * 0x1000 + 1)`，毫秒内计数器固定为 1（把哈希熵塞进计数器会触发 `FreeTierError`）。时间字段必须是**最近的**：2026-11-01 实测，30 天内放行，90 天以上一律 `429 FreeUsageLimitError`。网关取当前 7 天窗口的起点再按哈希往前偏移，最多 14 天前，同一对话在一个窗口内保持不变。
+- Chat 请求的 system 里必须有 `<env>` 块并包含 `Working directory:`，tools 也不能为空，缺了同样是 `429 FreeUsageLimitError`；只写这一行不带标签、或放进 user 消息都不行。（官方的会话标题请求原文例外，那是上游认得的固定提示。）客户端自己带了 `<env>`（Claude Code、OpenCode 都会带）就原样转发，没带时网关在第一条 system 末尾补一个最小块；网关总会补上 `read`/`shell`，所以 tools 不会为空。
+- **上游按 TLS 握手识别客户端。** 同一出口、同一份请求字节：Node 的 OpenSSL 握手回 `429 FreeUsageLimitError`，Bun 的 BoringSSL 握手回 200；把 Node 的加密套件和曲线改成 Bun 那套也没用。所以推理请求由一个只监听 127.0.0.1 的 Bun 子进程发出（`server/bun-sidecar.js`），Node 只把请求转给它；镜像里固定装 Bun `1.4.4`，换版本前要重新对照官方 CLI。找不到 Bun 时启动日志会告警，请求回退 Node TLS。
 - 免费请求必须带 OpenCode v2 的精确 `read` 与 `shell` 工具定义。网关不再发送旧的五工具 stub；缺少的定义按 CLI 原文补上，并在 system/instructions 中标记为 placeholder，避免模型真的调用网关没有实现的工具。
 - 客户端自己的工具原样保留。若客户端正好把不同 schema 的工具命名为 `read` 或 `shell`，出站临时改成 `read_client` / `shell_client`（重名递增），历史调用和响应再恢复原名；`Read`、`Bash` 等大小写不同的名字不改。
 - 版本成功记录原子写入 `/data/opencode-version.json`，启动先读缓存，到期后后台同步，之后每 24 小时检查一次，不依赖面板轮询或客户端请求。网络失败、非法元数据或版本倒退都保留最近成功值；完全没有有效缓存时使用已验证的 `2.0.29`。真实请求与可用性、能力探针共用当前版本，单次请求跨节点重试时身份不变；身份头开关不影响版本同步。`/api/status` 的 `opencodeVersion` 与 `[opencode-version]` 日志提供版本、检查时间和最近错误。
 - 2026-10-16 在 API 容器内以官方发行二进制 `2.0.31` 抓取 UA，并用更新后的隔离网关验证：入站 `2.0.1` 被升级为 `2.0.31`，`/v1/messages` 返回 HTTP 200 和完整 `PONG`。自动同步只更新版本数字；若上游将来更改 UA 形状、会话规则或工具校验，仍需升级网关代码，不能靠更换版本数字解决。
+
+会话时间、`<env>` 块、Bun TLS 这三项单独缺任何一项，上游都回 `429 FreeUsageLimitError`，原文与真的额度耗尽一模一样，网关就会把好节点按 Retry-After 冷却到第二天，看起来像整个节点池都被限流了。判断是不是真没额度，要在同一节点上交错跑官方 CLI。
 
 这几项是免费层准入形状，不是普通协议转换。客户端非流式请求仍由网关收上游流后拼回 JSON；Chat、Responses、Anthropic 三种入口共用同一套 v2 身份与工具处理。上游返回真实配额/供应商错误时，网关仍按错误原文分类，不把 `200` 外壳或 `403 FreeTierError` 误记成成功。
 
