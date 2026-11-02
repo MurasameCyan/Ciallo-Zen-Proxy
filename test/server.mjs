@@ -2956,6 +2956,63 @@ await t('探测撞上 429:按 Retry-After 冷却该出口并换下一个,真实�
   assert.equal(g.cooldown.pickAvailable(['A', 'B', 'C'], group), 'B', '真实请求的选点也要跳过它');
 });
 
+await t('连接失败的最快三个出口不会饿死下一模型的可用性探测', async () => {
+  const g = new Gateway(load(), () => {});
+  const nodes = ['A', 'B', 'C', 'D'];
+  g.cur = 'A';
+  g.getCurrentNode = async () => g.cur;
+  g.getAllNodes = async () => nodes;
+  g.delay = new Map(nodes.map((node, i) => [node, i + 1]));
+  g.switchNode = async (node) => { g.cur = node; return true; };
+  const seen = [];
+  g.probeOnce = async () => {
+    seen.push(g.cur);
+    if (g.cur !== 'D') throw Object.assign(new Error('bun fetch: ECONNRESET: The socket connection was closed unexpectedly'), { status: 0 });
+    return { choices: [{ message: { content: 'pong' } }] };
+  };
+
+  const out = await g.availability.probe(['big-pickle', 'beam-free']);
+  assert.equal(out['big-pickle'].status, 'unknown', '连接失败不能被当成模型下线');
+  assert.equal(out['big-pickle'].error.kind, 'transport');
+  assert.equal(out['beam-free'].status, 'available', '下一模型必须能跳过失败的当前 C 和旧前缀 A/B,到达可用出口 D');
+  assert.deepEqual(seen, ['A', 'B', 'C', 'D'], '第一模型仍只有三次出站,第二模型不重复失败前缀');
+  for (const node of nodes.slice(0, 3)) {
+    assert.equal(g.cooldown.isCooling(node, 'default'), true);
+    assert.equal(g.cooldown.isCooling(node, 'nemotron'), false, '短退避不误伤其它供应商组');
+  }
+});
+
+await t('所有出口短暂连接失败时,其它模型不会被伪造的 503 卡住六小时', async () => {
+  const originalNow = Date.now;
+  let now = originalNow();
+  Date.now = () => now;
+  try {
+    const g = new Gateway(load(), () => {});
+    const nodes = ['A', 'B', 'C'];
+    g.cur = 'A';
+    g.getCurrentNode = async () => g.cur;
+    g.getAllNodes = async () => nodes;
+    g.delay = new Map(nodes.map((node, i) => [node, i + 1]));
+    g.switchNode = async (node) => { g.cur = node; return true; };
+    let failing = true;
+    g.probeOnce = async () => {
+      if (failing) throw Object.assign(new Error('bun fetch: ECONNRESET'), { status: 0 });
+      return { choices: [{ message: { content: 'pong' } }] };
+    };
+
+    const before = await g.availability.probe(['big-pickle', 'beam-free']);
+    assert.equal(before['beam-free'].status, 'unknown');
+    failing = false;
+    now += COOLDOWN_MS + 1;
+    const after = await g.availability.probe(['beam-free']);
+    assert.equal(after['beam-free'].status, 'available', '出口短冷却结束后应重探,不能把本地无可用出口当成上游 503 等六小时');
+    assert.equal(before['beam-free'].error.kind, 'transport');
+    assert.equal(before['beam-free'].error.status, null, '没有出站就不能伪造上游 HTTP 状态');
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 for (const status of [403, 503]) {
   await t(`连续探测跳过 ${status} 拒绝的当前出口和旧前缀,不突破单次上限`, async () => {
     const g = new Gateway(load(), () => {});
@@ -2999,7 +3056,8 @@ await t('拒绝探测不缩短更强 Retry-After,全员冷却后不再出站', a
   await assert.rejects(() => g.probeRequest(body), (e) => e.status === 403);
   assert.equal(g.cooldown.get('A', 'default').until, until);
   assert.equal(g.cooldown.get('A', 'default').retryAfter, 3600);
-  await assert.rejects(() => g.probeRequest(body), (e) => e.status === 503);
+  const out = await g.availability.probe(['beam-free']);
+  assert.equal(out['beam-free'].status, 'unknown', '没有出站成功就不能伪造模型可用');
   assert.equal(calls, 1, '已冷却出口没有新证据前不可反复探测');
 });
 

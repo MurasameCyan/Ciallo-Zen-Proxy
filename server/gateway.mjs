@@ -706,7 +706,8 @@ export class Gateway {
           const nodes = this.rankNodes(await this.getAllNodes());
           const next = this.cooldown.pickAvailable(nodes, group, tried);
           if (!next || !(await this.switchNode(next))) {
-            throw last || { status: 503, body: '{"error":{"message":"No usable upstream node","type":"all_nodes_unavailable"}}' };
+            // 本地没有可用出口,未发 HTTP 请求;不能伪造上游 503 让模型等六小时。
+            throw last || { status: 0, body: '{"error":{"message":"No usable upstream node","type":"all_nodes_unavailable"}}' };
           }
           cur = next;
         }
@@ -726,6 +727,10 @@ export class Gateway {
               this.cooldown.markBlocked(cur, group);
               this.logger('warn', `[probe] node="${cur}" 疑似机场拒连该域名,冷却 ${BLOCKED_COOLDOWN_MS / 60_000}min,换下一个`);
             }
+          } else if (kind === 'transport' && cur) {
+            // 瞬时连接失败也要记共享短退避,否则下一模型又从同一批最快坏出口开始。
+            // 复用 60s 不可用政策,不伪造限流或确定性封域。
+            this.cooldown.markRejected(cur, group);
           }
           // 429 同样记进共享冷却表(带上 Retry-After):免费额度按出口 IP 计,上游给的
           // 时长往往是几个小时(2026-10-13 实测 muse 回 retry-after: 20661)。不记的话,
